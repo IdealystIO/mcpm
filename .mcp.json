@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "idealyst": {
+      "command": "idealyst",
+      "args": ["mcp"]
+    },
+    "mcpm": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "-p", "mcpm-mcp"],
+      "env": {
+        "DATABASE_URL": "postgres://app:app@localhost:55432/app",
+        "MCPM_PROJECT_NAME": "control-center"
+      }
+    }
+  }
+}

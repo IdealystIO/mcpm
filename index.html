@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <base href="/" />
+    <title>Control Center</title>
+    <style>
+      html, body, #app { height: 100%; margin: 0; }
+      body { background: #f7f8fb; }
+      /* Mount is a flex column so the app's root view fills the viewport
+         height; without it the root sizes to content and short screens stop
+         short of full height on tall windows. */
+      #app { display: flex; flex-direction: column; }
+      #app > * { flex: 1 1 auto; min-height: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      import init from "/pkg/control_center.js";
+      init();
+    </script>
+  </body>
+</html>

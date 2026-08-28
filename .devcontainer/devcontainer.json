@@ -1,0 +1,21 @@
+{
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  },
+  "dockerComposeFile": [
+    "docker-compose.yml",
+    "docker-compose.idealyst.yml"
+  ],
+  "name": "control-center",
+  "postCreateCommand": {
+    "idealyst-claude-chown": "chown -R \"$(id -u):$(id -g)\" /idealyst/agents/claude 2>/dev/null || sudo -n chown -R \"$(id -u):$(id -g)\" /idealyst/agents/claude",
+    "idealyst-claude-install": "curl -fsSL https://claude.ai/install.sh | bash && { sudo -n ln -sf \"$HOME/.local/bin/claude\" /usr/local/bin/claude 2>/dev/null || ln -sf \"$HOME/.local/bin/claude\" /usr/local/bin/claude 2>/dev/null || true; }",
+    "idealyst-cli-install": "chown -R \"$(id -u):$(id -g)\" /idealyst/cli 2>/dev/null || sudo -n chown -R \"$(id -u):$(id -g)\" /idealyst/cli; test -x /idealyst/cli/bin/idealyst || cargo install --git https://github.com/IdealystIO/idealyst-native idealyst-cli --root /idealyst/cli; sudo -n ln -sf /idealyst/cli/bin/idealyst /usr/local/bin/idealyst 2>/dev/null || ln -sf /idealyst/cli/bin/idealyst /usr/local/bin/idealyst 2>/dev/null || true"
+  },
+  "service": "dev",
+  "workspaceFolder": "/workspaces/control-center"
+}

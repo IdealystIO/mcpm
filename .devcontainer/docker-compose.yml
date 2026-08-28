@@ -1,0 +1,8 @@
+# Base devcontainer service — YOURS to edit. Add your own services here;
+# idealyst-managed sidecars live in `docker-compose.idealyst.yml`.
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/rust:1
+    volumes:
+      - ..:/workspaces/control-center:cached
+    command: sleep infinity

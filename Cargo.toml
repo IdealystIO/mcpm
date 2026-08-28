@@ -1,0 +1,93 @@
+# Workspace: the Idealyst app (this root crate) plus the Control Center
+# backend — `mcpm-core` (domain + Postgres store, the gate lives there)
+# and `mcpm-mcp` (the MCP stdio server agents connect to).
+[workspace]
+members = [".", "crates/api", "crates/mcpm-core", "crates/mcpm-mcp"]
+resolver = "2"
+
+[package]
+name = "control-center"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# The library half stays platform-agnostic — no `web.rs` / `ios.rs` /
+# `android.rs`, no `#[cfg(target_os = "...")]` blocks, no `wasm-bindgen`
+# / `backend-*` direct deps. Same source ships to every backend.
+#
+# The platform-specific half is `src/main.rs`: one `idealyst::entry!`
+# line whose shell is picked by the target triple. The iOS / Android
+# wrappers the CLI still generates at build time depend on this crate as
+# an `rlib` and supply their own `staticlib` / `cdylib` crate-type.
+[lib]
+crate-type = ["rlib"]
+
+# No `catalog` feature or catalog binary is needed for the MCP server:
+# `idealyst mcp` generates an ephemeral wrapper crate on demand that turns
+# on the `catalog` feature (and each component-library dependency's own
+# `catalog` feature) across the whole graph and force-links those deps, so
+# every `#[component]` plus dependency-provided catalog entries (icon sets,
+# …) surface. See the `catalog_wrapper` module in the CLI.
+
+[features]
+# `sidecar`: enabled ONLY by the CLI-generated runtime-server sidecar
+# wrapper (`idealyst dev`). Pulls `dev-server` so the recorder-side
+# registration seams compile.
+sidecar = ["dep:dev-server"]
+
+[dependencies]
+# The platform surface, used by `src/main.rs` only. It carries whatever
+# the target needs — `backend-web` + the wasm-bindgen glue on wasm, a
+# native shell otherwise — so this manifest names no backend directly
+# and `cargo build` alone produces a runnable artifact.
+idealyst = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+# The author surface. `runtime-core` is the crate this project aliases
+# to `runtime_core` at its root (see src/lib.rs). `runtime-vocabulary` is
+# needed because the `ui!` emission spells absolute
+# `::runtime_vocabulary::glue::…` paths, and `runtime-scene` because
+# `register_scene_extensions` is generic over the scene `Registry` host.
+runtime-core = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca", features = ["async-driver"] }
+runtime-vocabulary = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+runtime-scene = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+# Recorder backend for the runtime-server sidecar wrapper. Optional —
+# pulled in only by the `sidecar` feature (host-side sidecar build);
+# never compiled for device/web targets.
+dev-server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca", optional = true }
+# The idea-ui component library (Badge, Progress, Button, Typography, …)
+# and its theme runtime — the MCP Project Console composes these rather
+# than re-implementing chrome on bare primitives.
+idea-ui = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+idea-theme = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+# Live data: the console calls the `api` crate's #[server] fns (RPC
+# stubs on this side; mcpm-web hosts the bodies) via the server SDK.
+api = { path = "crates/api" }
+# The editable code surface behind the bulk want composer: `code_editor`
+# takes author-supplied BYTE-RANGE decorations, so `#tag` highlighting is
+# our tokenizer's output rather than a language the SDK has to know.
+codeblock = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+
+# No backend deps: `register_scene_extensions` is generic over the scene
+# `Host` (this scaffold registers no third-party SDKs), so the app crate
+# is fully platform-agnostic — the CLI-generated wrappers bring their own
+# concrete backend. A project that adds an SDK with a backend-CONCRETE
+# scene handler specializes `register_scene_extensions` to that backend's
+# registry type and adds the matching backend dep then.
+
+# Idealyst project config. The CLI reads this on `idealyst build`,
+# `idealyst run`, `idealyst dev`, etc.
+[package.metadata.idealyst.app]
+name      = "Control Center"
+bundle_id = "com.example.control_center"
+version   = "0.0.1"
+# Platforms `idealyst dev` and `idealyst build` fan out across when
+# no `--web` / `--ios` / `--android` flag is passed on the command
+# line. We default to web-only because it's the broadest target with
+# zero per-platform toolchain setup (no Xcode, no NDK) — a fresh
+# clone of this project will `idealyst dev` straight into a hot-
+# reloading browser preview. Add the mobile targets when you're
+# ready: `targets = ["web", "ios", "android"]`. The `run ios` /
+# `run android` subcommands work regardless of what's listed here
+# (they take an explicit platform argument), so you can also just
+# leave this alone and invoke them directly.
+targets   = ["web"]

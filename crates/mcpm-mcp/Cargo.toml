@@ -1,0 +1,17 @@
+# mcpm-mcp — the Control Center MCP server.
+#
+# The entire agent-facing product surface: 15 tools, the manager/worker
+# briefing prompts, and read-only resources, served as newline-delimited
+# JSON-RPC over stdio (the MCP stdio transport). Every domain rule lives
+# in mcpm-core; this binary is protocol plumbing plus tool schemas.
+[package]
+name = "mcpm-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mcpm-core = { path = "../mcpm-core" }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }

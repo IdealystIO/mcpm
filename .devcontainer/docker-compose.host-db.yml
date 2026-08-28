@@ -1,0 +1,17 @@
+# Host-side override — publishes the devcontainer's postgres on a
+# distinct host port so host-run tests can reach it without colliding
+# with other projects' databases (5432/5433 are taken by others).
+#
+# Usage (database only, from the repo root):
+#   docker compose -p control-center-devc \
+#     -f .devcontainer/docker-compose.yml \
+#     -f .devcontainer/docker-compose.idealyst.yml \
+#     -f .devcontainer/docker-compose.host-db.yml \
+#     up -d database
+#
+# Not referenced by devcontainer.json — inside the container the app
+# reaches the database as database:5432 and needs no published port.
+services:
+  database:
+    ports:
+      - "55432:5432"

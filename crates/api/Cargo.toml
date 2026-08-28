@@ -1,0 +1,51 @@
+# api — wire DTOs + `#[server]` functions shared by the console (wasm,
+# stub side) and the `mcpm-web` host binary (real bodies).
+#
+# Per the framework's server-functions guide: the lib does NOT depend on
+# the UI runtime, so a server body can never touch a Signal; db access
+# (mcpm-core → sqlx/tokio) is gated behind the `server` feature so the
+# wasm build never compiles it.
+#
+# The host binary lives HERE rather than in its own workspace member,
+# and declares `required-features = ["server"]`: that keeps
+# `server/server` OFF for a default workspace build, so cargo's feature
+# unification can't strip the client half of the `server` SDK out from
+# under the console. Run it with:
+#   cargo run -p api --bin mcpm-web --features server
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "mcpm-web"
+path = "src/bin/mcpm-web.rs"
+required-features = ["server"]
+
+[features]
+default = []
+server = [
+    "server/server",
+    "dep:mcpm-core",
+    "dep:chrono",
+    "dep:axum",
+    "dep:tokio",
+    "dep:tower-http",
+    "dep:futures-core",
+    "dep:futures-util",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+
+# Server-only. Optional so the wasm build never pulls sqlx/tokio/axum.
+axum = { version = "0.7", optional = true }
+mcpm-core = { path = "../mcpm-core", optional = true }
+chrono = { version = "0.4", optional = true }
+# The Stream trait `#[subscription]`'s return type names.
+futures-core = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }

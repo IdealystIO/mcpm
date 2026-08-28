@@ -1,0 +1,9 @@
+/target
+/pkg
+Cargo.lock
+/.idealyst/
+/dist/
+.env
+.env.local
+.DS_Store
+dev.toml

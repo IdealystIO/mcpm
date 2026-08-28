@@ -1,0 +1,39 @@
+# mcpm-core — Control Center project-management domain + store.
+#
+# The gatekeeper logic from the architecture doc lives here: stage
+# gating, exclusive module claims, checklist-proven completion, the
+# append-only event ledger, and scoped memory search. Storage is
+# Postgres (the devcontainer's `database` service); every invariant is
+# enforced inside a transaction in this crate, never in the callers.
+[package]
+name = "mcpm-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The event stream: `async_stream` to write `watch_events` as a
+# generator, `futures-core`/`futures-util` for the Stream trait it
+# returns and the adapter that drives PgListener.
+async-stream = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Plain-TCP Postgres (local/devcontainer only — no TLS feature on purpose).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "migrate",
+    "chrono",
+    "json",
+] }
+thiserror = "2"
+# The event fan-out: one listener task, a broadcast to every subscriber.
+tokio = { version = "1", features = ["sync", "rt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
