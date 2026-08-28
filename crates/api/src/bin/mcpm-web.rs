@@ -1,6 +1,11 @@
 //! Console API host. Serves this crate's `#[server]` functions at
-//! `/_srv/*` on port 3210 (override with PORT), CORS-open so the
-//! `idealyst dev` page on another port can call it.
+//! `/_srv/*` on 127.0.0.1:3210 (override with HOST and PORT), CORS-open
+//! so the `idealyst dev` page on another port can call it.
+//!
+//! In a container, `-p` publishing only reaches a process listening on
+//! the container's external interface, so set `HOST=0.0.0.0` there. The
+//! default stays loopback: this host is CORS-permissive and unauthenticated,
+//! so it must not become reachable from the network by accident.
 //!
 //! ```
 //! cargo run -p api --bin mcpm-web --features server
@@ -37,7 +42,13 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3210);
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let host: std::net::IpAddr = match std::env::var("HOST") {
+        Ok(h) => h
+            .parse()
+            .unwrap_or_else(|_| panic!("HOST must be an IP address to bind (e.g. 0.0.0.0), got {h:?}")),
+        Err(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+    };
+    let addr: std::net::SocketAddr = (host, port).into();
     println!("mcpm-web: API at http://{addr}/_srv/<fn> (db: {database_url})");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");

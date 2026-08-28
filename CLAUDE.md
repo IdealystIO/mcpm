@@ -68,7 +68,10 @@ idealyst dev --web --local --port 8090                          # :8090
 ```
 
 Ports are deliberate — 5432/5433/8080 belong to the user's other
-projects. Before calling UI work done:
+projects. `mcpm-web` binds loopback (`HOST`/`PORT` override); a container
+needs `HOST=0.0.0.0` or a published port reaches nothing, and nothing
+outside a container should set it — the host is CORS-permissive and
+unauthenticated. Before calling UI work done:
 
 ```bash
 cargo check --workspace                              # console + client half

@@ -47,6 +47,12 @@ this step also creates the schema.
 cargo run -p api --bin mcpm-web --features server     # http://127.0.0.1:3210
 ```
 
+It binds `127.0.0.1:3210`; `HOST` and `PORT` override the two halves. In
+a container, published ports only reach a process listening on the
+container's external interface, so run it with `HOST=0.0.0.0` there — and
+only there. The host is CORS-permissive and unauthenticated, so loopback
+stays the default.
+
 **3. Start the console.**
 
 ```bash
