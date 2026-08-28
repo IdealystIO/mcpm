@@ -613,3 +613,67 @@ stylesheet! {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::WantsView;
+    use crate::state::use_console;
+
+    /// Regression: the pool must MOUNT.
+    ///
+    /// It is the only view that renders scene-registry payloads — the
+    /// composer's `code_editor` and `idea_ui::Table` — and a payload
+    /// whose handler was never registered panics at realize with "no
+    /// handler registered for item payload". Nothing catches that at
+    /// compile time: it type-checks, links, and then aborts on screen.
+    ///
+    /// So this mounts the real view through the real `realize` against a
+    /// mock host, with the app's own `register_scene_extensions` as the
+    /// boot seam — the same registry the CLI wrapper installs. Drop
+    /// `codeblock::register` and this fails with the browser's panic.
+    ///
+    /// It does NOT cover the table: see the test below for why.
+    #[test]
+    fn the_pool_mounts_with_the_apps_registrations() {
+        let harness = host_mock::Harness::with_registry(crate::register_scene_extensions);
+        let tree = harness.world.enter(|| {
+            // Inside the world: installing the theme injects an ambient,
+            // and `use_console` creates signals.
+            idea_ui::install_idea_theme(idea_ui::light_theme());
+            let console = use_console();
+            runtime_core::ui! { WantsView(console = console) }
+        });
+        harness.mount(tree);
+        harness.flush();
+    }
+
+    /// The `table` SDK emits its payloads ONLY on wasm — off-web it
+    /// lowers a table to a CSS grid of plain views, which needs no
+    /// handler. So the mount test above passes on this host whether or
+    /// not `table::register` is in the seam, while the browser panics:
+    /// the one payload a host test structurally cannot see is the one
+    /// that broke.
+    ///
+    /// This is the reachable check — that the seam registers exactly the
+    /// SDKs the console renders, counted on a registry rather than
+    /// through a mount. `table::register` is not cfg'd, so its three
+    /// handlers (table, row, cell) are countable here even though a
+    /// mounted table never asks for them.
+    #[test]
+    fn the_seam_registers_every_sdk_the_console_renders() {
+        let mut seam = runtime_scene::Registry::<host_mock::HostMock>::new();
+        crate::register_scene_extensions(&mut seam);
+
+        let mut expected = runtime_scene::Registry::<host_mock::HostMock>::new();
+        codeblock::register(&mut expected);
+        table::register(&mut expected);
+
+        assert_eq!(
+            seam.handler_count(),
+            expected.handler_count(),
+            "register_scene_extensions must install every SDK payload handler the \
+             console renders — a missing line here is a runtime panic on web, not \
+             a build error"
+        );
+    }
+}

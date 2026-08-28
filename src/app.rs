@@ -121,7 +121,13 @@ fn start_sync(console: Console) {
     server::configure(server::ClientConfig::new(API_ORIGIN));
     // Scope-bound: the socket closes when the app unmounts.
     let events = api::watch_events();
-    let mut last_fetch: u64 = 0;
+    // `None` means "fetch on the next frame"; `Some(t)` is when the
+    // last attempt started. Deliberately not `0`: on web `now_micros`
+    // counts from page load, so for the first POLL_MICROS after load
+    // `now - 0` is still inside the window — a zero sentinel would gate
+    // off the very first snapshot, and any event tick or local capture
+    // that lands while the page is young, until the window elapsed.
+    let mut last_fetch: Option<u64> = None;
     let mut in_flight = false;
     let mut seen_nudge: u64 = 0;
     let mut seen_seq: i64 = 0;
@@ -135,7 +141,7 @@ fn start_sync(console: Console) {
         if let Some(tick) = events.latest() {
             if tick.seq > seen_seq {
                 seen_seq = tick.seq;
-                last_fetch = 0;
+                last_fetch = None;
                 in_flight = false;
             }
         }
@@ -144,19 +150,20 @@ fn start_sync(console: Console) {
         let nudge = console.refresh.get();
         if nudge != seen_nudge {
             seen_nudge = nudge;
-            last_fetch = 0;
+            last_fetch = None;
             in_flight = false;
         }
-        if in_flight || now.saturating_sub(last_fetch) < POLL_MICROS {
+        let due = last_fetch.is_none_or(|t| now.saturating_sub(t) >= POLL_MICROS);
+        if in_flight || !due {
             // A fetch answers (or fails) well within a poll window;
             // reset the in-flight latch once the window passes so a
             // dropped callback can't wedge the loop.
-            if now.saturating_sub(last_fetch) >= POLL_MICROS {
+            if due {
                 in_flight = false;
             }
             return;
         }
-        last_fetch = now;
+        last_fetch = Some(now);
         in_flight = true;
         spawn_then(api::load_snapshot(), move |result| {
             match result {

@@ -65,7 +65,20 @@ api = { path = "crates/api" }
 # takes author-supplied BYTE-RANGE decorations, so `#tag` highlighting is
 # our tokenizer's output rather than a language the SDK has to know.
 codeblock = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+# The `table` SDK, named DIRECTLY even though `idea-ui`'s default `table`
+# feature already pulls it: `idea_ui::Table` renders the SDK's payloads
+# (`table`/`table_row`/`table_cell`), and a payload with no handler panics
+# at realize. Registering it needs the crate in scope here — a transitive
+# dep is linked but not nameable.
+table = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
 server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+
+# Test-only mock scene host. It realizes a component tree through the
+# REAL `realize` path against an in-memory backend, which is the only
+# way to prove a payload has a handler without a browser: an
+# unregistered one panics at mount exactly as it does on web.
+[dev-dependencies]
+host-mock = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
 
 # No backend deps: `register_scene_extensions` is generic over the scene
 # `Host` (this scaffold registers no third-party SDKs), so the app crate

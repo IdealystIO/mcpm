@@ -44,9 +44,18 @@ pub fn register_scene_extensions<H>(registry: &mut runtime_scene::Registry<H>)
 where
     H: runtime_vocabulary::style_attach::StyleServices
         + runtime_vocabulary::caps::TextOps
+        + runtime_vocabulary::caps::InputOps
         + 'static,
 {
+    // The want composer's `code_editor`.
     codeblock::register(registry);
+    // `idea_ui::Table` — the want pool's rows. It is not a plain
+    // component over builtins: it renders the `table` SDK's payloads, so
+    // it needs a handler like any other extension. The bounds above are
+    // the UNION of what these two ask for (`TextOps` for codeblock,
+    // `InputOps` for table); every backend satisfies all of them, so a
+    // new SDK here widens the bound rather than forcing a second seam.
+    table::register(registry);
 }
 
 // Android entry: the generated Android wrapper's `attach` mounts

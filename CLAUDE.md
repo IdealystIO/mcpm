@@ -108,7 +108,15 @@ of the `server` SDK, and only running one hides breakage in the other.
   steal focus mid-sentence. Its buffers live on `Console` for the same
   reason.
 - **Extension SDKs must be registered** in `register_scene_extensions`
-  (`codeblock::register`). An unregistered payload panics at realize.
+  (`codeblock::register`, `table::register`). An unregistered payload
+  panics at realize. Some idea-ui components ARE such payloads —
+  `idea_ui::Table` renders the `table` SDK — so a component library
+  import can need a registration line, and the crate must be a direct
+  dep to be nameable there. Worse, `table` only emits its payload on
+  **wasm** (off-web it lowers to a grid of views), so a host-side mount
+  test cannot see the failure: pair the mount test with the
+  handler-count assertion in `wants.rs`, and check a new SDK-backed
+  component in the browser.
 - **`mcpm-web` must reference the `api` crate** (`api::Snapshot::default()`)
   or the linker dead-strips its route inventory and every `/_srv/` path
   404s with no build error.
