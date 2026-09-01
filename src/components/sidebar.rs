@@ -44,6 +44,20 @@ pub fn Sidebar(props: &SidebarProps) -> Element {
             }
         },
     );
+    // The knowledge base sits with the want pool above the features:
+    // both are project-wide and neither belongs to the feature you
+    // happen to have selected.
+    let knowledge = switch(
+        move || (console.pane.get(), console.rev.get()),
+        move |(pane, _rev): &(String, u64)| {
+            let on_knowledge = pane == "knowledge";
+            ui! {
+                view(style = CardList()) {
+                    KnowledgeCard(console = console, selected = on_knowledge)
+                }
+            }
+        },
+    );
     let cards = switch(
         move || (console.pane.get(), console.feature.get(), console.rev.get()),
         move |(pane, sel, _rev): &(String, usize, u64)| {
@@ -85,6 +99,10 @@ pub fn Sidebar(props: &SidebarProps) -> Element {
             }
             pool
             view(style = SidebarPad()) {
+                text(style = SectionLabel()) { "Knowledge" }
+            }
+            knowledge
+            view(style = SidebarPad()) {
                 text(style = SectionLabel()) { "Features" }
             }
             scroll_view(style = SidebarScroll()) {
@@ -93,6 +111,48 @@ pub fn Sidebar(props: &SidebarProps) -> Element {
             }
         }
     }
+}
+
+/// Props for [`KnowledgeCard`].
+#[derive(Default, IdealystSchema)]
+pub struct KnowledgeCardProps {
+    /// Console state handles.
+    pub console: Console,
+    /// Whether the knowledge screen is the one showing.
+    pub selected: bool,
+}
+
+/// The way into the knowledge base.
+///
+/// It carries no count. Unlike the pool's loose-want number, a total
+/// here is not something anyone acts on — nobody drains the knowledge
+/// base — and the console would have to fetch it on every poll to
+/// print it (see `KnowledgeView`: the base is queried, not snapshotted).
+#[component]
+pub fn KnowledgeCard(props: &KnowledgeCardProps) -> Element {
+    let console = props.console;
+    let inner: Element = ui! {
+        view(style = CardInner()) {
+            Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
+                view(style = TitleSlot()) {
+                    Typography(
+                        content = "Knowledge base",
+                        kind = typography_kind::BodySm,
+                        weight = Some(FontWeight::SemiBold),
+                    )
+                }
+                Spacer()
+            }
+            Mono(content = "conventions, decisions, gotchas")
+        }
+    };
+
+    let arm = if props.selected { "on" } else { "off" };
+    pressable(vec![inner], move || console.show_knowledge())
+        .with_style(
+            StyleApplication::new(feature_card_box_style()).with("selected", arm.to_string()),
+        )
+        .into_element()
 }
 
 /// Props for [`AllFeaturesCard`].

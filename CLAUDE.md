@@ -56,6 +56,16 @@ bespoke UI, and look things up in the catalog rather than guessing —
 recipe is compile-verified against the current API; your memory of the
 API is not.
 
+## Knowledge work: read KNOWLEDGE.md first
+
+The memory graph has one rule that is easy to violate by accident:
+**memories are immutable — no update, no delete, corrections
+supersede.** [KNOWLEDGE.md](KNOWLEDGE.md) is the standing rulebook for
+it (edge types, derived node state, what decay may and may not do, and
+the anti-patterns each of which is a plausible next step that breaks the
+model). Read it before touching `commit_memory`, `search_memory`, or
+anything that writes to `memories`.
+
 ## Layout
 
 | Path | What it is |
@@ -64,6 +74,14 @@ API is not.
 | `crates/mcpm-mcp` | The MCP server agents connect to: tools, prompts, `project://` resources. Two transports (`rpc.rs` is the shared dispatcher), plus the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, `#[server]` fns, and the `mcpm-web` host binary. |
 | `src/` | The Idealyst console. `components/` is one module per view. |
+
+When you change anything that affects ranking — weights, synonyms, the
+tsquery construction — run `cargo test -p mcpm-core --test retrieval_eval
+-- --nocapture` and read the margins, not just the pass/fail. It has
+already caught two bugs that reasoning missed: a synonym crossing word
+senses (`schema → table` returning a UI note), and short function words
+scoring a perfect trigram similarity so every natural-language question
+ranked by whichever entry contained "the".
 
 ## Running and verifying
 
@@ -108,6 +126,29 @@ of the `server` SDK, and only running one hides breakage in the other.
   connections) caps concurrent consoles and then starves ordinary
   reads, which surfaces as `pool timed out waiting for an open
   connection` and a dead-looking console.
+- **Memories are immutable, and the store is where that is enforced.**
+  There is no `update_memory` and no delete: `commit_memory` takes a
+  `supersedes` list, and the edge is written in the same transaction as
+  the memory, because a correction that landed without its link would
+  leave both versions reading as current. Edges only ever point from a
+  newly committed memory backwards, which is what makes a cycle
+  structurally impossible rather than something to check — any future
+  tool that links two PRE-EXISTING memories loses that and must add the
+  check itself.
+- **Supersession is commit-time only; standing relations are not.**
+  That asymmetry is what keeps the history acyclic — an edge that can
+  only be created alongside its newer end always points backwards in
+  time — so `relate_memories` refuses the four supersession kinds. Both
+  kinds share `memory_edges`, and exactly one place tells them apart:
+  the `ed` CTE lists the supersession kinds BY NAME, so a kind added to
+  the schema and forgotten there fails safe.
+- **No score is ever stored on a memory.** `knowledge_weights` is read
+  at query time by `MEMORY_FIELDS`, so retuning is a SQL `UPDATE` with
+  no backfill and every entry stays comparable. The corollary is that
+  the ranking SQL exists once and is shared by every read path — two
+  copies that drifted would mean agents and the console were looking at
+  differently ordered versions of the same base, which nobody would
+  notice.
 - **The capture syntax is defined once**, in `crates/api/src/capture.rs`,
   and used by both the editor's highlighting and the server function
   that writes. Never add a second parser — drift between them means the
@@ -116,6 +157,13 @@ of the `server` SDK, and only running one hides breakage in the other.
   `Console.rev`.** A background poll would rebuild the text node and
   steal focus mid-sentence. Its buffers live on `Console` for the same
   reason.
+- **`scroll_view` is single-axis and clips the other one silently.**
+  Vertical unless `horizontal = true`, never both — so the board and the
+  dependency graph each nest two, and the inner axis is pinned with
+  `height: 100%` rather than `min_height`, which would let the row grow
+  and push the outer scrollbar off-screen. UX_GUIDELINES rule 23 has the
+  full pattern. Nothing about this fails a build or a test: it renders
+  as a view that looks complete until the data gets wide.
 - **Extension SDKs must be registered** in `register_scene_extensions`
   (`codeblock::register`, `table::register`). An unregistered payload
   panics at realize. Some idea-ui components ARE such payloads —

@@ -10,6 +10,7 @@ use runtime_core::{presence, raf_loop_scoped, spawn_then, stylesheet, switch, ui
 use crate::components::drawer::{Drawer, WantDrawer};
 use crate::components::gate::KeyGate;
 use crate::components::header::Header;
+use crate::components::knowledge::KnowledgeDrawer;
 use crate::components::main_pane::MainPane;
 use crate::components::sidebar::Sidebar;
 use crate::model;
@@ -119,12 +120,30 @@ pub fn app() -> Element {
         },
     );
 
+    // The knowledge drawer shares the overlay slot with the other two.
+    // Keyed on the memory id — the base re-ranks under a poll, so an
+    // index would slide onto a different entry mid-read.
+    let knowledge_host = presence(move || {
+        switch(
+            move || console.know_open.get(),
+            move |id: &Option<String>| match id {
+                Some(id) => ui! { KnowledgeDrawer(console = console, memory_id = id.clone()) },
+                None => ui! { view {} },
+            },
+        )
+    })
+    .present(move || console.know_open.get().is_some())
+    .enter(PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut))
+    .exit(PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn))
+    .into_element();
+
     ui! {
         view(style = PageFrame()) {
             Header(console = console)
             body
             drawer_host
             want_host
+            knowledge_host
             sync
         }
     }

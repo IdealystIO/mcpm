@@ -112,6 +112,85 @@ pub struct WantDto {
     pub features: Vec<WantLinkDto>,
 }
 
+/// One entry in the knowledge base.
+///
+/// `Default` because it rides a component's props struct, and the
+/// struct-literal dispatch needs one — the derived value is never
+/// rendered; every call site passes a real entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MemoryDto {
+    pub id: String,
+    /// project | feature | stage | module | task
+    pub level: String,
+    pub subject_id: String,
+    /// The node's name — or the project's, at project level.
+    pub subject_name: String,
+    /// convention | decision | gotcha | outcome | reference | note
+    pub kind: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub author: String,
+    /// "MMM D HH:MM"
+    pub written: String,
+    /// current | superseded | disputed. Derived, never stored.
+    pub state: String,
+    /// Distinct agents that used it.
+    pub touches: i64,
+    /// Distinct agents that verified it.
+    pub confirms: i64,
+    /// Distinct agents that say it is wrong.
+    pub disputes: i64,
+    /// Where it sits in its kind, 0 (newest) to 1 (oldest) — the decay
+    /// clock, shown so a low rank is explicable rather than mysterious.
+    pub newer_fraction: f32,
+}
+
+/// One page of knowledge, plus what the filters matched in total so the
+/// pager can say "1–20 of 142" without a second round trip.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgePage {
+    pub entries: Vec<MemoryDto>,
+    pub total: i64,
+    /// Counts per kind across the WHOLE base, not this page — the
+    /// header's stats must not lurch as the reader pages.
+    pub by_kind: Vec<KindCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KindCount {
+    pub kind: String,
+    pub count: i64,
+}
+
+/// One step of a memory's lineage, or one standing relation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LinkDto {
+    /// replaces | refutes | revises | consolidates | refines |
+    /// depends_on | contradicts | relates_to
+    pub kind: String,
+    /// Why the link exists. Often the only place the reason survives.
+    pub rationale: String,
+    /// For a standing relation: whether this memory is the source. A
+    /// `refines` read outward and inward mean opposite things.
+    pub outgoing: bool,
+    pub other: MemoryDto,
+}
+
+/// Everything the graph knows about one entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MemoryDetail {
+    pub entry: MemoryDto,
+    /// What it replaced, nearest first.
+    pub supersedes: Vec<LinkDto>,
+    /// What replaced it.
+    pub superseded_by: Vec<LinkDto>,
+    /// Declared standing relations, both directions.
+    pub relations: Vec<LinkDto>,
+    /// Undeclared relations the co-touch record hints at. Suggestions,
+    /// never assertions.
+    pub suggestions: Vec<MemoryDto>,
+}
+
 /// One tag in the registry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TagDto {
@@ -526,6 +605,154 @@ pub async fn capture_wants(
         new_tags,
         skipped,
     })
+}
+
+/// The console's window on the knowledge base.
+///
+/// Its own endpoint rather than a slice of the snapshot: the base grows
+/// without bound, and the ranking that makes a loose query useful has
+/// to happen in Postgres against the full text index — shipping every
+/// entry to the browser to filter there would be both the largest
+/// payload the console sends and the worst search it could offer.
+#[server]
+pub async fn search_knowledge(
+    query: String,
+    kinds: Vec<String>,
+    tags: Vec<String>,
+    level: String,
+    page: i64,
+    include_superseded: bool,
+) -> Result<KnowledgePage, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+
+    let kinds: Vec<mcpm_core::MemoryKind> = kinds
+        .iter()
+        .filter_map(|k| mcpm_core::MemoryKind::parse(k))
+        .collect();
+    // A level filter is expressed as an anchor at that level searched
+    // `here`, except "project", which is its own singleton shelf. An
+    // unrecognized level means no filter rather than no results: the
+    // console's "All" arm sends an empty string.
+    let scope = match level.as_str() {
+        "project" => Some(mcpm_core::MemoryScope::project()),
+        _ => None,
+    };
+    let page = page.max(0);
+    const PER_PAGE: i64 = 20;
+
+    let found = store
+        .search_memory(&mcpm_core::MemoryQuery {
+            text: query,
+            kinds,
+            tags,
+            scope,
+            direction: if level == "project" {
+                mcpm_core::SearchDirection::Here
+            } else {
+                mcpm_core::SearchDirection::All
+            },
+            limit: PER_PAGE,
+            offset: page * PER_PAGE,
+            include_superseded,
+            ..Default::default()
+        })
+        .await
+        .map_err(fail)?;
+
+    // The non-project level filters are applied here rather than in the
+    // store, because "every memory at module level" is not an anchor —
+    // it is a level predicate, and the store's scoping vocabulary is
+    // deliberately about anchors and directions.
+    let entries: Vec<MemoryDto> = found
+        .hits
+        .iter()
+        .filter(|h| level.is_empty() || level == "project" || h.memory.level == level)
+        .map(|h| memory_dto(&h.memory))
+        .collect();
+
+    Ok(KnowledgePage {
+        entries,
+        total: found.total,
+        by_kind: kind_counts(&store).await,
+    })
+}
+
+/// Everything the graph knows about one entry, for its drawer.
+///
+/// The lineage defaults to belief-only: a reader opening an entry wants
+/// to know what changed, not who tightened a sentence.
+#[server]
+pub async fn knowledge_detail(memory_id: String) -> Result<MemoryDetail, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let h = store.memory_history(&memory_id, true).await.map_err(fail)?;
+    let step = |s: &mcpm_core::HistoryStep| LinkDto {
+        kind: s.via.map(|k| k.as_str().to_string()).unwrap_or_default(),
+        rationale: s.rationale.clone(),
+        outgoing: true,
+        other: memory_dto(&s.memory),
+    };
+    Ok(MemoryDetail {
+        entry: memory_dto(&h.anchor),
+        supersedes: h.supersedes.iter().map(step).collect(),
+        superseded_by: h.superseded_by.iter().map(step).collect(),
+        relations: h
+            .relations
+            .iter()
+            .map(|r| LinkDto {
+                kind: r.kind.as_str().to_string(),
+                rationale: r.rationale.clone(),
+                outgoing: r.outgoing,
+                other: memory_dto(&r.other),
+            })
+            .collect(),
+        suggestions: h.suggestions.iter().map(|s| memory_dto(&s.other)).collect(),
+    })
+}
+
+/// Core memory → wire DTO. One mapper, so the drawer and the list
+/// cannot disagree about what an entry is.
+#[cfg(feature = "server")]
+fn memory_dto(m: &mcpm_core::Memory) -> MemoryDto {
+    MemoryDto {
+        id: m.id.clone(),
+        level: m.level.clone(),
+        subject_id: m.subject_id.clone(),
+        subject_name: m.subject_name.clone(),
+        kind: m.kind.as_str().to_string(),
+        content: m.content.clone(),
+        tags: m.tags.clone(),
+        author: m.author.clone(),
+        written: m.created_at.format("%b %-d %H:%M").to_string(),
+        state: m.state.as_str().to_string(),
+        touches: m.standing.touches,
+        confirms: m.standing.confirms,
+        disputes: m.standing.disputes,
+        newer_fraction: m.standing.newer_fraction,
+    }
+}
+
+/// Per-kind totals across the whole base, for the screen's header.
+/// A failure here costs the header its numbers, not the page its
+/// content — so it degrades to empty rather than failing the request.
+#[cfg(feature = "server")]
+async fn kind_counts(store: &mcpm_core::Store) -> Vec<KindCount> {
+    let mut out = Vec::new();
+    for kind in mcpm_core::MemoryKind::ALL {
+        let found = store
+            .search_memory(&mcpm_core::MemoryQuery {
+                kinds: vec![kind],
+                limit: 1,
+                include_superseded: true,
+                ..Default::default()
+            })
+            .await;
+        if let Ok(page) = found {
+            out.push(KindCount { kind: kind.as_str().to_string(), count: page.total });
+        }
+    }
+    out
 }
 
 /// Create a tag with no want attached — a preset to file later ideas

@@ -326,3 +326,37 @@ slot per side:
 The tell is a screen that looks right with your test data and breaks on
 real names. Any row that pairs caller-supplied text with chrome needs
 this; narrow surfaces (a sidebar, a drawer, a table cell) hit it first.
+
+### 23. A view that overflows must scroll on the axis it overflows
+
+`scroll_view` is **single-axis** — vertical unless you pass
+`horizontal = true`, and there is no both. Content that overflows the
+other axis is simply clipped, silently, with no scrollbar to admit it.
+A board of eight stages showed three and a half and looked complete.
+
+So a surface that can outgrow the viewport on both axes — a board, a
+diagram, a wide table — needs two nested scrollers, one per axis, and
+the nesting is not arbitrary:
+
+- **The outer scroller is the one that fills the pane**, and its
+  scrollbar therefore sits at the pane's edge. Put the inner scroller
+  outside and its bar floats in the middle of the screen, wherever the
+  content happens to end.
+- **The inner axis needs a DEFINITE size to scroll against.** A row
+  pinned with `min_height: 100%` still grows to its tallest child,
+  which pushes the outer scrollbar off-screen and re-creates the bug
+  one level down. Use `height: 100%`, and give every ancestor of the
+  scrolling child `min_height: 0` — that is what lets a flex item
+  shrink below its content, and without it nothing scrolls at all.
+- **Padding belongs to the content, not the scroller** (rule 3), or the
+  scrollbar is inset from the edge and the first item clips against the
+  pad.
+
+A corollary about surfaces: **a card that must be as wide as its
+content is not a card.** At eight stages its right border sits two
+screens away, so the border and background only ever read as the
+diagram having broken out of its box. Let the items be the cards and
+the strip be the row they sit in.
+
+The tell is a view that looks finished with three items and truncates
+at eight. Test wide and deep, not typical.

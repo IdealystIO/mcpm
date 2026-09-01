@@ -34,6 +34,8 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
     "chrono",
     "json",
+    # The co-touch batch stamp is a UUID column.
+    "uuid",
 ] }
 thiserror = "2"
 # The event fan-out: one listener task, a broadcast to every subscriber.

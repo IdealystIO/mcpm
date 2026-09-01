@@ -31,8 +31,18 @@ pub fn BoardView(props: &BoardViewProps) -> Element {
     let fi = props.feature;
     let selected = props.selected;
     let count = features()[fi].stages.len();
+    // `scroll_view` is single-axis, and the board overflows on both:
+    // wide in stages, tall in modules. So the axes are split across two
+    // nested scrollers.
+    //
+    // The HORIZONTAL one is the outer, and it fills the pane. That is
+    // what puts its scrollbar along the bottom of the screen instead of
+    // floating under the lanes wherever the tallest one happens to end.
+    // Each lane then scrolls its own cards vertically (see `LaneCards`),
+    // which is also what keeps every lane's header — the stage name and
+    // its progress — pinned while you read down a long one.
     ui! {
-        scroll_view(style = BoardScroll()) {
+        scroll_view(horizontal = true, style = BoardScroll()) {
             view(style = LaneRow()) {
                 for si in 0..count {
                     StageLane(console = console, feature = fi, stage = si, selected = selected)
@@ -101,7 +111,7 @@ pub fn StageLane(props: &StageLaneProps) -> Element {
                 }
                 Progress(value = fraction, tone = status_tone(status))
             }
-            view(style = LaneCards()) {
+            scroll_view(style = LaneCards()) {
                 for mi in 0..module_count {
                     ModuleCard(
                         console = console,
@@ -146,17 +156,33 @@ stylesheet! {
         base(t) {
             flex_grow: 1.0,
             min_height: 0,
+            min_width: 0,
         }
     }
 }
 
+// `Stretch`, not `FlexStart`: a lane has to be given the board's height
+// before it can decide its card list needs to scroll. Left to size
+// itself, every lane is exactly as tall as its content and nothing ever
+// overflows — which is the same clipping, one level down.
+//
+// Padding lives here rather than on the scroller so the scrollbar hugs
+// the container edge (rule 3).
 stylesheet! {
     pub LaneRow<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
-            align_items: AlignItems::FlexStart,
+            align_items: AlignItems::Stretch,
             gap: t.spacing.md(),
             padding: t.spacing.xl(),
+            // A DEFINITE height, not a minimum. `min_height` lets the
+            // row grow to its tallest lane, which then makes the whole
+            // board scroll vertically and pushes the horizontal
+            // scrollbar off the bottom of the screen — the exact bug
+            // this nesting exists to fix, reappearing as soon as one
+            // lane is deep. Pinned to the viewport, the lanes are
+            // bounded and their card lists scroll instead.
+            height: runtime_core::Length::Percent(100.0),
         }
     }
 }
@@ -171,6 +197,9 @@ stylesheet! {
             padding: t.spacing.md(),
             border_width: 1.0,
             border_radius: t.radius.lg(),
+            // Bounded by the row rather than by its own cards, so the
+            // card list inside has a definite height to scroll within.
+            min_height: 0,
         }
         variant state {
             #[default]
@@ -206,6 +235,11 @@ stylesheet! {
         base(t) {
             flex_direction: FlexDirection::Column,
             gap: t.spacing.sm(),
+            // Take the slack the lane's header and footer leave, and no
+            // more: `min_height: 0` is what lets a flex child shrink
+            // below its content and therefore scroll at all.
+            flex_grow: 1.0,
+            min_height: 0,
         }
     }
 }

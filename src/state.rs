@@ -85,6 +85,27 @@ pub struct Console {
     /// Zero-based page of the filtered list.
     pub feature_page: Signal<usize>,
 
+    // --- The knowledge screen's toolbar -----------------------------
+    /// Free text over the knowledge base. Ranked server-side, so this
+    /// is a query rather than a client-side filter.
+    pub know_query: Signal<String>,
+    /// Kinds to include. Empty means every kind.
+    pub know_kinds: Signal<Vec<String>>,
+    /// Tags an entry must carry, all of them.
+    pub know_tags: Signal<Vec<String>>,
+    /// Scope filter: "" (all) | "project" | "feature" | "module" | …
+    pub know_level: Signal<String>,
+    /// Zero-based page.
+    pub know_page: Signal<usize>,
+    /// The entry whose drawer is open, by id. An id and not an index:
+    /// a re-ranked result set slides a held index onto a different
+    /// entry, the same reason the want drawer addresses by id.
+    pub know_open: Signal<Option<String>>,
+    /// Show entries that have been superseded or disputed. Off by
+    /// default — the current answer is what a reader wants — but never
+    /// unavailable, because nothing here is ever deleted.
+    pub know_history: Signal<bool>,
+
     // --- The capture composer ---------------------------------------
     // These live here, not inside the composer component, so a data
     // poll that rebuilds the pool can never discard half-typed text.
@@ -141,6 +162,13 @@ pub fn use_console() -> Console {
         feature_query: signal(String::new()),
         feature_status: signal("all".to_string()),
         feature_page: signal(0),
+        know_query: signal(String::new()),
+        know_kinds: signal(Vec::new()),
+        know_tags: signal(Vec::new()),
+        know_level: signal(String::new()),
+        know_page: signal(0),
+        know_history: signal(false),
+        know_open: signal(None),
         draft: signal(String::new()),
         status: signal(String::new()),
         busy: signal(false),
@@ -193,6 +221,80 @@ impl Console {
     pub fn show_wants(&self) {
         self.pane.set("wants".to_string());
         self.close_drawer();
+    }
+
+    /// Show the knowledge base.
+    pub fn show_knowledge(&self) {
+        self.pane.set("knowledge".to_string());
+        self.close_drawer();
+    }
+
+    /// Narrow the knowledge base by free text.
+    pub fn set_know_query(&self, text: String) {
+        self.know_query.set(text);
+        self.know_page.set(0);
+    }
+
+    /// Add or remove one kind from the filter.
+    pub fn toggle_know_kind(&self, kind: &str) {
+        self.know_kinds.update(|kinds| {
+            let mut next = kinds.clone();
+            match next.iter().position(|k| k == kind) {
+                Some(at) => {
+                    next.remove(at);
+                }
+                None => next.push(kind.to_string()),
+            }
+            next
+        });
+        self.know_page.set(0);
+    }
+
+    /// Add or remove one tag from the filter.
+    pub fn toggle_know_tag(&self, tag: &str) {
+        self.know_tags.update(|tags| {
+            let mut next = tags.clone();
+            match next.iter().position(|t| t == tag) {
+                Some(at) => {
+                    next.remove(at);
+                }
+                None => next.push(tag.to_string()),
+            }
+            next
+        });
+        self.know_page.set(0);
+    }
+
+    /// Narrow to one scope level (or "" for all).
+    pub fn set_know_level(&self, level: String) {
+        self.know_level.set(level);
+        self.know_page.set(0);
+    }
+
+    /// Open one entry's detail drawer, or close it with `None`.
+    pub fn open_knowledge(&self, id: Option<String>) {
+        self.know_open.set(id);
+    }
+
+    /// Show or hide superseded and disputed entries.
+    pub fn set_know_history(&self, on: bool) {
+        self.know_history.set(on);
+        self.know_page.set(0);
+    }
+
+    /// Drop every knowledge filter at once.
+    pub fn clear_know_filters(&self) {
+        self.know_query.set(String::new());
+        self.know_kinds.set(Vec::new());
+        self.know_tags.set(Vec::new());
+        self.know_level.set(String::new());
+        self.know_history.set(false);
+        self.know_page.set(0);
+    }
+
+    /// Step the knowledge base's page.
+    pub fn set_know_page(&self, page: usize) {
+        self.know_page.set(page);
     }
 
     /// Show every feature, including the completed ones the rail hides.

@@ -93,8 +93,11 @@ blockers, premature claims, discovered tasks, stage_unlocked. Dispatch the next 
 escalate to the human. A premature_claim event means YOUR dispatch was early.\n\
 5. When every stage is done: complete_feature(feature_id, summary). The summary becomes \
 a feature-scope memory.\n\n\
-Record conventions and interface decisions with commit_memory at feature scope — \
-workers read them via search_memory(direction='up') before writing code."
+Record what the crew learns with commit_memory, at the narrowest scope it is actually \
+true at: kind='convention' or 'decision' at scope={{level:'project'}} for anything that \
+outlives this feature, at feature scope for what is only true here. Workers read both \
+via search_memory(direction='up'), which terminates at the project shelf — so a \
+practice filed under one feature is a practice the next feature's workers never see."
     );
     Ok(prompt_result("Manager operating protocol + live board.", &text))
 }
@@ -174,11 +177,16 @@ module, and the completed-module summaries from earlier stages.\n\
    - If claim_module returns STAGE_LOCKED: STOP. Do no work. Report the error to your \
 manager and end your turn — the server has already recorded the premature_claim event.\n\
 2. Before writing code, search_memory(scope={{level:'module', id:'{module_id}'}}, \
-direction='up') for conventions and interfaces decided upstream.\n\
+direction='up') for conventions and interfaces decided upstream — that walk ends at \
+the project's standing knowledge, so it covers house rules as well as this feature's. \
+Ask in plain words; matching is fuzzy. Narrow with kinds=['convention','gotcha'] when \
+you want the rules rather than the history.\n\
 3. Work the checklist: complete_task each item as it lands (not in a batch at the end). \
 When reality reveals work the plan missed, add_task it — it is recorded as discovered.\n\
-4. commit_memory (module scope) anything the next agent will need: decisions, gotchas, \
-interfaces exposed.\n\
+4. commit_memory anything the next agent will need, with the kind that fits \
+(decision, gotcha, reference). Module scope for what is true of your module; \
+scope={{level:'project'}} for something you learned that will bite anyone here, not \
+just the next worker on this feature.\n\
 5. Exit through exactly ONE door:\n\
    - complete_module(module_id, summary) — all tasks resolved; your summary is what \
 downstream workers read.\n\

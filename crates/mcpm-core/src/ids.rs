@@ -5,18 +5,33 @@
 use serde::{Deserialize, Serialize};
 
 /// Which level of the tree an id (or a memory scope) names.
+///
+/// `Project` is not part of the work tree — nothing is ever planned or
+/// claimed at project level. It exists so knowledge can be filed ABOVE
+/// the tree: a convention, a decision that binds every feature, a
+/// pointer to something external. It is the top of the `direction =
+/// up` chain, so a worker reading upward from its module reaches it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Level {
+    Project,
     Feature,
     Stage,
     Module,
     Task,
 }
 
+/// The single subject id every project-scoped memory pins to.
+///
+/// One deployment is one project (see the README), so this is a
+/// singleton rather than a row id — but it is spelled like an id so
+/// `id_level` recognizes it and the `subject_id` column stays uniform.
+pub const PROJECT_SUBJECT: &str = "proj_main";
+
 impl Level {
     pub fn prefix(self) -> &'static str {
         match self {
+            Level::Project => "proj",
             Level::Feature => "feat",
             Level::Stage => "stg",
             Level::Module => "mod",
@@ -26,6 +41,7 @@ impl Level {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Level::Project => "project",
             Level::Feature => "feature",
             Level::Stage => "stage",
             Level::Module => "module",
@@ -35,6 +51,7 @@ impl Level {
 
     pub fn from_str(s: &str) -> Option<Level> {
         match s {
+            "project" => Some(Level::Project),
             "feature" => Some(Level::Feature),
             "stage" => Some(Level::Stage),
             "module" => Some(Level::Module),
@@ -68,6 +85,7 @@ pub fn new_want_id() -> String {
 /// whose ops take any tree id).
 pub fn id_level(id: &str) -> Option<Level> {
     match id.split('_').next() {
+        Some("proj") => Some(Level::Project),
         Some("feat") => Some(Level::Feature),
         Some("stg") => Some(Level::Stage),
         Some("mod") => Some(Level::Module),

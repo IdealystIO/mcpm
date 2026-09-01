@@ -229,49 +229,232 @@ fn tree_tools() -> Value {
         },
         {
             "name": "commit_memory",
-            "description": "ANY AGENT. Pin a searchable note to one node of the tree: \
-                decisions, gotchas, interfaces, conventions. Workers commit at module scope; \
-                managers commit conventions at feature scope. Attribution is automatic.",
+            "description": "ANY AGENT. Write to the project's knowledge base — the shared, \
+                searchable record of what this crew knows. Pin it at the narrowest scope it \
+                is actually true at: 'project' for anything that outlives one feature (a \
+                convention, a tool choice, a standing gotcha), 'feature'/'stage'/'module'/'task' \
+                for what is only true there. Scope is what makes it findable later: a \
+                project-wide practice filed under one feature reads like a fact about that \
+                feature and nobody finds it again. Attribution is automatic.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "scope": {
                         "type": "object",
+                        "description": "Where this is true. Project scope needs no id.",
                         "properties": {
-                            "level": { "type": "string", "enum": ["task", "module", "stage", "feature"] },
-                            "id": { "type": "string" }
+                            "level": {
+                                "type": "string",
+                                "enum": ["project", "feature", "stage", "module", "task"]
+                            },
+                            "id": { "type": "string", "description": "Omit for project level." }
                         },
-                        "required": ["level", "id"]
+                        "required": ["level"]
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["convention", "decision", "gotcha", "outcome", "reference", "note"],
+                        "description": "What this IS. convention = a standing rule for how we \
+                            do something. decision = a choice and the reasoning that settled \
+                            it. gotcha = a trap that looks fine and is not. outcome = what \
+                            actually happened. reference = a pointer to a doc, ticket or \
+                            dashboard. note = none of those. Pick the honest one: it is a \
+                            filter every later reader uses."
                     },
                     "content": { "type": "string" },
-                    "tags": { "type": "array", "items": { "type": "string" } }
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "supersedes": {
+                        "type": "array",
+                        "description": "Memories this one replaces. THERE IS NO UPDATE TOOL: \
+                            memories are immutable, and correcting one means committing the \
+                            corrected version here with the old id listed. The old entry is \
+                            never deleted — it drops out of default results and stays \
+                            readable as history, because what the project used to believe is \
+                            part of what it knows.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "memory_id": { "type": "string" },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["replaces", "refutes", "revises", "consolidates"],
+                                    "description": "replaces = the fact changed (the world \
+                                        moved). refutes = it was wrong when written (we were \
+                                        wrong). revises = same fact, better words. \
+                                        consolidates = several folded into one. The first two \
+                                        are what 'what did we used to believe' returns, so \
+                                        picking honestly is what makes history readable."
+                                },
+                                "rationale": {
+                                    "type": "string",
+                                    "description": "Why this replaces that. Rides the link, \
+                                        and is often the only place the reason survives."
+                                }
+                            },
+                            "required": ["memory_id"]
+                        }
+                    }
                 },
                 "required": ["scope", "content"]
             }
         },
         {
             "name": "search_memory",
-            "description": "ANY AGENT. Full-text search over memories. Unscoped it searches \
-                the whole project. Scoped, direction picks the slice: 'up' = anchor + \
-                ancestors (a worker reading the conventions above its module), 'down' = \
-                anchor + descendants (a manager reading everything that happened inside its \
-                feature), 'here' = the anchor only. Empty query = newest first in scope.",
+            "description": "ANY AGENT. Query the project's knowledge base. Ask in your own \
+                words — matching is fuzzy: terms are stemmed, expanded through a synonym \
+                table, and matched against near-spellings, and a note answering three of \
+                your four words still comes back (ranked below one answering all four). \
+                Every other argument NARROWS. Unscoped it searches everything; scoped, \
+                direction picks the slice: 'up' = anchor + ancestors + the project's \
+                standing knowledge (what a worker should read before starting), 'down' = \
+                anchor + descendants (what a manager reads to see what happened inside a \
+                feature), 'here' = the anchor alone. Empty query = newest first in scope.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string" },
+                    "query": { "type": "string", "description": "Free text. A question is fine." },
+                    "kinds": {
+                        "type": "array",
+                        "description": "Restrict to these kinds. Omit for all of them.",
+                        "items": {
+                            "type": "string",
+                            "enum": ["convention", "decision", "gotcha", "outcome", "reference", "note"]
+                        }
+                    },
                     "scope": {
                         "type": "object",
                         "properties": {
-                            "level": { "type": "string", "enum": ["task", "module", "stage", "feature"] },
-                            "id": { "type": "string" }
+                            "level": {
+                                "type": "string",
+                                "enum": ["project", "feature", "stage", "module", "task"]
+                            },
+                            "id": { "type": "string", "description": "Omit for project level." }
                         },
-                        "required": ["level", "id"]
+                        "required": ["level"]
                     },
                     "direction": { "type": "string", "enum": ["here", "up", "down", "all"] },
-                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "tags": {
+                        "type": "array",
+                        "description": "Every tag must be present (AND, not OR).",
+                        "items": { "type": "string" }
+                    },
+                    "author": { "type": "string", "description": "Only this agent's writes." },
+                    "since": { "type": "string", "description": "RFC 3339 instant; written at or after it." },
+                    "until": { "type": "string", "description": "RFC 3339 instant; written before it." },
+                    "include_superseded": {
+                        "type": "boolean",
+                        "description": "Include entries that have been replaced or are \
+                            disputed. Off by default — you almost always want the current \
+                            answer. On, this is how you read what the project used to think."
+                    },
                     "limit": { "type": "integer" }
                 }
+            }
+        },
+        {
+            "name": "touch_memory",
+            "description": "ANY AGENT. Say which memories you actually USED. Bulk — pass \
+                every id you leaned on in one call. This is the only thing that records use: \
+                nothing is counted when a search merely returns something to you, because \
+                that would measure what the ranker chose to show rather than what helped. \
+                Touching keeps a memory ranking well and is how the crew learns which \
+                knowledge is load-bearing, so be honest in both directions — touching \
+                everything you were shown is the same as touching nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_ids": { "type": "array", "items": { "type": "string" } },
+                    "note": { "type": "string", "description": "Optional: what you used it for." }
+                },
+                "required": ["memory_ids"]
+            }
+        },
+        {
+            "name": "confirm_memory",
+            "description": "ANY AGENT. You checked this against reality and it holds. A \
+                stronger claim than touch_memory — use it when you verified, not when you \
+                merely relied on it. You cannot confirm a memory you wrote: corroboration \
+                needs independence.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string" },
+                    "note": { "type": "string", "description": "How you checked." }
+                },
+                "required": ["memory_id"]
+            }
+        },
+        {
+            "name": "dispute_memory",
+            "description": "ANY AGENT. This memory is wrong. It is NOT deleted — nothing here \
+                ever is — but it drops out of default search results until the dispute is \
+                resolved, and it stays readable as a record of what the project used to \
+                believe. You cannot dispute your own memory: commit a corrected one with \
+                supersedes[kind='refutes'] instead, which records what changed as well as \
+                that something did.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string" },
+                    "reason": {
+                        "type": "string",
+                        "description": "Required. A dispute nobody can evaluate cannot be \
+                            resolved, and it holds the memory out of circulation meanwhile."
+                    }
+                },
+                "required": ["memory_id", "reason"]
+            }
+        },
+        {
+            "name": "relate_memories",
+            "description": "ANY AGENT. Declare a standing relation between two existing \
+                memories. This describes how they sit together and retires neither — \
+                superseding is done at commit time through commit_memory's `supersedes`, \
+                which is what keeps the history acyclic. Use it when you notice two entries \
+                are connected and nothing says so: the graph grows by declared and confirmed \
+                links, never by inference.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_memory_id": { "type": "string" },
+                    "to_memory_id": { "type": "string" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["refines", "depends_on", "contradicts", "relates_to"],
+                        "description": "refines = FROM is a narrower case of TO. depends_on = \
+                            FROM is only true because TO is (so changing TO puts FROM at \
+                            risk). contradicts = they disagree and neither has won — a flag \
+                            for a human, not a vote. relates_to = plain association, the \
+                            weakest claim."
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Why they are connected. Rides the link and is often \
+                            the only place the reason survives."
+                    }
+                },
+                "required": ["from_memory_id", "to_memory_id", "kind"]
+            }
+        },
+        {
+            "name": "memory_history",
+            "description": "ANY AGENT. Everything the graph knows about one memory: what it \
+                replaced and what replaced it, the standing relations declared on it, and \
+                SUGGESTIONS — entries agents have repeatedly used in the same breath as this \
+                one but that nobody has linked. Use it when a current rule looks arbitrary \
+                (the reason usually lives in the edge, not in either entry), and act on a \
+                suggestion by calling relate_memories if it is real.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string" },
+                    "belief_only": {
+                        "type": "boolean",
+                        "description": "Default true: show only the steps where the belief \
+                            changed, collapsing rewordings. False gives every edit."
+                    }
+                },
+                "required": ["memory_id"]
             }
         },
         {

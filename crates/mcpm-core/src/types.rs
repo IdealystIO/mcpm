@@ -76,11 +76,398 @@ pub enum TaskOutcome {
     Skipped,
 }
 
-/// A memory scope: one node of the tree.
+/// A memory scope: one node of the tree, or the project above it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MemoryScope {
     pub level: Level,
+    /// The node's id. Optional in the wire form and ignored entirely at
+    /// project level, which is a singleton — an agent writes
+    /// `{"level": "project"}` and the store fills in the rest, because
+    /// making it quote an id it can neither discover nor vary would be
+    /// ceremony with no content.
+    #[serde(default)]
     pub id: String,
+}
+
+impl MemoryScope {
+    /// The whole project's shelf.
+    pub fn project() -> MemoryScope {
+        MemoryScope {
+            level: Level::Project,
+            id: crate::ids::PROJECT_SUBJECT.to_string(),
+        }
+    }
+
+    /// Fill in what the caller may leave out. Called on every scope the
+    /// store accepts, so the singleton's id is settled in one place.
+    pub fn normalized(mut self) -> MemoryScope {
+        if self.level == Level::Project {
+            self.id = crate::ids::PROJECT_SUBJECT.to_string();
+        }
+        self
+    }
+}
+
+/// What a memory IS, as distinct from what it is about.
+///
+/// A closed set on purpose. It is enumerated in the MCP tool schema, so
+/// an agent sees the whole vocabulary and picks from it rather than
+/// inventing a label — which is what keeps the facet queryable. The
+/// same discipline the tag registry applies to tags.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    /// A standing rule: how this project does something.
+    Convention,
+    /// A choice made and the reasoning that settled it.
+    Decision,
+    /// A trap: something that looks fine and is not.
+    Gotcha,
+    /// What actually happened when work was done.
+    Outcome,
+    /// A pointer outward — a doc, a ticket, a dashboard.
+    Reference,
+    /// Unclassified. What every memory written before kinds existed
+    /// backfilled to, and what an agent that did not say gets: honestly
+    /// different from claiming one of the others.
+    #[default]
+    Note,
+}
+
+impl MemoryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryKind::Convention => "convention",
+            MemoryKind::Decision => "decision",
+            MemoryKind::Gotcha => "gotcha",
+            MemoryKind::Outcome => "outcome",
+            MemoryKind::Reference => "reference",
+            MemoryKind::Note => "note",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<MemoryKind> {
+        match s {
+            "convention" => Some(MemoryKind::Convention),
+            "decision" => Some(MemoryKind::Decision),
+            "gotcha" => Some(MemoryKind::Gotcha),
+            "outcome" => Some(MemoryKind::Outcome),
+            "reference" => Some(MemoryKind::Reference),
+            "note" => Some(MemoryKind::Note),
+            _ => None,
+        }
+    }
+
+    /// Every kind, for the tool schema and the console's filter rail.
+    pub const ALL: [MemoryKind; 6] = [
+        MemoryKind::Convention,
+        MemoryKind::Decision,
+        MemoryKind::Gotcha,
+        MemoryKind::Outcome,
+        MemoryKind::Reference,
+        MemoryKind::Note,
+    ];
+}
+
+/// A claim an agent makes about a memory.
+///
+/// Never written by a search: use is attested, not observed. See
+/// KNOWLEDGE.md, "Use is attested, not observed".
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalKind {
+    /// "I used this." Cheap to give, weak evidence of truth.
+    Touch,
+    /// "I checked this and it holds."
+    Confirm,
+    /// "This is wrong."
+    Dispute,
+}
+
+impl SignalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignalKind::Touch => "touch",
+            SignalKind::Confirm => "confirm",
+            SignalKind::Dispute => "dispute",
+        }
+    }
+}
+
+/// How one memory supersedes another.
+///
+/// Split into "the belief changed" (`Replaces`, `Refutes`) and "the
+/// wording changed" (`Revises`, `Consolidates`), because those answer
+/// different questions about the history.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    /// The fact changed — the world moved.
+    #[default]
+    Replaces,
+    /// It was wrong when written — we were wrong.
+    Refutes,
+    /// Same fact, better words or corrected tags. Clerical.
+    Revises,
+    /// Several entries folded into one.
+    Consolidates,
+
+    // --- Standing relations. These describe; they retire nothing. ---
+    /// A narrower case of a broader rule.
+    Refines,
+    /// True only because the target is. Read the other way, this is the
+    /// blast radius of changing the target.
+    DependsOn,
+    /// Disagrees with the target, and neither has won yet. A flag for a
+    /// human — never averaged away.
+    Contradicts,
+    /// Plain association. The weakest claim, and what a confirmed
+    /// suggestion becomes when nobody says anything stronger.
+    RelatesTo,
+}
+
+impl EdgeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EdgeKind::Replaces => "replaces",
+            EdgeKind::Refutes => "refutes",
+            EdgeKind::Revises => "revises",
+            EdgeKind::Consolidates => "consolidates",
+            EdgeKind::Refines => "refines",
+            EdgeKind::DependsOn => "depends_on",
+            EdgeKind::Contradicts => "contradicts",
+            EdgeKind::RelatesTo => "relates_to",
+        }
+    }
+
+    /// Whether this edge RETIRES its target. Exactly the four
+    /// supersession kinds; everything else describes without withdrawing.
+    pub fn supersedes(self) -> bool {
+        matches!(
+            self,
+            EdgeKind::Replaces
+                | EdgeKind::Refutes
+                | EdgeKind::Revises
+                | EdgeKind::Consolidates
+        )
+    }
+
+    pub fn parse(s: &str) -> Option<EdgeKind> {
+        match s {
+            "replaces" => Some(EdgeKind::Replaces),
+            "refutes" => Some(EdgeKind::Refutes),
+            "revises" => Some(EdgeKind::Revises),
+            "consolidates" => Some(EdgeKind::Consolidates),
+            "refines" => Some(EdgeKind::Refines),
+            "depends_on" => Some(EdgeKind::DependsOn),
+            "contradicts" => Some(EdgeKind::Contradicts),
+            "relates_to" => Some(EdgeKind::RelatesTo),
+            _ => None,
+        }
+    }
+
+    /// Whether this edge marks a change of BELIEF rather than of
+    /// wording. `history` collapses the clerical ones by default: asking
+    /// "what did we used to think" and getting three rephrasings of one
+    /// idea buries the one place the idea actually changed.
+    pub fn changes_belief(self) -> bool {
+        matches!(self, EdgeKind::Replaces | EdgeKind::Refutes)
+    }
+}
+
+/// One supersession declared at commit time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Supersede {
+    /// The memory being superseded.
+    pub memory_id: String,
+    #[serde(default)]
+    pub kind: EdgeKind,
+    /// Why. Carried on the edge, not on either memory.
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// A memory's state, DERIVED from its edges and signals — never stored,
+/// so it cannot drift from the evidence.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryState {
+    /// Nothing supersedes it and nobody is disputing it.
+    #[default]
+    Current,
+    /// Something supersedes it. Still searchable; out of default results.
+    Superseded,
+    /// More agents say it is wrong than say it holds, and nothing has
+    /// replaced it yet. A manager's problem.
+    Disputed,
+}
+
+impl MemoryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryState::Current => "current",
+            MemoryState::Superseded => "superseded",
+            MemoryState::Disputed => "disputed",
+        }
+    }
+
+    /// Whether a default search returns it.
+    pub fn in_default_results(self) -> bool {
+        matches!(self, MemoryState::Current)
+    }
+}
+
+/// The evidence behind one memory's rank, decomposed.
+///
+/// Returned rather than reduced to a number on purpose: "stale, and two
+/// agents dispute it" is actionable where `0.31` is not, and every part
+/// of it is reconstructible from rows anyone can read.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Standing {
+    /// Distinct agents that used it.
+    pub touches: i64,
+    /// Distinct agents that verified it.
+    pub confirms: i64,
+    /// Distinct agents that say it is wrong.
+    pub disputes: i64,
+    /// Fraction of same-kind memories written after this one, 0..1.
+    /// The decay clock: how much the project has learned since.
+    pub newer_fraction: f32,
+    /// `tanh(k * weighted signal sum)`, in -1..1.
+    pub evidence: f32,
+    /// The rank multiplier this resolves to, never below the floor.
+    pub multiplier: f32,
+}
+
+/// One query against the knowledge base.
+///
+/// Every field narrows; none widens. An empty query with no filters is
+/// "everything, newest first", and each facet added removes rows rather
+/// than adding them — so a caller can reason about a query by reading
+/// it top to bottom, and a filter can never surprise them by pulling in
+/// something the previous line excluded.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MemoryQuery {
+    /// Free text. Matched against content by three routes at once —
+    /// exact phrase, expanded lexemes, and trigram similarity — and
+    /// used to rank. Empty means "do not filter by text".
+    #[serde(default)]
+    pub text: String,
+    /// Kinds to include. Empty means every kind.
+    #[serde(default)]
+    pub kinds: Vec<MemoryKind>,
+    /// Tags the memory must carry. Every one of them (AND, not OR —
+    /// filters narrow).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Only memories written by this agent.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Only memories written at or after this instant.
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    /// Only memories written before this instant.
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    /// The anchor node. `None` searches the whole project.
+    #[serde(default)]
+    pub scope: Option<MemoryScope>,
+    /// Which way to walk the tree from the anchor.
+    #[serde(default)]
+    pub direction: SearchDirection,
+    #[serde(default)]
+    pub limit: i64,
+    /// Rows to skip — the console's pager. Agents leave it at 0.
+    #[serde(default)]
+    pub offset: i64,
+    /// Include superseded entries whose successor REFUTED them.
+    ///
+    /// Narrower than `include_superseded` and used by the claim
+    /// briefing: "we tried this and it was wrong" is what stops a fresh
+    /// agent proposing it again, while a plain replacement has a
+    /// successor that says everything needed. A dead end is knowledge.
+    #[serde(default)]
+    pub include_refuted: bool,
+    /// Include superseded and disputed entries. Off by default: the
+    /// current answer is what a caller almost always wants. On, this is
+    /// how you read what the project used to believe — nothing is ever
+    /// deleted, so the history is always there to ask for.
+    #[serde(default)]
+    pub include_superseded: bool,
+}
+
+/// A search result: the memory plus why it surfaced.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemoryHit {
+    #[serde(flatten)]
+    pub memory: Memory,
+    /// Combined lexical + fuzzy score. Comparable within one result
+    /// set, meaningless across two — it is a sort key, not a
+    /// percentage, and presenting it as one would invite a reader to
+    /// draw conclusions it cannot support.
+    pub relevance: f32,
+}
+
+/// One step of a memory's lineage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryStep {
+    pub memory: Memory,
+    /// How this step relates to the one before it. `None` on the entry
+    /// the walk started from.
+    pub via: Option<EdgeKind>,
+    /// Why that edge exists.
+    pub rationale: String,
+}
+
+/// One standing relation, seen from a memory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Relation {
+    pub kind: EdgeKind,
+    /// Whether this memory is the SOURCE of the edge. `refines` read
+    /// outward is "this refines that"; read inward it is "that refines
+    /// this", and the two mean opposite things.
+    pub outgoing: bool,
+    pub rationale: String,
+    pub author: String,
+    pub other: Memory,
+}
+
+/// A relation the graph has not been told about, inferred from agents
+/// having leaned on both memories in the same breath.
+///
+/// A SUGGESTION, never an assertion: co-use is the weakest evidence a
+/// relation exists, and a graph that asserted them would fill with
+/// correlations wearing the same clothes as declared knowledge.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Suggestion {
+    pub other: Memory,
+    /// Distinct agents that used both in one `touch_memory` call.
+    pub co_touches: i64,
+}
+
+/// A memory's lineage, both directions from the anchor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryHistory {
+    /// The entry asked about.
+    pub anchor: Memory,
+    /// What it superseded, and what those superseded, oldest last.
+    pub supersedes: Vec<HistoryStep>,
+    /// What superseded it, newest last. Empty when it is current.
+    pub superseded_by: Vec<HistoryStep>,
+    /// Declared standing relations, both directions.
+    #[serde(default)]
+    pub relations: Vec<Relation>,
+    /// Undeclared relations the co-touch record hints at.
+    #[serde(default)]
+    pub suggestions: Vec<Suggestion>,
+}
+
+/// A page of results plus the total the filters matched, so a pager can
+/// say "1-20 of 142" without a second round trip.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemoryPage {
+    pub hits: Vec<MemoryHit>,
+    pub total: i64,
 }
 
 /// `search_memory` direction along the tree from the anchor scope.
@@ -96,6 +483,17 @@ pub enum SearchDirection {
     /// The whole project (the default when no scope is given).
     #[default]
     All,
+}
+
+impl SearchDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchDirection::Here => "here",
+            SearchDirection::Up => "up",
+            SearchDirection::Down => "down",
+            SearchDirection::All => "all",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -259,17 +657,23 @@ pub struct UpstreamSummary {
 }
 
 /// One memory (commit + search result).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
     pub level: String,
     pub subject_id: String,
     /// Name of the node the memory is pinned to.
     pub subject_name: String,
+    /// What this memory is — convention, decision, gotcha, …
+    pub kind: MemoryKind,
     pub content: String,
     pub tags: Vec<String>,
     pub author: String,
     pub created_at: DateTime<Utc>,
+    /// Derived from edges + signals, never stored.
+    pub state: MemoryState,
+    /// The evidence behind its rank, decomposed.
+    pub standing: Standing,
 }
 
 /// One event ledger entry.

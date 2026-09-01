@@ -315,9 +315,11 @@ rotate or forget it.
 - **The browser holds the console key in `localStorage`.** The
   `credentials` SDK errors on web rather than pretend the browser has a
   keychain, and web is the console's only target.
-- **No TLS of its own.** Both listeners speak plain HTTP; terminate TLS
-  at your ingress. A bearer token over plaintext on an untrusted network
-  is a token you have given away.
+- **No TLS of its own, by design.** Both listeners speak plain HTTP and
+  expect to sit behind an ingress that terminates TLS — a load balancer
+  for a public deployment, nothing at all for a private network. What
+  the deployment must not do is carry bearer tokens over plaintext
+  across a network it does not trust.
 - **No rate limiting** on the key check.
 
 ## Crates
@@ -325,7 +327,7 @@ rotate or forget it.
 | Crate | What it is |
 | --- | --- |
 | `crates/mcpm-core` | Domain and Postgres store. The stage gate, exclusive claims, checklist-proven completion, the want pool, the append-only event ledger, and scoped memory search. Every invariant is enforced inside a transaction. |
-| `crates/mcpm-mcp` | The MCP server: 22 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
+| `crates/mcpm-mcp` | The MCP server: 27 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, the `#[server]` functions and `#[subscription]` the console calls, plus the `mcpm-web` host binary (feature-gated). |
 | `src/` | The Idealyst console: want pool with capture composer, board, hierarchy, live feed, dependency graph, composed-from, and the module and want drawers. |
 

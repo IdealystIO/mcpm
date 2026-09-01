@@ -1,5 +1,6 @@
-//! Main pane: the want pool, the all-features screen, or one feature —
-//! header (title, stats, tabs) and the active view. Rebuilt via one
+//! Main pane: the want pool, the all-features screen, the knowledge
+//! base, or one feature — header (title, stats, tabs) and the active
+//! view. Rebuilt via one
 //! coarse `switch` whenever the pane, selection, view tab, tree toggles,
 //! or drawer target change, which keeps every view a plain function of
 //! state.
@@ -18,6 +19,7 @@ use crate::components::board::BoardView;
 use crate::components::feature_list::FeaturesView;
 use crate::components::feed::FeedView;
 use crate::components::graph::GraphView;
+use crate::components::knowledge::KnowledgeView;
 use crate::components::tree::TreeView;
 use crate::components::wants::WantsView;
 use crate::model::features;
@@ -46,7 +48,7 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             // here: both own their own data-keyed switches, and
             // rebuilding them from this one would recreate the field
             // the user is typing into every time a poll landed.
-            let rev = if pane == "wants" || pane == "features" {
+            let rev = if pane == "wants" || pane == "features" || pane == "knowledge" {
                 0
             } else {
                 console.rev.get()
@@ -67,6 +69,9 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             }
             if pane == "features" {
                 return ui! { FeaturesView(console = console) };
+            }
+            if pane == "knowledge" {
+                return ui! { KnowledgeView(console = console) };
             }
             if features().get(fi).is_none() {
                 return empty_pane();

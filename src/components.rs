@@ -10,6 +10,7 @@ pub mod feed;
 pub mod gate;
 pub mod graph;
 pub mod header;
+pub mod knowledge;
 pub mod main_pane;
 pub mod module_card;
 pub mod sidebar;

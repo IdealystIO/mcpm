@@ -14,8 +14,9 @@
 //! said who it is, and `get_context` takes no arguments at all.
 
 use mcpm_core::{
-    ErrorCode, KeyIdentity, KeyRole, McpmError, MemoryScope, PlanFeature, PlanOp, PromoteWants,
-    SearchDirection, Store, TaskOutcome, WantDraft, WantEdit, WantFilter, WantState,
+    EdgeKind, ErrorCode, KeyIdentity, KeyRole, McpmError, MemoryKind, MemoryQuery, MemoryScope, PlanFeature,
+    PlanOp, PromoteWants, SearchDirection, Store, Supersede, TaskOutcome, WantDraft, WantEdit,
+    WantFilter, WantState,
 };
 use serde_json::{json, Value};
 
@@ -238,12 +239,14 @@ async fn call_tool(
         "complete_module" => {
             let module_id = str_arg(args, "module_id")?;
             let summary = str_arg(args, "summary")?;
-            to_value(store.complete_module(&agent, &module_id, &summary).await?)
+            let used: Vec<String> = json_field(args, "used_memories")?.unwrap_or_default();
+            to_value(store.complete_module(&agent, &module_id, &summary, &used).await?)
         }
         "report_blocker" => {
             let module_id = str_arg(args, "module_id")?;
             let description = str_arg(args, "description")?;
-            to_value(store.report_blocker(&agent, &module_id, &description).await?)
+            let misled: Vec<String> = json_field(args, "misled_by")?.unwrap_or_default();
+            to_value(store.report_blocker(&agent, &module_id, &description, &misled).await?)
         }
         "release_module" => {
             let module_id = str_arg(args, "module_id")?;
@@ -252,6 +255,10 @@ async fn call_tool(
         }
         "commit_memory" => {
             let scope: MemoryScope = parse_field(args, "scope")?;
+            let kind: MemoryKind = match args.get("kind") {
+                None | Some(Value::Null) => MemoryKind::Note,
+                Some(kind) => serde_json::from_value(kind.clone()).map_err(bad_args)?,
+            };
             let content = str_arg(args, "content")?;
             let tags: Vec<String> = args
                 .get("tags")
@@ -259,10 +266,14 @@ async fn call_tool(
                 .transpose()
                 .map_err(bad_args)?
                 .unwrap_or_default();
-            to_value(store.commit_memory(&agent, scope, &content, &tags).await?)
+            let supersedes: Vec<Supersede> = json_field(args, "supersedes")?.unwrap_or_default();
+            to_value(
+                store
+                    .commit_memory(&agent, scope, kind, &content, &tags, &supersedes)
+                    .await?,
+            )
         }
         "search_memory" => {
-            let query = opt_str_arg(args, "query").unwrap_or_default();
             let scope: Option<MemoryScope> = match args.get("scope") {
                 None | Some(Value::Null) => None,
                 Some(scope) => Some(serde_json::from_value(scope.clone()).map_err(bad_args)?),
@@ -277,18 +288,27 @@ async fn call_tool(
                 }
                 Some(direction) => serde_json::from_value(direction.clone()).map_err(bad_args)?,
             };
-            let tags: Vec<String> = args
-                .get("tags")
-                .map(|t| serde_json::from_value(t.clone()))
-                .transpose()
-                .map_err(bad_args)?
-                .unwrap_or_default();
-            let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(20);
-            to_value(
-                store
-                    .search_memory(&query, scope, direction, &tags, limit)
-                    .await?,
-            )
+            let query = MemoryQuery {
+                text: opt_str_arg(args, "query").unwrap_or_default(),
+                kinds: json_field(args, "kinds")?.unwrap_or_default(),
+                tags: json_field(args, "tags")?.unwrap_or_default(),
+                author: opt_str_arg(args, "author"),
+                since: rfc3339(args, "since")?,
+                until: rfc3339(args, "until")?,
+                scope,
+                direction,
+                limit: args.get("limit").and_then(Value::as_i64).unwrap_or(20),
+                offset: 0,
+                include_superseded: args
+                    .get("include_superseded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                include_refuted: false,
+            };
+            // Agents get the hits; `total` is the console's pager
+            // business, and a count they cannot page through would only
+            // invite them to ask for more than the limit they set.
+            to_value(store.search_memory(&query).await?.hits)
         }
         "add_want" => {
             let body = str_arg(args, "body")?;
@@ -347,6 +367,36 @@ async fn call_tool(
             let req: PromoteWants = parse_args(args)?;
             to_value(store.promote_wants(&agent, req).await?)
         }
+        "touch_memory" => {
+            let ids: Vec<String> = parse_field(args, "memory_ids")?;
+            let note = opt_str_arg(args, "note").unwrap_or_default();
+            to_value(store.touch_memories(&agent, &ids, &note).await?)
+        }
+        "confirm_memory" => {
+            let id = str_arg(args, "memory_id")?;
+            let note = opt_str_arg(args, "note").unwrap_or_default();
+            to_value(store.confirm_memory(&agent, &id, &note).await?)
+        }
+        "dispute_memory" => {
+            let id = str_arg(args, "memory_id")?;
+            let reason = str_arg(args, "reason")?;
+            to_value(store.dispute_memory(&agent, &id, &reason).await?)
+        }
+        "relate_memories" => {
+            let from = str_arg(args, "from_memory_id")?;
+            let to = str_arg(args, "to_memory_id")?;
+            let kind: EdgeKind = parse_field(args, "kind")?;
+            let rationale = opt_str_arg(args, "rationale").unwrap_or_default();
+            to_value(store.relate_memories(&agent, &from, &to, kind, &rationale).await?)
+        }
+        "memory_history" => {
+            let id = str_arg(args, "memory_id")?;
+            let belief_only = args
+                .get("belief_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            to_value(store.memory_history(&id, belief_only).await?)
+        }
         "get_events" => {
             let feature_id = opt_str_arg(args, "feature_id");
             let since = args.get("since").and_then(Value::as_i64).unwrap_or(0);
@@ -382,6 +432,14 @@ pub async fn list_resources(store: &Store) -> Result<Value, McpmError> {
             "mimeType": "application/json"
         }),
         json!({
+            "uri": "project://knowledge",
+            "name": "Knowledge base",
+            "description": "What this crew knows: conventions, decisions, gotchas and \
+                outcomes, newest first. Search it with search_memory rather than reading \
+                it whole.",
+            "mimeType": "application/json"
+        }),
+        json!({
             "uri": "project://events",
             "name": "Event ledger",
             "description": "The append-only audit trail (most recent 500).",
@@ -409,6 +467,13 @@ pub async fn read_resource(store: &Store, params: &Value) -> Result<Value, McpmE
     } else if uri == "project://wants" {
         serde_json::to_value(store.list_wants("", mcpm_core::WantFilter::All, &[], 500).await?)
             .map_err(McpmError::internal)?
+    } else if uri == "project://knowledge" {
+        serde_json::to_value(
+            store
+                .search_memory(&mcpm_core::MemoryQuery { limit: 200, ..Default::default() })
+                .await?,
+        )
+        .map_err(McpmError::internal)?
     } else if uri == "project://events" {
         serde_json::to_value(store.get_events(None, 0, 500).await?).map_err(McpmError::internal)?
     } else if let Some(feature_id) = uri.strip_prefix("project://features/") {
@@ -443,6 +508,39 @@ fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
 
 fn parse_args<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, McpmError> {
     serde_json::from_value(args.clone()).map_err(bad_args)
+}
+
+/// An optional JSON-typed argument: absent and `null` both mean "not
+/// given", which is what an agent omitting a filter looks like on the
+/// wire.
+fn json_field<T: serde::de::DeserializeOwned>(
+    args: &Value,
+    key: &str,
+) -> Result<Option<T>, McpmError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(bad_args),
+    }
+}
+
+/// An optional RFC 3339 instant. Rejected loudly rather than silently
+/// ignored: a date filter that quietly did nothing would hand back a
+/// wider answer than the caller asked for, and they would believe it.
+fn rfc3339(args: &Value, key: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, McpmError> {
+    let Some(raw) = opt_str_arg(args, key).filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .map(|t| Some(t.with_timezone(&chrono::Utc)))
+        .map_err(|e| {
+            McpmError::new(
+                ErrorCode::PlanInvalid,
+                format!("'{key}' is not an RFC 3339 instant: {e}"),
+                Value::Null,
+                "Send something like 2026-09-01T00:00:00Z, or omit the argument to not filter \
+                 by date.",
+            )
+        })
 }
 
 fn parse_field<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, McpmError> {

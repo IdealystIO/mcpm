@@ -36,7 +36,7 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
     let agent = f.agent.to_string();
     let stage_count = f.stages.len();
     ui! {
-        scroll_view(style = GraphScroll()) {
+        view(style = GraphScroll()) {
             view(style = GraphPad()) {
                 view(style = LegendRowBox()) {
                     Spacer()
@@ -46,7 +46,13 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                                 Dimmed module: subagent not yet spawned.",
                     )
                 }
-                view(style = GraphStrip()) {
+                // The strip is a row of fixed-width stage nodes, so it
+                // outgrows the viewport as soon as a feature has more
+                // than a few stages. `scroll_view` is single-axis, so
+                // the wide part gets its own horizontal scroller rather
+                // than clipping inside the vertical one.
+                scroll_view(horizontal = true, style = StripScroll()) {
+                    view(style = GraphStrip()) {
                     view(style = AgentCell()) {
                         Stack(axis = StackAxis::Row, gap = StackGap::Xs, align = StackAlign::Center) {
                             text(style = SectionLabel()) { "Feature agent" }
@@ -62,6 +68,7 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                             stage = si,
                             selected = selected,
                         )
+                    }
                     }
                 }
             }
@@ -148,7 +155,7 @@ pub fn GraphStage(props: &GraphStageProps) -> Element {
                 kind = typography_kind::Body,
                 weight = Some(FontWeight::SemiBold),
             )
-            view(style = NodeModules()) {
+            scroll_view(style = NodeModules()) {
                 for mi in 0..module_count {
                     ModuleRow(
                         console = console,
@@ -164,11 +171,21 @@ pub fn GraphStage(props: &GraphStageProps) -> Element {
     }
 }
 
+// The graph is a canvas: it takes the pane rather than sizing to its
+// diagram, so the horizontal scrollbar lands at the bottom edge.
+//
+// A plain view and not a `scroll_view`, deliberately. Wrapping this in a
+// vertical scroller would make everything inside auto-height again —
+// scroll content sizes to itself — and the strip's `flex_grow` would
+// have nothing to grow against. The vertical overflow lives one level
+// in, on each stage node's module list, where it can actually be bounded.
 stylesheet! {
     pub GraphScroll<IdeaThemeRef> {
         base(t) {
             flex_grow: 1.0,
             min_height: 0,
+            min_width: 0,
+            flex_direction: FlexDirection::Column,
         }
     }
 }
@@ -177,22 +194,55 @@ stylesheet! {
     pub GraphPad<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Column,
-            gap: t.spacing.xl(),
-            padding: t.spacing.xl(),
+            gap: t.spacing.md(),
+            // Horizontal padding belongs to the strip, which scrolls;
+            // putting it here would inset the scrollbar from the pane
+            // edge and clip the first node against it (rule 3).
+            padding_top: t.spacing.lg(),
+            padding_horizontal: 0,
+            // Fills the pane so the strip below can too, which is what
+            // puts its horizontal scrollbar at the bottom of the screen
+            // rather than under the diagram.
+            flex_grow: 1.0,
+            min_height: 0,
         }
     }
 }
 
+// No padding here — it lives on `GraphStrip` inside, so the scrollbar
+// hugs the container edge (rule 3).
+stylesheet! {
+    pub StripScroll<IdeaThemeRef> {
+        base(t) {
+            min_width: 0,
+            flex_grow: 1.0,
+            min_height: 0,
+        }
+    }
+}
+
+// Not a card. A surface that has to be as wide as its content is not a
+// container the reader can see the edges of — at eight stages its right
+// border sits two screens away, so the border and background only ever
+// read as "the diagram is broken out of its box". The nodes are cards;
+// the strip is just the row they sit in.
 stylesheet! {
     pub GraphStrip<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Stretch,
-            padding: t.spacing.lg(),
-            border_width: 1.0,
-            border_color: t.color.border(),
-            border_radius: t.radius.lg(),
-            background: t.color.surface(),
+            // A DEFINITE height, not a minimum. `min_height` lets the
+            // row grow to its tallest lane, which then makes the whole
+            // board scroll vertically and pushes the horizontal
+            // scrollbar off the bottom of the screen — the exact bug
+            // this nesting exists to fix, reappearing as soon as one
+            // lane is deep. Pinned to the viewport, the lanes are
+            // bounded and their card lists scroll instead.
+            height: runtime_core::Length::Percent(100.0),
+            // Padding on the content, so the scrollbar hugs the
+            // container edge (rule 3).
+            padding_vertical: t.spacing.sm(),
+            padding_horizontal: t.spacing.xl(),
         }
     }
 }
@@ -245,6 +295,9 @@ stylesheet! {
             padding: t.spacing.md(),
             border_width: 1.0,
             border_radius: t.radius.md(),
+            // Bounded by the strip, so the module list inside has a
+            // definite height to scroll within.
+            min_height: 0,
         }
         variant state {
             #[default]
@@ -266,6 +319,11 @@ stylesheet! {
             flex_direction: FlexDirection::Column,
             gap: t.spacing.xs(),
             padding_top: 2,
+            // Takes the slack the node's header leaves, and no more:
+            // `min_height: 0` is what lets a flex child shrink below its
+            // content and therefore scroll at all.
+            flex_grow: 1.0,
+            min_height: 0,
         }
     }
 }
@@ -286,6 +344,7 @@ stylesheet! {
 stylesheet! {
     pub LegendRowBox<IdeaThemeRef> {
         base(t) {
+            padding_horizontal: t.spacing.xl(),
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
             gap: t.spacing.xs(),

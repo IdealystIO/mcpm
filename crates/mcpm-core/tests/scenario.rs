@@ -160,7 +160,7 @@ async fn the_worked_scenario() {
         assert_eq!(stranger_err.code, ErrorCode::NotClaimedByYou);
 
         // Completing with open tasks is refused, with the list.
-        let open_err = store.complete_module(w1, &m_schema, "too early").await.unwrap_err();
+        let open_err = store.complete_module(w1, &m_schema, "too early", &[]).await.unwrap_err();
         assert_eq!(open_err.code, ErrorCode::TasksOpen);
 
         // Skips need reasons.
@@ -199,14 +199,16 @@ async fn the_worked_scenario() {
             .commit_memory(
                 w1,
                 MemoryScope { level: Level::Module, id: m_schema.clone() },
+                MemoryKind::Decision,
                 "Money amounts are integer minor units; currency codes are ISO 4217.",
                 &["decision".into()],
+                &[],
             )
             .await
             .unwrap();
 
         let ack = store
-            .complete_module(w1, &m_schema, "Schema landed: reports + report_lines tables.")
+            .complete_module(w1, &m_schema, "Schema landed: reports + report_lines tables.", &[])
             .await
             .unwrap();
         assert!(ack.message.contains("unlocked stage 'API'"), "ack: {}", ack.message);
@@ -230,21 +232,23 @@ async fn the_worked_scenario() {
         // nothing module-scoped of stage 1 (different module), but the
         // feature-level search finds the schema decision via `down`.
         let found = store
-            .search_memory(
-                "currency",
-                Some(MemoryScope { level: Level::Feature, id: fid.clone() }),
-                SearchDirection::Down,
-                &[],
-                10,
-            )
+            .search_memory(&MemoryQuery {
+                text: "currency".into(),
+                scope: Some(MemoryScope { level: Level::Feature, id: fid.clone() }),
+                direction: SearchDirection::Down,
+                limit: 10,
+                ..Default::default()
+            })
             .await
             .unwrap();
-        assert_eq!(found.len(), 1);
-        assert!(found[0].content.contains("ISO 4217"));
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.total, 1);
+        assert!(found.hits[0].memory.content.contains("ISO 4217"));
+        assert_eq!(found.hits[0].memory.kind, MemoryKind::Decision);
 
         // Blocker path: report, manager sees it, then resume + finish.
         store
-            .report_blocker(w2, &m_api, "Rate provider credentials missing from env.")
+            .report_blocker(w2, &m_api, "Rate provider credentials missing from env.", &[])
             .await
             .unwrap();
         let status = store.feature_status(&fid, 0).await.unwrap();
@@ -258,7 +262,7 @@ async fn the_worked_scenario() {
                 .unwrap();
         }
         store
-            .complete_module(w2, &m_api, "Endpoints live: GET/POST /reports with contract tests.")
+            .complete_module(w2, &m_api, "Endpoints live: GET/POST /reports with contract tests.", &[])
             .await
             .unwrap();
 
@@ -291,7 +295,7 @@ async fn the_worked_scenario() {
                     .unwrap();
             }
             store
-                .complete_module(worker, module_id, "Done.")
+                .complete_module(worker, module_id, "Done.", &[])
                 .await
                 .unwrap();
         }
@@ -309,17 +313,31 @@ async fn the_worked_scenario() {
         // Completion summaries are memories: a whole-project search
         // finds the feature summary without anyone writing docs.
         let summaries = store
-            .search_memory("shipped", None, SearchDirection::All, &[], 10)
+            .search_memory(&MemoryQuery {
+                text: "shipped".into(),
+                limit: 10,
+                ..Default::default()
+            })
             .await
             .unwrap();
-        assert!(summaries.iter().any(|m| m.level == "feature"));
+        assert!(summaries
+            .hits
+            .iter()
+            .any(|h| h.memory.level == "feature" && h.memory.kind == MemoryKind::Outcome));
 
         // Tag-filtered search: the system-tagged module summaries.
         let sys = store
-            .search_memory("", None, SearchDirection::All, &["summary".into()], 50)
+            .search_memory(&MemoryQuery {
+                tags: vec!["summary".into()],
+                limit: 50,
+                ..Default::default()
+            })
             .await
             .unwrap();
-        assert!(sys.len() >= 4, "each module + feature completion committed a summary");
+        assert!(
+            sys.hits.len() >= 4,
+            "each module + feature completion committed a summary"
+        );
 
         // ---- get_context suggests resumes ---------------------------
         let ctx = store.get_context(manager, "manager").await.unwrap();
@@ -500,11 +518,16 @@ async fn wants_compose_into_features() {
         // The raw ideas reach the workers: promotion commits a
         // feature-scope memory that search_memory(up) will surface.
         let origin = store
-            .search_memory("spreadsheet", None, SearchDirection::All, &["origin".to_string()], 10)
+            .search_memory(&MemoryQuery {
+                text: "spreadsheet".into(),
+                tags: vec!["origin".to_string()],
+                limit: 10,
+                ..Default::default()
+            })
             .await
             .unwrap();
-        assert_eq!(origin.len(), 1, "origin memory committed with the promotion");
-        assert!(origin[0].content.contains("CSV is the first export format"));
+        assert_eq!(origin.hits.len(), 1, "origin memory committed with the promotion");
+        assert!(origin.hits[0].memory.content.contains("CSV is the first export format"));
 
         // --- A promoted want is frozen --------------------------------
         let frozen = store

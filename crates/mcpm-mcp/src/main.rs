@@ -1,3 +1,10 @@
+// `tools::tool_defs` builds the whole tool list as one `json!` literal,
+// and serde_json's macro recurses once per token. Twenty-six tools with
+// full schemas exceeds the default 128 frames — the error names the
+// macro rather than the file, so it is worth saying here that this is a
+// macro-expansion budget and not a runtime stack.
+#![recursion_limit = "1024"]
+
 //! `mcpm-mcp` — the Control Center MCP server.
 //!
 //! Two transports over one dispatcher ([`rpc`]):

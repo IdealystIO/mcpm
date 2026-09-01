@@ -433,6 +433,7 @@ impl Store {
             &mut tx,
             Level::Feature,
             feature_id,
+            MemoryKind::Outcome,
             summary,
             &["system", "summary"],
             agent,
@@ -701,18 +702,28 @@ impl Store {
 
         // --- The briefing --------------------------------------------
         let tasks = self.tasks_of(module_id).await?;
+        // Everything filed above this module, project conventions
+        // included — `up` terminates at the project shelf, so a worker
+        // is briefed with the standing rules and not just the ones
+        // somebody happened to pin to this feature.
         let ancestor_memories = self
-            .search_memory(
-                "",
-                Some(MemoryScope {
+            .search_memory(&MemoryQuery {
+                scope: Some(MemoryScope {
                     level: Level::Module,
                     id: module_id.to_string(),
                 }),
-                SearchDirection::Up,
-                &[],
-                25,
-            )
-            .await?;
+                direction: SearchDirection::Up,
+                limit: 25,
+                // Dead ends included. A worker that does not know X was
+                // tried and refuted will propose X.
+                include_refuted: true,
+                ..Default::default()
+            })
+            .await?
+            .hits
+            .into_iter()
+            .map(|h| h.memory)
+            .collect();
         let upstream = sqlx::query(
             "SELECT m.id, m.name, s.position, m.summary
              FROM modules m JOIN stages s ON s.id = m.stage_id
@@ -872,7 +883,21 @@ impl Store {
     /// The exit interview: refuses while tasks are open, commits the
     /// summary as a module-scope memory, and unlocks the next stage
     /// when this was the last module standing.
-    pub async fn complete_module(&self, agent: &str, module_id: &str, summary: &str) -> Result<Ack> {
+    /// Finish a module. `used` names the memories the work actually
+    /// leaned on.
+    ///
+    /// The exit doors are the best place to attest: the agent has just
+    /// finished and knows what helped, and — unlike at search time —
+    /// the OUTCOME is known. A touch recorded here rode work that
+    /// succeeded, which is the closest thing to accuracy evidence
+    /// available without asking anyone to grade anything.
+    pub async fn complete_module(
+        &self,
+        agent: &str,
+        module_id: &str,
+        summary: &str,
+        used: &[String],
+    ) -> Result<Ack> {
         if summary.trim().is_empty() {
             return Err(plan_invalid(
                 "complete_module requires a non-empty summary — it becomes the memory the \
@@ -935,7 +960,16 @@ impl Store {
             .bind(summary)
             .execute(&mut *tx)
             .await?;
-        insert_memory(&mut tx, Level::Module, module_id, summary, &["system", "summary"], agent).await?;
+        insert_memory(
+            &mut tx,
+            Level::Module,
+            module_id,
+            MemoryKind::Outcome,
+            summary,
+            &["system", "summary"],
+            agent,
+        )
+        .await?;
         record_event(
             &mut tx,
             "module_done",
@@ -945,6 +979,9 @@ impl Store {
             json!({ "module": module_name, "stage": stage_name }),
         )
         .await?;
+        // Attested use, inside the same transaction as the completion —
+        // so a touch recorded here is one that rode work that finished.
+        attest_used(&mut tx, agent, used, "carried this module").await?;
 
         // Stage completion → unlock the next stage.
         let stage_open: i64 = sqlx::query(
@@ -1002,7 +1039,21 @@ impl Store {
 
     /// Flag the module blocked; keeps the claim, records the blocker as
     /// a memory, raises `blocker_reported` for the manager.
-    pub async fn report_blocker(&self, agent: &str, module_id: &str, description: &str) -> Result<Ack> {
+    /// Report a blocker. `misled_by` names memories that turned out to
+    /// be wrong or misleading — the disconfirming half of the same
+    /// signal `complete_module` records.
+    ///
+    /// It records a touch rather than a dispute: "I relied on this and
+    /// got stuck" is weaker than "I checked this and it is wrong", and
+    /// conflating them would let every dead end withdraw a memory
+    /// nobody had actually examined.
+    pub async fn report_blocker(
+        &self,
+        agent: &str,
+        module_id: &str,
+        description: &str,
+        misled_by: &[String],
+    ) -> Result<Ack> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, s.feature_id
@@ -1020,7 +1071,17 @@ impl Store {
             .bind(module_id)
             .execute(&mut *tx)
             .await?;
-        insert_memory(&mut tx, Level::Module, module_id, description, &["system", "blocker"], agent).await?;
+        insert_memory(
+            &mut tx,
+            Level::Module,
+            module_id,
+            MemoryKind::Gotcha,
+            description,
+            &["system", "blocker"],
+            agent,
+        )
+        .await?;
+        attest_used(&mut tx, agent, misled_by, "relied on this and got stuck").await?;
         record_event(
             &mut tx,
             "blocker_reported",
@@ -1082,16 +1143,90 @@ impl Store {
         &self,
         agent: &str,
         scope: MemoryScope,
+        kind: MemoryKind,
         content: &str,
         tags: &[String],
+        supersedes: &[Supersede],
     ) -> Result<Memory> {
-        let subject_name = self
-            .subject_name(scope.level, &scope.id)
+        let scope = scope.normalized();
+        self.subject_name(scope.level, &scope.id)
             .await?
             .ok_or_else(|| McpmError::not_found(scope.level.as_str(), &scope.id))?;
+
+        // Idempotency. Agents retry, and a retry is not a new belief —
+        // it must not become a second row that then has to be
+        // superseded by hand. Only when nothing new is being asserted:
+        // a repeat that ALSO declares a supersession is a real write.
+        if supersedes.is_empty() {
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM memories
+                 WHERE level = $1 AND subject_id = $2 AND content = $3 AND author = $4
+                 ORDER BY created_at LIMIT 1",
+            )
+            .bind(scope.level.as_str())
+            .bind(&scope.id)
+            .bind(content)
+            .bind(agent)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(id) = existing {
+                return self
+                    .memory_by_id(&id)
+                    .await?
+                    .ok_or_else(|| McpmError::internal("memory vanished mid-commit"));
+            }
+        }
+
         let mut tx = self.pool.begin().await?;
         let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-        let id = insert_memory(&mut tx, scope.level, &scope.id, content, &tag_refs, agent).await?;
+        let id =
+            insert_memory(&mut tx, scope.level, &scope.id, kind, content, &tag_refs, agent).await?;
+
+        // The supersession edges, inside the same transaction as the
+        // memory they belong to: a correction that landed without its
+        // link would be an orphan claiming to be the current truth
+        // while the thing it replaced still read as current too.
+        for sup in supersedes {
+            let target: Option<String> =
+                sqlx::query_scalar("SELECT content FROM memories WHERE id = $1")
+                    .bind(&sup.memory_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let target = target.ok_or_else(|| McpmError::not_found("memory", &sup.memory_id))?;
+            if target == content {
+                return Err(McpmError::new(
+                    ErrorCode::PlanInvalid,
+                    format!(
+                        "The new memory is byte-identical to {} — superseding it would add a \
+                         step to the lineage that changed nothing.",
+                        sup.memory_id
+                    ),
+                    json!({ "memory_id": sup.memory_id }),
+                    "If the wording needed no change, you are agreeing with it: confirm_memory \
+                     records that. If it needed a change, make the change.",
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO memory_edges (from_id, to_id, kind, rationale, author)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&id)
+            .bind(&sup.memory_id)
+            .bind(sup.kind.as_str())
+            .bind(&sup.rationale)
+            .bind(agent)
+            .execute(&mut *tx)
+            .await?;
+            record_event(
+                &mut tx,
+                "memory_superseded",
+                None,
+                Some(&sup.memory_id),
+                Some(agent),
+                json!({ "by": id, "kind": sup.kind.as_str(), "rationale": sup.rationale }),
+            )
+            .await?;
+        }
         let feature_id = self.feature_of(scope.level, &scope.id).await?;
         record_event(
             &mut tx,
@@ -1099,84 +1234,517 @@ impl Store {
             feature_id.as_deref(),
             Some(&scope.id),
             Some(agent),
-            json!({ "level": scope.level.as_str(), "memory_id": id }),
+            json!({ "level": scope.level.as_str(), "kind": kind.as_str(), "memory_id": id }),
         )
         .await?;
         tx.commit().await?;
-        let row = sqlx::query("SELECT created_at FROM memories WHERE id = $1")
-            .bind(&id)
-            .fetch_one(&self.pool)
+        // Read it back through the same projection every other caller
+        // sees, so the returned memory carries its derived state and
+        // standing rather than a hand-built approximation of them.
+        self.memory_by_id(&id)
+            .await?
+            .ok_or_else(|| McpmError::internal("committed memory vanished before it could be read"))
+    }
+
+    /// Search the knowledge base.
+    ///
+    /// Three routes to a match, unioned, because they fail differently:
+    ///
+    /// - **Lexemes.** The stemmed `tsvector`, with each term OR'd
+    ///   against its synonyms so "db" reaches a note that says
+    ///   "postgres".
+    /// - **Any-term.** The same lexemes OR'd together, so a four-word
+    ///   question still finds the note that answers three of them.
+    ///   Without this a longer, more natural query returns strictly
+    ///   less than a shorter one.
+    /// - **Trigrams**, per term, catching typos and truncations the
+    ///   stemmer cannot recover from.
+    ///
+    /// That produces textual relevance. It is then multiplied by the
+    /// entry's standing — the evidence agents have given it, decayed by
+    /// how much the project has learned since it was written. The
+    /// multiplier never reaches zero (see `rank_floor`), so a stale,
+    /// disputed memory still surfaces for a caller who searches its
+    /// exact words. Nothing here is ever hidden by arithmetic; only
+    /// ranked lower.
+    ///
+    /// Superseded and disputed entries are out of the results unless
+    /// [`MemoryQuery::include_superseded`] asks for them.
+    pub async fn search_memory(&self, q: &MemoryQuery) -> Result<MemoryPage> {
+        let scope = q.scope.clone().map(MemoryScope::normalized);
+        let (unscoped, sets) = match (&scope, q.direction) {
+            (None, _) | (_, SearchDirection::All) => (true, SubjectSets::default()),
+            (Some(scope), SearchDirection::Down) if scope.level == Level::Project => {
+                (true, SubjectSets::default())
+            }
+            (Some(scope), dir) => (false, self.subject_sets(scope, dir).await?),
+        };
+
+        let terms = lexemes(&q.text);
+        // Three tsqueries, not two. `raw` carries only the words the
+        // caller actually typed: a note using their word must outrank
+        // one reached through a synonym, or expansion turns every
+        // database question into every database note.
+        let (strict, raw, loose) = if terms.is_empty() {
+            (String::new(), String::new(), String::new())
+        } else {
+            let groups = self.expand(&terms).await?;
+            (groups.join(" & "), terms.join(" | "), groups.join(" | "))
+        };
+        // Trigrams get a stricter list. A short function word scores a
+        // PERFECT similarity against any text containing it — measured,
+        // "the" scores 1.00 against a sentence with "the" in it — so a
+        // natural-language question would rank every entry by whichever
+        // one happened to contain its stop words, and the longest,
+        // most conversational queries would be the worst served.
+        //
+        // Four characters is where trigram similarity starts meaning
+        // something: below it there are too few trigrams for a match to
+        // be evidence of anything. Short terms still reach the tsquery,
+        // which stems and stop-words them properly.
+        let fuzzy: Vec<String> = terms.iter().filter(|t| t.len() >= 4).cloned().collect();
+        let kinds: Vec<String> = q.kinds.iter().map(|k| k.as_str().to_string()).collect();
+        let limit = if q.limit <= 0 { 20 } else { q.limit.clamp(1, 200) };
+        let offset = q.offset.max(0);
+
+        // One CTE so the count and the page come from the same
+        // predicate. Two statements would let a write between them
+        // report "1-20 of 19".
+        let sql = format!("
+            WITH {ctes},
+            matched AS (
+                SELECT {fields},
+                       (CASE WHEN cardinality($9::text[]) = 0 THEN 1.0
+                             ELSE 3.0 * ts_rank(mem.tsv, to_tsquery('english', $6))
+                                + 2.0 * ts_rank(mem.tsv, to_tsquery('english', $8))
+                                + 1.0 * ts_rank(mem.tsv, to_tsquery('english', $7))
+                                + 1.5 * (SELECT COALESCE(MAX(word_similarity(t2, mem.content)), 0)
+                                         FROM unnest($20::text[]) AS t2)
+                        END)::real AS relevance
+                {joins}
+                WHERE ($1 OR (mem.level = 'project' AND $2)
+                          OR (mem.level = 'feature' AND mem.subject_id = ANY($3))
+                          OR (mem.level = 'stage'   AND mem.subject_id = ANY($4))
+                          OR (mem.level = 'module'  AND mem.subject_id = ANY($5))
+                          OR (mem.level = 'task'    AND mem.subject_id = ANY($10)))
+                  -- Fuzzy matching is per TERM, not on the whole query
+                  -- string: two typos in one phrase drag the phrase's
+                  -- similarity below any usable threshold, while each
+                  -- misspelled word on its own still scores well against
+                  -- the word it meant.
+                  --
+                  -- An explicit threshold rather than the `<%` operator,
+                  -- whose cutoff is a session GUC we cannot set reliably
+                  -- from a pool. 0.5 sits in a wide gap: measured, a real
+                  -- transposition scores 0.57 and unrelated text 0.00.
+                  AND (cardinality($9::text[]) = 0
+                       OR mem.tsv @@ to_tsquery('english', $7)
+                       OR EXISTS (SELECT 1 FROM unnest($20::text[]) AS t2
+                                  WHERE word_similarity(t2, mem.content) > 0.5))
+                  AND (cardinality($11::text[]) = 0 OR mem.kind = ANY($11))
+                  AND (cardinality($12::text[]) = 0 OR mem.tags @> $12)
+                  AND ($13::text IS NULL OR mem.author = $13)
+                  AND ($14::timestamptz IS NULL OR mem.created_at >= $14)
+                  AND ($15::timestamptz IS NULL OR mem.created_at < $15)
+                  AND ($18
+                       OR (COALESCE(ed.superseded_by, 0) = 0
+                           AND COALESCE(sig.disputes, 0) <= COALESCE(sig.confirms, 0))
+                       -- A refuted entry rides along when asked for: the
+                       -- successor says what is true now, and this says
+                       -- what was already tried and did not work.
+                       OR ($19 AND EXISTS (SELECT 1 FROM memory_edges r
+                                           WHERE r.to_id = mem.id AND r.kind = 'refutes')))
+            )
+            SELECT *, COUNT(*) OVER () AS total,
+                   (relevance * multiplier)::real AS score
+            FROM matched
+            ORDER BY score DESC, created_at DESC
+            LIMIT $16 OFFSET $17",
+            ctes = MEMORY_CTES, fields = MEMORY_FIELDS, joins = MEMORY_JOINS);
+
+        let rows = sqlx::query(&sql)
+            .bind(unscoped)
+            .bind(sets.project)
+            .bind(&sets.features)
+            .bind(&sets.stages)
+            .bind(&sets.modules)
+            .bind(&strict)
+            .bind(&loose)
+            .bind(&raw)
+            .bind(&terms)
+            .bind(&sets.tasks)
+            .bind(&kinds)
+            .bind(&q.tags)
+            .bind(&q.author)
+            .bind(q.since)
+            .bind(q.until)
+            .bind(limit)
+            .bind(offset)
+            .bind(q.include_superseded)
+            .bind(q.include_refuted)
+            .bind(&fuzzy)
+            .fetch_all(&self.pool)
             .await?;
-        Ok(Memory {
-            id,
-            level: scope.level.as_str().to_string(),
-            subject_id: scope.id,
-            subject_name,
-            content: content.to_string(),
-            tags: tags.to_vec(),
-            author: agent.to_string(),
-            created_at: row.get("created_at"),
+
+        let total = rows.first().map(|r| r.get::<i64, _>("total")).unwrap_or(0);
+        Ok(MemoryPage {
+            total,
+            hits: rows
+                .iter()
+                .map(|r| MemoryHit { relevance: r.get::<f32, _>("score"), memory: map_memory(r) })
+                .collect(),
         })
     }
 
-    /// Full-text search over memories, scoped by an anchor + direction.
-    /// An empty query returns the scope's memories newest-first.
-    pub async fn search_memory(
+    /// Expand each term into a parenthesised `(term|synonym|…)` group,
+    /// ready to be joined into a tsquery.
+    ///
+    /// The last term also gets a `:*` prefix match, so a half-typed word
+    /// in a live search box narrows instead of returning nothing — which
+    /// is what makes the console's field feel like search rather than a
+    /// submit button.
+    async fn expand(&self, terms: &[String]) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT term, synonyms FROM knowledge_synonyms WHERE term = ANY($1)")
+            .bind(terms)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut out = Vec::with_capacity(terms.len());
+        for (i, term) in terms.iter().enumerate() {
+            let mut group: Vec<String> = vec![term.clone()];
+            if let Some(row) = rows.iter().find(|r| r.get::<String, _>("term") == *term) {
+                group.extend(row.get::<Vec<String>, _>("synonyms"));
+            }
+            if i + 1 == terms.len() {
+                // Prefix-match the word still being typed. Only the
+                // last one: mid-query terms are finished words, and
+                // prefixing them would quietly widen every result.
+                group[0] = format!("{term}:*");
+            }
+            out.push(format!("({})", group.join(" | ")));
+        }
+        Ok(out)
+    }
+
+
+    // -----------------------------------------------------------------
+    // The memory graph
+    // -----------------------------------------------------------------
+    //
+    // Everything here is append-only. Nothing updates a memory and
+    // nothing deletes one; a correction is a NEW memory carrying a
+    // supersession edge, and evidence accumulates as rows rather than
+    // as a number on the memory it is about. See KNOWLEDGE.md.
+
+    /// Attest that these memories were used. Bulk, because an agent that
+    /// leaned on five entries should say so once.
+    ///
+    /// Unknown ids are reported rather than ignored: an agent touching
+    /// an id that does not exist has misread something, and silently
+    /// accepting it would hide that.
+    pub async fn touch_memories(&self, agent: &str, ids: &[String], note: &str) -> Result<Ack> {
+        if ids.is_empty() {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                "touch_memory needs at least one memory id.",
+                json!({}),
+                "Pass the ids of the memories you actually used. If you used none, call \
+                 nothing — an empty touch is not a claim.",
+            ));
+        }
+        // One batch id for the whole call: a bulk touch is one act of
+        // "I leaned on these together", and that co-occurrence is what
+        // the suggestion query later reads.
+        let batch = uuid::Uuid::new_v4();
+        let mut tx = self.pool.begin().await?;
+        let mut recorded = Vec::new();
+        for id in ids {
+            let exists: Option<String> = sqlx::query_scalar("SELECT id FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_none() {
+                return Err(McpmError::not_found("memory", id));
+            }
+            insert_signal(&mut tx, id, agent, SignalKind::Touch, note, Some(batch)).await?;
+            recorded.push(id.clone());
+        }
+        tx.commit().await?;
+        Ok(Ack {
+            ok: true,
+            message: format!("Recorded {} touch(es).", recorded.len()),
+            data: json!({ "touched": recorded }),
+        })
+    }
+
+    /// "I checked this and it holds."
+    pub async fn confirm_memory(&self, agent: &str, id: &str, note: &str) -> Result<Ack> {
+        self.attest(agent, id, SignalKind::Confirm, note).await
+    }
+
+    /// "This is wrong." Does not delete anything: it takes the memory
+    /// out of default results and leaves it findable, because a wrong
+    /// belief the project once held is part of the record.
+    pub async fn dispute_memory(&self, agent: &str, id: &str, note: &str) -> Result<Ack> {
+        if note.trim().is_empty() {
+            return Err(McpmError::new(
+                ErrorCode::SkipNeedsReason,
+                "A dispute needs a reason.",
+                json!({ "memory_id": id }),
+                "Say what is wrong with it. A dispute with no reason cannot be resolved by \
+                 anyone but you, and it takes the memory out of circulation until someone does.",
+            ));
+        }
+        self.attest(agent, id, SignalKind::Dispute, note).await
+    }
+
+    /// The shared body of confirm/dispute, including the independence
+    /// rule: an agent cannot corroborate or refute its own memory.
+    /// Grading your own work is not evidence, and letting it count would
+    /// make the confirm count a measure of how many memories an eager
+    /// agent wrote.
+    async fn attest(
         &self,
-        query: &str,
-        scope: Option<MemoryScope>,
-        direction: SearchDirection,
-        tags: &[String],
-        limit: i64,
-    ) -> Result<Vec<Memory>> {
-        let (unscoped, sets) = match (&scope, direction) {
-            (None, _) | (_, SearchDirection::All) => (true, SubjectSets::default()),
-            (Some(scope), dir) => (false, self.subject_sets(scope, dir).await?),
-        };
-        let limit = limit.clamp(1, 100);
-        let rows = sqlx::query(
-            "SELECT mem.id, mem.level, mem.subject_id, mem.content, mem.tags, mem.author,
-                    mem.created_at,
-                    COALESCE(f.name, s.name, m.name, t.name, mem.subject_id) AS subject_name
-             FROM memories mem
-             LEFT JOIN features f ON mem.level = 'feature' AND f.id = mem.subject_id
-             LEFT JOIN stages s   ON mem.level = 'stage'   AND s.id = mem.subject_id
-             LEFT JOIN modules m  ON mem.level = 'module'  AND m.id = mem.subject_id
-             LEFT JOIN tasks t    ON mem.level = 'task'    AND t.id = mem.subject_id
-             WHERE ($1 OR (mem.level = 'feature' AND mem.subject_id = ANY($2))
-                       OR (mem.level = 'stage'   AND mem.subject_id = ANY($3))
-                       OR (mem.level = 'module'  AND mem.subject_id = ANY($4))
-                       OR (mem.level = 'task'    AND mem.subject_id = ANY($5)))
-               AND ($6 = '' OR mem.tsv @@ websearch_to_tsquery('english', $6))
-               AND (cardinality($7::text[]) = 0 OR mem.tags && $7)
-             ORDER BY CASE WHEN $6 = '' THEN 0
-                           ELSE ts_rank(mem.tsv, websearch_to_tsquery('english', $6)) END DESC,
-                      mem.created_at DESC
-             LIMIT $8",
+        agent: &str,
+        id: &str,
+        kind: SignalKind,
+        note: &str,
+    ) -> Result<Ack> {
+        let author: Option<String> = sqlx::query_scalar("SELECT author FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let author = author.ok_or_else(|| McpmError::not_found("memory", id))?;
+        if author == agent {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                format!("You wrote {id}; you cannot {} your own memory.", kind.as_str()),
+                json!({ "memory_id": id, "author": author }),
+                "Corroboration needs independence. If you have learned this is wrong, commit a \
+                 new memory that supersedes it with kind='refutes' instead — that records both \
+                 what changed and why.",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        insert_signal(&mut tx, id, agent, kind, note, None).await?;
+        tx.commit().await?;
+        Ok(Ack {
+            ok: true,
+            message: format!("Recorded {} on {id}.", kind.as_str()),
+            data: json!({ "memory_id": id, "signal": kind.as_str() }),
+        })
+    }
+
+    /// A memory's lineage in both directions.
+    ///
+    /// `belief_only` collapses the clerical steps (`revises`,
+    /// `consolidates`): asking what the project used to think and
+    /// getting three rephrasings of one idea buries the one place the
+    /// idea actually changed.
+    pub async fn memory_history(&self, id: &str, belief_only: bool) -> Result<MemoryHistory> {
+        let anchor = self
+            .memory_by_id(id)
+            .await?
+            .ok_or_else(|| McpmError::not_found("memory", id))?;
+        Ok(MemoryHistory {
+            anchor,
+            supersedes: self.walk(id, true, belief_only).await?,
+            superseded_by: self.walk(id, false, belief_only).await?,
+            relations: self.relations_of(id).await?,
+            suggestions: self.suggestions_for(id).await?,
+        })
+    }
+
+    /// Declare a standing relation between two memories.
+    ///
+    /// Separate from supersession on purpose: this describes how two
+    /// things sit together and retires neither. Supersession stays
+    /// commit-time-only, which is what keeps that spine acyclic.
+    pub async fn relate_memories(
+        &self,
+        agent: &str,
+        from: &str,
+        to: &str,
+        kind: EdgeKind,
+        rationale: &str,
+    ) -> Result<Ack> {
+        if kind.supersedes() {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                format!("'{}' retires a memory; it cannot be declared between two that already exist.", kind.as_str()),
+                json!({ "kind": kind.as_str() }),
+                "Supersession is declared when the replacement is COMMITTED — pass it to \
+                 commit_memory's `supersedes`. That is what guarantees the history has no \
+                 cycles. Use refines, depends_on, contradicts or relates_to here.",
+            ));
+        }
+        if from == to {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                "A memory cannot relate to itself.".to_string(),
+                json!({ "memory_id": from }),
+                "Pass two different memory ids.",
+            ));
+        }
+        for id in [from, to] {
+            if self.memory_by_id(id).await?.is_none() {
+                return Err(McpmError::not_found("memory", id));
+            }
+        }
+        let done = sqlx::query(
+            "INSERT INTO memory_edges (from_id, to_id, kind, rationale, author)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (from_id, to_id) DO NOTHING",
         )
-        .bind(unscoped)
-        .bind(&sets.features)
-        .bind(&sets.stages)
-        .bind(&sets.modules)
-        .bind(&sets.tasks)
-        .bind(query)
-        .bind(tags)
-        .bind(limit)
-        .fetch_all(&self.pool)
+        .bind(from)
+        .bind(to)
+        .bind(kind.as_str())
+        .bind(rationale)
+        .bind(agent)
+        .execute(&self.pool)
         .await?;
+        Ok(Ack {
+            ok: true,
+            message: if done.rows_affected() > 0 {
+                format!("{from} {} {to}.", kind.as_str())
+            } else {
+                format!("{from} and {to} were already linked.")
+            },
+            data: json!({ "from": from, "to": to, "kind": kind.as_str() }),
+        })
+    }
+
+    /// Declared standing relations on a memory, both directions.
+    async fn relations_of(&self, id: &str) -> Result<Vec<Relation>> {
+        let sql = format!("
+            WITH {ctes}
+            SELECT {fields}, e.kind AS edge_kind, e.rationale, e.author AS edge_author,
+                   (e.from_id = $1) AS outgoing
+            {joins}
+            JOIN memory_edges e
+              ON (e.from_id = $1 AND e.to_id = mem.id)
+              OR (e.to_id = $1 AND e.from_id = mem.id)
+            WHERE e.kind NOT IN ('replaces', 'refutes', 'revises', 'consolidates')
+            ORDER BY e.at DESC",
+            ctes = MEMORY_CTES, fields = MEMORY_FIELDS, joins = MEMORY_JOINS);
+        let rows = sqlx::query(&sql).bind(id).fetch_all(&self.pool).await?;
         Ok(rows
-            .into_iter()
-            .map(|r| Memory {
-                id: r.get("id"),
-                level: r.get("level"),
-                subject_id: r.get("subject_id"),
-                subject_name: r.get("subject_name"),
-                content: r.get("content"),
-                tags: r.get("tags"),
-                author: r.get("author"),
-                created_at: r.get("created_at"),
+            .iter()
+            .filter_map(|r| {
+                Some(Relation {
+                    kind: EdgeKind::parse(r.get::<String, _>("edge_kind").as_str())?,
+                    outgoing: r.get("outgoing"),
+                    rationale: r.get("rationale"),
+                    author: r.get("edge_author"),
+                    other: map_memory(r),
+                })
             })
             .collect())
+    }
+
+    /// Relations nobody has declared, inferred from agents having used
+    /// two memories in the same breath.
+    ///
+    /// Deliberately returned as candidates and never written. Co-use is
+    /// the weakest evidence a relation exists — two memories can be
+    /// read together for a hundred reasons — so it earns a question,
+    /// not an edge. Anything already declared or superseded is excluded:
+    /// suggesting what somebody has said trains a reader to ignore the
+    /// list.
+    async fn suggestions_for(&self, id: &str) -> Result<Vec<Suggestion>> {
+        let sql = format!("
+            WITH {ctes},
+            mine AS (
+                SELECT DISTINCT batch FROM memory_signals
+                WHERE memory_id = $1 AND kind = 'touch' AND batch IS NOT NULL
+            ),
+            co AS (
+                SELECT s.memory_id, COUNT(DISTINCT s.agent) AS co_touches
+                FROM memory_signals s JOIN mine ON mine.batch = s.batch
+                WHERE s.memory_id <> $1 AND s.kind = 'touch'
+                GROUP BY s.memory_id
+            )
+            SELECT {fields}, co.co_touches
+            {joins}
+            JOIN co ON co.memory_id = mem.id
+            WHERE NOT EXISTS (SELECT 1 FROM memory_edges e
+                              WHERE (e.from_id = $1 AND e.to_id = mem.id)
+                                 OR (e.to_id = $1 AND e.from_id = mem.id))
+              AND COALESCE(ed.superseded_by, 0) = 0
+            ORDER BY co.co_touches DESC, mem.created_at DESC
+            LIMIT 5",
+            ctes = MEMORY_CTES, fields = MEMORY_FIELDS, joins = MEMORY_JOINS);
+        let rows = sqlx::query(&sql).bind(id).fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| Suggestion { other: map_memory(r), co_touches: r.get("co_touches") })
+            .collect())
+    }
+
+    /// Walk the supersession spine. `backwards` follows what this
+    /// memory superseded; otherwise what superseded it.
+    async fn walk(&self, id: &str, backwards: bool, belief_only: bool) -> Result<Vec<HistoryStep>> {
+        // Edges always point from newer to older (they can only be
+        // declared when the newer memory is committed), so this
+        // recursion is guaranteed to terminate — there is no cycle to
+        // guard against. The depth cap is belt and braces.
+        let (seed, step) = if backwards {
+            ("e.from_id = $1", "e.from_id = h.next_id")
+        } else {
+            ("e.to_id = $1", "e.to_id = h.next_id")
+        };
+        let next = if backwards { "e.to_id" } else { "e.from_id" };
+        let sql = format!("
+            WITH {ctes},
+            RECURSIVE_PLACEHOLDER
+            SELECT {fields}, h.depth, h.via, h.rationale
+            {joins}
+            JOIN hops h ON h.next_id = mem.id
+            ORDER BY h.depth",
+            ctes = MEMORY_CTES, fields = MEMORY_FIELDS, joins = MEMORY_JOINS);
+        // The recursive term has to come first in the WITH list, so it
+        // is spliced in rather than appended.
+        let hops = format!("
+            hops AS (
+                WITH RECURSIVE r(next_id, via, rationale, depth) AS (
+                    SELECT {next}, e.kind, e.rationale, 1
+                    FROM memory_edges e WHERE {seed}
+                    UNION ALL
+                    SELECT {next}, e.kind, e.rationale, r.depth + 1
+                    FROM memory_edges e JOIN r ON {step_r}
+                    WHERE r.depth < 64
+                )
+                SELECT * FROM r
+            )",
+            next = next,
+            seed = seed,
+            step_r = step.replace("h.next_id", "r.next_id"));
+        let sql = sql.replace("RECURSIVE_PLACEHOLDER", hops.trim_start());
+
+        let rows = sqlx::query(&sql).bind(id).fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let via = EdgeKind::parse(r.get::<String, _>("via").as_str());
+                if belief_only && !via.map(EdgeKind::changes_belief).unwrap_or(true) {
+                    return None;
+                }
+                Some(HistoryStep {
+                    memory: map_memory(r),
+                    via,
+                    rationale: r.get("rationale"),
+                })
+            })
+            .collect())
+    }
+
+    /// One memory by id, scored, whatever its state.
+    pub async fn memory_by_id(&self, id: &str) -> Result<Option<Memory>> {
+        let sql = format!(
+            "WITH {ctes} SELECT {fields} {joins} WHERE mem.id = $1",
+            ctes = MEMORY_CTES, fields = MEMORY_FIELDS, joins = MEMORY_JOINS
+        );
+        let row = sqlx::query(&sql).bind(id).fetch_optional(&self.pool).await?;
+        Ok(row.as_ref().map(map_memory))
     }
 
     // -----------------------------------------------------------------
@@ -1628,6 +2196,7 @@ impl Store {
             &mut tx,
             Level::Feature,
             &feature_id,
+            MemoryKind::Decision,
             origin.trim_end(),
             &["wants", "origin"],
             agent,
@@ -1896,7 +2465,19 @@ impl Store {
     }
 
     async fn subject_name(&self, level: Level, id: &str) -> Result<Option<String>> {
+        // Project scope is a singleton with no row of its own in the
+        // tree; its "name" is the project's.
+        if level == Level::Project {
+            let row = sqlx::query("SELECT name FROM project WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+            return Ok(Some(
+                row.map(|r| r.get::<String, _>("name"))
+                    .unwrap_or_else(|| "project".to_string()),
+            ));
+        }
         let table = match level {
+            Level::Project => unreachable!("handled above"),
             Level::Feature => "features",
             Level::Stage => "stages",
             Level::Module => "modules",
@@ -1911,7 +2492,13 @@ impl Store {
 
     /// The feature an id belongs to (for event attribution).
     async fn feature_of(&self, level: Level, id: &str) -> Result<Option<String>> {
+        // A project-scoped memory belongs to no feature — that is the
+        // point of the scope — so its event carries no feature_id.
+        if level == Level::Project {
+            return Ok(None);
+        }
         let sql = match level {
+            Level::Project => unreachable!("handled above"),
             Level::Feature => "SELECT id AS feature_id FROM features WHERE id = $1",
             Level::Stage => "SELECT feature_id FROM stages WHERE id = $1",
             Level::Module => {
@@ -1930,8 +2517,17 @@ impl Store {
     async fn subject_sets(&self, scope: &MemoryScope, dir: SearchDirection) -> Result<SubjectSets> {
         let mut sets = SubjectSets::default();
         // The anchor's ancestor chain (feature, stage?, module?, task?).
+        // A project anchor has no ancestor chain: it IS the top. `here`
+        // and `up` both mean the project's own shelf; `down` means
+        // everything, which the caller handles by leaving the sets
+        // empty and unscoping the query.
+        if scope.level == Level::Project {
+            sets.project = true;
+            return Ok(sets);
+        }
         let (feature, stage, module, task): (Option<String>, Option<String>, Option<String>, Option<String>) =
             match scope.level {
+                Level::Project => unreachable!("handled above"),
                 Level::Feature => (Some(scope.id.clone()), None, None, None),
                 Level::Stage => {
                     let r = sqlx::query("SELECT feature_id FROM stages WHERE id = $1")
@@ -1978,6 +2574,7 @@ impl Store {
 
         // `here`: the anchor only. `up`: anchor + ancestors.
         match scope.level {
+            Level::Project => unreachable!("handled above"),
             Level::Feature => sets.features.extend(feature.clone()),
             Level::Stage => sets.stages.extend(stage.clone()),
             Level::Module => sets.modules.extend(module.clone()),
@@ -1988,11 +2585,18 @@ impl Store {
             sets.stages.extend(stage.clone());
             sets.modules.extend(module.clone());
             sets.tasks.extend(task.clone());
+            // The chain now terminates at the project, so a worker
+            // reading upward from its module reaches the standing
+            // conventions — which is the whole reason project scope
+            // exists. Leaving it out would make `up` mean "everything
+            // above me except the part that always applies".
+            sets.project = true;
             sets.dedup();
         }
         // `down`: anchor + all descendants.
         if dir == SearchDirection::Down {
             match scope.level {
+                Level::Project => unreachable!("handled above"),
                 Level::Feature => {
                     let rows = sqlx::query(
                         "SELECT s.id AS stage_id, m.id AS module_id, t.id AS task_id
@@ -2219,8 +2823,12 @@ impl Store {
     }
 }
 
+/// Which subjects a scoped search matches, resolved from the anchor +
+/// direction. `project` is a flag rather than an id list because the
+/// project shelf is a singleton.
 #[derive(Default)]
 struct SubjectSets {
+    project: bool,
     features: Vec<String>,
     stages: Vec<String>,
     modules: Vec<String>,
@@ -2266,6 +2874,7 @@ async fn insert_memory(
     tx: &mut Tx<'_>,
     level: Level,
     subject_id: &str,
+    kind: MemoryKind,
     content: &str,
     tags: &[&str],
     author: &str,
@@ -2273,12 +2882,13 @@ async fn insert_memory(
     let id = new_memory_id();
     let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
     sqlx::query(
-        "INSERT INTO memories (id, level, subject_id, content, tags, author)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO memories (id, level, subject_id, kind, content, tags, author)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&id)
     .bind(level.as_str())
     .bind(subject_id)
+    .bind(kind.as_str())
     .bind(content)
     .bind(&tags)
     .bind(author)
@@ -2471,6 +3081,12 @@ async fn apply_plan_op(
             let level = id_level(&id)
                 .ok_or_else(|| plan_invalid(format!("'{id}' is not a recognizable tree id.")))?;
             let (table, guard) = match level {
+                Level::Project => {
+                    return Err(plan_invalid(
+                        "The project is not part of a feature's plan — revise_plan cannot \
+                         rename it.",
+                    ))
+                }
                 Level::Feature => ("features", "id = $2"),
                 Level::Stage => ("stages", "id = $2 AND feature_id = $3"),
                 Level::Module => ("modules", "id = $2"),
@@ -2495,6 +3111,9 @@ async fn apply_plan_op(
             let level = id_level(&id)
                 .ok_or_else(|| plan_invalid(format!("'{id}' is not a recognizable tree id.")))?;
             match level {
+                Level::Project => Err(plan_invalid(
+                    "The project is not part of a feature's plan — revise_plan cannot remove it.",
+                )),
                 Level::Feature => Err(plan_invalid(
                     "revise_plan cannot remove the feature itself — shelve it instead.",
                 )),
@@ -2711,6 +3330,218 @@ async fn insert_tag(tx: &mut Tx<'_>, agent: &str, name: &str, label: &str) -> Re
     .execute(&mut **tx)
     .await?;
     Ok(inserted.rows_affected() > 0)
+}
+
+/// The CTEs every memory read shares: the tunable weights, the
+/// distinct-agent signal counts, and each entry's position within its
+/// own kind.
+///
+/// One string because the ranking must be identical everywhere a memory
+/// is read. Two copies of this that drifted would mean the console and
+/// the agents were looking at differently-ordered versions of the same
+/// base, which is exactly the bug nobody would notice.
+const MEMORY_CTES: &str = "
+    w AS (
+        SELECT COALESCE(MAX(value) FILTER (WHERE name = 'signal_touch'),   0.15) AS w_touch,
+               COALESCE(MAX(value) FILTER (WHERE name = 'signal_confirm'), 1.0)  AS w_confirm,
+               COALESCE(MAX(value) FILTER (WHERE name = 'signal_dispute'), -2.0) AS w_dispute,
+               COALESCE(MAX(value) FILTER (WHERE name = 'sigmoid_k'),      0.25) AS k,
+               COALESCE(MAX(value) FILTER (WHERE name = 'decay_strength'), 0.5)  AS decay,
+               COALESCE(MAX(value) FILTER (WHERE name = 'rank_floor'),     0.2)  AS floor,
+               COALESCE(MAX(value) FILTER (WHERE name = 'penalty_superseded'), 0.6) AS pen_sup,
+               COALESCE(MAX(value) FILTER (WHERE name = 'penalty_disputed'),   0.8) AS pen_dis,
+               COALESCE(MAX(value) FILTER (WHERE name = 'penalty_machine'),   0.15) AS pen_mach
+        FROM knowledge_weights
+    ),
+    sig AS (
+        -- DISTINCT agent, not row: an agent touching in a loop is one
+        -- agent's opinion however many times it fires.
+        SELECT memory_id,
+               COUNT(DISTINCT agent) FILTER (WHERE kind = 'touch')   AS touches,
+               COUNT(DISTINCT agent) FILTER (WHERE kind = 'confirm') AS confirms,
+               COUNT(DISTINCT agent) FILTER (WHERE kind = 'dispute') AS disputes
+        FROM memory_signals GROUP BY memory_id
+    ),
+    pos AS (
+        -- The decay clock: what fraction of same-kind memories were
+        -- written AFTER this one. 0 for the newest, 1 for the oldest.
+        --
+        -- Corpus position rather than wall-clock, so a dormant project
+        -- does not stale its own knowledge and a busy one does. Within
+        -- KIND, because most of this table is machine-written outcomes
+        -- (every module completion commits one) and counting globally
+        -- would bury curated conventions under activity that could never
+        -- have superseded them.
+        --
+        -- Self-normalizing, so it cannot run away as the base grows, and
+        -- there is no per-insert constant to tune.
+        SELECT id, PERCENT_RANK() OVER (PARTITION BY kind ORDER BY created_at DESC) AS newer
+        FROM memories
+    ),
+    ed AS (
+        -- Supersession kinds BY NAME. A standing relation (refines,
+        -- depends_on, contradicts, relates_to) describes a memory; it
+        -- must never retire one.
+        SELECT to_id, COUNT(*) AS superseded_by FROM memory_edges
+        WHERE kind IN ('replaces', 'refutes', 'revises', 'consolidates')
+        GROUP BY to_id
+    ),
+    mach AS (
+        -- Machine-written records: the completion summaries and blocker
+        -- reports the store commits on the crew's behalf. Knowledge, but
+        -- history rather than guidance.
+        SELECT id FROM memories WHERE tags @> ARRAY['system']
+    )";
+
+/// The scored, state-annotated projection of one memory row. Assumes
+/// [`MEMORY_CTES`] is in scope and the row is aliased `mem`.
+const MEMORY_FIELDS: &str = "
+    mem.id, mem.level, mem.subject_id, mem.kind, mem.content, mem.tags,
+    mem.author, mem.created_at,
+    COALESCE(p.name, f.name, s.name, m.name, t.name, mem.subject_id) AS subject_name,
+    COALESCE(sig.touches, 0)  AS touches,
+    COALESCE(sig.confirms, 0) AS confirms,
+    COALESCE(sig.disputes, 0) AS disputes,
+    pos.newer::real AS newer_fraction,
+    CASE WHEN COALESCE(ed.superseded_by, 0) > 0 THEN 'superseded'
+         WHEN COALESCE(sig.disputes, 0) > COALESCE(sig.confirms, 0) THEN 'disputed'
+         ELSE 'current' END AS state,
+    tanh(w.k * (w.w_touch   * COALESCE(sig.touches, 0)
+              + w.w_confirm * COALESCE(sig.confirms, 0)
+              + w.w_dispute * COALESCE(sig.disputes, 0)))::real AS evidence,
+    -- standing = evidence - decay*position - state penalty, clamped,
+    -- then mapped onto [floor, 1]. Mapped rather than used raw because
+    -- a negative multiplier would invert the ordering and a zero one
+    -- would delete the memory by arithmetic.
+    --
+    -- The state penalty is what stops a well-confirmed old belief
+    -- outranking the entry that corrected it: evidence accrued while it
+    -- was current does not go away when it is superseded, so without
+    -- this the history view leads with the thing that is no longer true.
+    (w.floor + (1 - w.floor) * ((LEAST(GREATEST(
+        tanh(w.k * (w.w_touch   * COALESCE(sig.touches, 0)
+                  + w.w_confirm * COALESCE(sig.confirms, 0)
+                  + w.w_dispute * COALESCE(sig.disputes, 0)))
+        - w.decay * pos.newer
+        - CASE WHEN COALESCE(ed.superseded_by, 0) > 0 THEN w.pen_sup
+               WHEN COALESCE(sig.disputes, 0) > COALESCE(sig.confirms, 0) THEN w.pen_dis
+               ELSE 0 END
+        - CASE WHEN mach.id IS NOT NULL THEN w.pen_mach ELSE 0 END,
+        -1), 1) + 1) / 2))::real AS multiplier";
+
+/// The joins [`MEMORY_FIELDS`] needs.
+const MEMORY_JOINS: &str = "
+    FROM memories mem
+    CROSS JOIN w
+    LEFT JOIN sig ON sig.memory_id = mem.id
+    LEFT JOIN pos ON pos.id = mem.id
+    LEFT JOIN ed   ON ed.to_id = mem.id
+    LEFT JOIN mach ON mach.id = mem.id
+    LEFT JOIN project p  ON mem.level = 'project' AND p.id = 1
+    LEFT JOIN features f ON mem.level = 'feature' AND f.id = mem.subject_id
+    LEFT JOIN stages s   ON mem.level = 'stage'   AND s.id = mem.subject_id
+    LEFT JOIN modules m  ON mem.level = 'module'  AND m.id = mem.subject_id
+    LEFT JOIN tasks t    ON mem.level = 'task'    AND t.id = mem.subject_id";
+
+/// Row → [`Memory`], including the derived state and decomposed
+/// standing. One mapper, so every read path agrees about what a memory
+/// is.
+fn map_memory(r: &sqlx::postgres::PgRow) -> Memory {
+    Memory {
+        id: r.get("id"),
+        level: r.get("level"),
+        subject_id: r.get("subject_id"),
+        subject_name: r.get("subject_name"),
+        kind: MemoryKind::parse(r.get::<String, _>("kind").as_str()).unwrap_or_default(),
+        content: r.get("content"),
+        tags: r.get("tags"),
+        author: r.get("author"),
+        created_at: r.get("created_at"),
+        state: match r.get::<String, _>("state").as_str() {
+            "superseded" => MemoryState::Superseded,
+            "disputed" => MemoryState::Disputed,
+            _ => MemoryState::Current,
+        },
+        standing: Standing {
+            touches: r.get("touches"),
+            confirms: r.get("confirms"),
+            disputes: r.get("disputes"),
+            newer_fraction: r.get("newer_fraction"),
+            evidence: r.get("evidence"),
+            multiplier: r.get("multiplier"),
+        },
+    }
+}
+
+/// Record a batch of touches from an exit door, ignoring ids that do
+/// not resolve.
+///
+/// Lenient where `touch_memory` is strict: a completion must not fail
+/// because an agent mistyped one id in a list of five. The work is
+/// done, and refusing the completion over a bad reference would lose
+/// far more than the touch was worth.
+async fn attest_used(
+    tx: &mut Tx<'_>,
+    agent: &str,
+    ids: &[String],
+    note: &str,
+) -> std::result::Result<(), McpmError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let batch = uuid::Uuid::new_v4();
+    for id in ids {
+        let known: Option<String> = sqlx::query_scalar("SELECT id FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if known.is_some() {
+            insert_signal(tx, id, agent, SignalKind::Touch, note, Some(batch)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Append one piece of evidence. Never updates anything.
+async fn insert_signal(
+    tx: &mut Tx<'_>,
+    memory_id: &str,
+    agent: &str,
+    kind: SignalKind,
+    note: &str,
+    batch: Option<uuid::Uuid>,
+) -> std::result::Result<(), McpmError> {
+    sqlx::query(
+        "INSERT INTO memory_signals (memory_id, agent, kind, note, batch)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(memory_id)
+    .bind(agent)
+    .bind(kind.as_str())
+    .bind(note)
+    .bind(batch)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Split free text into safe tsquery lexemes.
+///
+/// Everything that is not alphanumeric becomes a separator, so no
+/// caller input can reach `to_tsquery` as syntax — an unescaped `&`,
+/// `|` or `!` there is a 500, and a `:` turns into a weight operator.
+/// This is the only place caller text becomes part of a query
+/// expression, which is why the sanitising lives here rather than at
+/// each call site.
+///
+/// Single characters are dropped: they match nearly everything and
+/// contribute nothing to ranking.
+fn lexemes(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() > 1)
+        .map(|w| w.to_lowercase())
+        .take(12) // A query longer than this is prose, not a search.
+        .collect()
 }
 
 /// Row → [`ApiKeyInfo`]. Shared by every read path so the display shape
