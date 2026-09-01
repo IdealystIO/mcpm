@@ -26,6 +26,13 @@ pub enum ErrorCode {
     AlreadyLinked,
     NotFound,
     NotRegistered,
+    /// No usable credential was presented: the header is missing,
+    /// malformed, unknown, or revoked.
+    Unauthorized,
+    /// The credential is good but does not authorize this call — a
+    /// worker key on a manager-only tool, a console key on the MCP
+    /// surface.
+    Forbidden,
     Internal,
 }
 
@@ -64,6 +71,32 @@ impl McpmError {
             format!("No {what} with id '{id}'."),
             serde_json::json!({ "id": id }),
             "The id is unknown. Re-orient with get_context and use the ids it returns.",
+        )
+    }
+
+    /// No usable credential. The hint is deliberately incurious about
+    /// WHICH way the key failed — unknown, revoked and malformed all
+    /// read the same to a caller, so a probe learns nothing from the
+    /// wording.
+    pub fn unauthorized() -> Self {
+        Self::new(
+            ErrorCode::Unauthorized,
+            "This request carries no valid API key.",
+            serde_json::Value::Null,
+            "Send `Authorization: Bearer <token>` with a key issued by this deployment \
+             (`mcpm-mcp --issue-key`). If yours was working, it has been revoked — ask \
+             the operator for a new one.",
+        )
+    }
+
+    /// A good credential, used somewhere it does not reach.
+    pub fn forbidden(action: &str, role: crate::KeyRole) -> Self {
+        Self::new(
+            ErrorCode::Forbidden,
+            format!("A {} key may not {action}.", role.as_str()),
+            serde_json::json!({ "role": role.as_str(), "action": action }),
+            "This is a permission boundary, not a transient failure — retrying will not \
+             help. Report it to your manager, who holds a key that can.",
         )
     }
 

@@ -18,6 +18,15 @@ the want pool's rules) and never spawns an agent. When you add a rule,
 it goes in the store, inside the transaction it guards — not in a
 caller.
 
+**Identity is a credential, not an argument.** Over HTTP an agent does
+not say who it is: `Store::verify_key` resolves its API key to an agent
+name and role, and that is what the ledger records and what the role
+gate enforces. Two rules follow. A tool that becomes manager-only goes
+in `KeyRole::MANAGER_ONLY` in `mcpm-core`, never in a transport — both
+dispatchers read that one list. And `get_context` must keep ignoring its
+arguments on a keyed connection: taking `agent_name` from the caller
+there hands back the one thing the key exists to make unforgeable.
+
 ## UI work: read UX_GUIDELINES.md first
 
 **Anything that touches a screen — new components, edits to existing
@@ -52,7 +61,7 @@ API is not.
 | Path | What it is |
 | --- | --- |
 | `crates/mcpm-core` | Domain + Postgres store. Every invariant lives here, in one place each. |
-| `crates/mcpm-mcp` | The MCP server agents connect to: tools, prompts, `project://` resources, over stdio. |
+| `crates/mcpm-mcp` | The MCP server agents connect to: tools, prompts, `project://` resources. Two transports (`rpc.rs` is the shared dispatcher), plus the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, `#[server]` fns, and the `mcpm-web` host binary. |
 | `src/` | The Idealyst console. `components/` is one module per view. |
 
@@ -76,7 +85,7 @@ unauthenticated. Before calling UI work done:
 ```bash
 cargo check --workspace                              # console + client half
 cargo check -p api --bin mcpm-web --features server  # the server half
-cargo test -p mcpm-core -p api -p control-center   # needs the db up
+cargo test --workspace                               # needs the db up
 idealyst lint
 ```
 
@@ -117,6 +126,21 @@ of the `server` SDK, and only running one hides breakage in the other.
   test cannot see the failure: pair the mount test with the
   handler-count assertion in `wants.rs`, and check a new SDK-backed
   component in the browser.
+- **The auth posture is derived from `HOST`, not configured
+  alongside it.** `api::auth_required()` is true whenever `HOST` is not
+  loopback, so a reachable console host cannot be an unauthenticated
+  one — there is no env var that turns the gate off for a published
+  port, and adding one would reintroduce exactly the accident this
+  prevents. The subscription reads the same function rather than a
+  local of the binary's, because a socket that authenticated
+  differently from the POST path would be a hole nobody looks at.
+- **The event socket authenticates in its own body**, not at the
+  dispatch hook. A browser cannot put a header on a WebSocket
+  handshake, so `ConsoleGate` deliberately leaves `on_open` at
+  pass-through and `watch_events` verifies its own `key` argument.
+  Gating it in the hook would reject every socket, and the console
+  would silently fall back to its 30s poll — the same failure mode
+  `tests/notify.rs` exists to catch.
 - **`mcpm-web` must reference the `api` crate** (`api::Snapshot::default()`)
   or the linker dead-strips its route inventory and every `/_srv/` path
   404s with no build error.

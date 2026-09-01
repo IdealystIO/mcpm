@@ -3,8 +3,8 @@
 
 use idea_ui::{typography_kind, IdeaThemeRef, Typography};
 use runtime_core::{
-    component, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight, IdealystSchema,
-    JustifyContent,
+    component, pressable, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
+    IdealystSchema, IntoElement, JustifyContent, StyleApplication,
 };
 
 use crate::components::bits::{Mono, StatusDot};
@@ -27,8 +27,12 @@ pub fn Header(props: &HeaderProps) -> Element {
     // Keyed on the connection too, so the live pill flips the moment
     // the socket opens or drops rather than at the next data change.
     runtime_core::switch(
-        move || (console.rev.get(), console.connected.get()),
-        move |_: &(u64, bool)| header_body(console),
+        move || (
+            console.rev.get(),
+            console.connected.get(),
+            console.api_key.get().is_empty(),
+        ),
+        move |_: &(u64, bool, bool)| header_body(console),
     )
 }
 
@@ -62,6 +66,7 @@ fn header_body(console: Console) -> Element {
                 }
             }
             view(style = HeaderSide()) {
+                KeyPill(console = console)
                 view(style = LivePill()) {
                     StatusDot(status = live_status)
                     Typography(content = live_label, kind = typography_kind::Caption, muted = true)
@@ -75,6 +80,65 @@ fn header_body(console: Console) -> Element {
                     )
                 }
             }
+        }
+    }
+}
+
+/// Props for [`KeyPill`].
+#[derive(Default, IdealystSchema)]
+pub struct KeyPillProps {
+    /// Console state handles.
+    pub console: Console,
+}
+
+/// The API key affordance: says whether the console is holding one, and
+/// is the way to the key screen to change it.
+///
+/// It shows in both postures on purpose. On an open loopback host "no
+/// key" is the correct, expected state rather than a warning — which is
+/// why it reads as plain muted text and not an alert (rule 21: nothing
+/// here needs clearing).
+#[component]
+pub fn KeyPill(props: &KeyPillProps) -> Element {
+    let console = props.console;
+    let held = !console.api_key.get().is_empty();
+    let label = if held { "key set" } else { "no key" };
+
+    let inner: Element = ui! {
+        view(style = PillRow()) {
+            Typography(content = label, kind = typography_kind::Caption, muted = true)
+        }
+    };
+    pressable(vec![inner], move || console.show_key())
+        .with_style(StyleApplication::new(key_pill_box_style()))
+        .into_element()
+}
+
+stylesheet! {
+    pub KeyPillBox<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            border_width: 1.0,
+            border_color: t.color.border(),
+            border_radius: t.radius.pill(),
+            padding_vertical: 4,
+            padding_horizontal: 10,
+            cursor: runtime_core::Cursor::Pointer,
+        }
+        state hovered(t) {
+            border_color: t.color.border_hover(),
+            background: t.color.surface_alt(),
+        }
+    }
+}
+
+stylesheet! {
+    pub PillRow<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            gap: t.spacing.sm(),
         }
     }
 }

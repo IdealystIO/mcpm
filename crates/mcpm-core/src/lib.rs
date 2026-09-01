@@ -11,10 +11,12 @@
 
 mod error;
 mod ids;
+mod keys;
 mod store;
 mod types;
 
 pub use error::{McpmError, ErrorCode};
 pub use ids::{id_level, new_id, new_want_id, normalize_tag, Level};
+pub use keys::{display_key, from_bearer, ApiKeyInfo, IssuedKey, KeyIdentity, KeyRole, MANAGER_ONLY};
 pub use store::Store;
 pub use types::*;

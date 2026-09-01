@@ -8,11 +8,12 @@ use runtime_core::{presence, raf_loop_scoped, spawn_then, stylesheet, switch, ui
     Element, FlexDirection, IntoElement, Position, PresenceAnim};
 
 use crate::components::drawer::{Drawer, WantDrawer};
+use crate::components::gate::KeyGate;
 use crate::components::header::Header;
 use crate::components::main_pane::MainPane;
 use crate::components::sidebar::Sidebar;
 use crate::model;
-use crate::state::{use_console, Console};
+use crate::state::{use_console_live, Console};
 
 /// Where the mcpm-web API listens
 /// (`cargo run -p api --bin mcpm-web --features server`).
@@ -33,7 +34,7 @@ pub const BACKDROP_IN_MS: u32 = 180;
 pub const BACKDROP_OUT_MS: u32 = 140;
 
 pub fn app() -> Element {
-    let console = use_console();
+    let console = use_console_live();
     install_idea_theme_reactive(move || {
         if console.dark.get() {
             dark_theme()
@@ -42,7 +43,19 @@ pub fn app() -> Element {
         }
     });
 
-    start_sync(console);
+    // The sync is keyed on the key: entering, rotating or forgetting
+    // one has to re-open the event socket, and the socket's credential
+    // is baked into its connect URL at open time. The switch's scope
+    // teardown is what closes the old one — `raf_loop_scoped` and the
+    // subscription both die with the scope that made them, so a key
+    // change leaves nothing of the previous session running.
+    let sync = switch(
+        move || console.api_key.get(),
+        move |key: &String| {
+            start_sync(console, key.clone());
+            ui! { view {} }
+        },
+    );
 
     // The drawer overlays the whole page. `presence` owns the
     // mount/unmount timing so the close animation can finish before the
@@ -86,15 +99,33 @@ pub fn app() -> Element {
     .exit(PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn))
     .into_element();
 
+    // The gate replaces the whole body, sidebar included: with the host
+    // refusing us there is no data behind it to show, and a rail of
+    // empty cards next to a "give me a key" card would only suggest
+    // there is something to go back to.
+    let body = switch(
+        move || (console.pane.get(), console.denied.get()),
+        move |state: &(String, bool)| {
+            let (pane, denied) = state.clone();
+            if denied || pane == "key" {
+                return ui! { KeyGate(console = console) };
+            }
+            ui! {
+                view(style = BodyRow()) {
+                    Sidebar(console = console)
+                    MainPane(console = console)
+                }
+            }
+        },
+    );
+
     ui! {
         view(style = PageFrame()) {
             Header(console = console)
-            view(style = BodyRow()) {
-                Sidebar(console = console)
-                MainPane(console = console)
-            }
+            body
             drawer_host
             want_host
+            sync
         }
     }
 }
@@ -109,7 +140,7 @@ fn drawer_target_exists(fi: usize, si: usize, mi: usize) -> bool {
 
 /// Configure the RPC origin, open the event subscription, and drive the
 /// snapshot fetch from a raf clock (scope-anchored, so both die with
-/// the app).
+/// the scope that called this).
 ///
 /// The socket carries only "an event committed, at seq N" — the console
 /// then refetches the snapshot it already knows how to apply, rather
@@ -117,10 +148,21 @@ fn drawer_target_exists(fi: usize, si: usize, mi: usize) -> bool {
 /// `apply_snapshot` the single place the model is written, and costs
 /// one ~16KB fetch per change instead of one every three seconds
 /// forever.
-fn start_sync(console: Console) {
-    server::configure(server::ClientConfig::new(API_ORIGIN));
-    // Scope-bound: the socket closes when the app unmounts.
-    let events = api::watch_events();
+///
+/// `key` is empty against an open loopback host, which sends no
+/// `Authorization` at all — the gate on that host does not ask for one,
+/// and sending an empty bearer would turn a fine request into a 401.
+fn start_sync(console: Console, key: String) {
+    let credential = key.clone();
+    server::configure(
+        server::ClientConfig::new(API_ORIGIN).with_credentials(server::bearer(move || {
+            Some(credential.clone()).filter(|k| !k.is_empty())
+        })),
+    );
+    // Scope-bound: the socket closes when this scope is torn down.
+    // The key rides the connect URL because a browser cannot put a
+    // header on a WebSocket handshake — see `api::watch_events`.
+    let events = api::watch_events(key);
     // `None` means "fetch on the next frame"; `Some(t)` is when the
     // last attempt started. Deliberately not `0`: on web `now_micros`
     // counts from page load, so for the first POLL_MICROS after load
@@ -168,15 +210,35 @@ fn start_sync(console: Console) {
         spawn_then(api::load_snapshot(), move |result| {
             match result {
                 Ok(snapshot) => {
+                    // A fetch that lands is proof the key (or the lack
+                    // of one) is accepted, so the gate clears itself
+                    // rather than waiting to be dismissed.
+                    console.denied.set(false);
+                    // Only the FIRST snapshot moves the selection. A
+                    // later poll must not steal the feature the reader
+                    // is on because a newer one arrived.
+                    let first_load = !model::loaded();
                     if model::apply_snapshot(snapshot) {
+                        if first_load {
+                            if let Some(open) = model::first_open_feature() {
+                                console.feature.set(open);
+                            }
+                        }
                         console.rev.update(|r| r + 1);
                     }
                 }
-                // The screen already says "connecting" and the next poll
-                // retries, so this stays out of the UI — but it goes to
-                // the log, because a poll that fails forever with no
-                // trace anywhere is undiagnosable.
-                Err(err) => runtime_core::log_warn!("snapshot poll failed: {err:?}"),
+                // A refusal is a condition the reader can act on — it
+                // ends when they paste a working key — so it reaches the
+                // screen. Every other failure is transient and the next
+                // poll retries it, so it stays a log line: the screen
+                // already says "connecting", and a poll that fails
+                // forever with no trace anywhere is undiagnosable.
+                Err(err) => {
+                    if matches!(err, server::ServerError::Server { status: 401, .. }) {
+                        console.denied.set(true);
+                    }
+                    runtime_core::log_warn!("snapshot poll failed: {err:?}");
+                }
             }
         });
         in_flight = false;

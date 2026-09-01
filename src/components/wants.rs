@@ -19,7 +19,7 @@ use runtime_core::{
     FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, StyleApplication,
 };
 
-use crate::components::bits::StatusDot;
+use crate::components::bits::{Pager, StatusDot};
 use crate::components::composer::Composer;
 use crate::model::{filter_wants, want_counts, wants, WantState};
 use crate::state::Console;
@@ -108,7 +108,13 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
                             WantRow(console = console, want = visible[i])
                         }
                     }
-                    Pager(console = console, summary = summary, page = page, pages = pages)
+                    Pager(
+                        on_page = Some(Rc::new(move |p| console.set_pool_page(p))
+                            as Rc<dyn Fn(usize)>),
+                        summary = summary,
+                        page = page,
+                        pages = pages,
+                    )
                 }
             }
         },
@@ -325,68 +331,6 @@ pub fn WantTag(props: &WantTagProps) -> Element {
     }
 }
 
-/// Props for [`Pager`].
-#[derive(Default, IdealystSchema)]
-pub struct PagerProps {
-    /// Console state handles.
-    pub console: Console,
-    /// "1-20 of 47", already formatted.
-    pub summary: String,
-    /// Zero-based current page.
-    pub page: usize,
-    /// Total pages, at least 1.
-    pub pages: usize,
-}
-
-/// The table's footer: what you are looking at, and the way to the rest
-/// of it. The chevrons stay put on a single page rather than vanishing,
-/// so the footer never changes width under you.
-#[component]
-pub fn Pager(props: &PagerProps) -> Element {
-    let console = props.console;
-    let summary = props.summary.clone();
-    let page = props.page;
-    let pages = props.pages;
-    let of_label = format!("Page {} of {}", page + 1, pages);
-    let back_on = page > 0;
-    let next_on = page + 1 < pages;
-
-    // Dimmed rather than removed: a chevron that vanishes on the last
-    // page resizes the footer under the reader (rule 18).
-    let back_arm = Chevron().live(if back_on { ChevronLive::Yes } else { ChevronLive::No });
-    let next_arm = Chevron().live(if next_on { ChevronLive::Yes } else { ChevronLive::No });
-    let back = pressable(
-        vec![ui! { text(style = back_arm) { "\u{2039}" } }],
-        move || {
-            if page > 0 {
-                console.set_pool_page(page - 1);
-            }
-        },
-    )
-    .with_style(StyleApplication::new(pager_button_style()))
-    .into_element();
-    let next = pressable(
-        vec![ui! { text(style = next_arm) { "\u{203a}" } }],
-        move || {
-            if page + 1 < pages {
-                console.set_pool_page(page + 1);
-            }
-        },
-    )
-    .with_style(StyleApplication::new(pager_button_style()))
-    .into_element();
-
-    ui! {
-        view(style = PagerBox()) {
-            Typography(content = summary, kind = typography_kind::Caption, muted = true)
-            Spacer()
-            Typography(content = of_label, kind = typography_kind::Caption, muted = true)
-            back
-            next
-        }
-    }
-}
-
 /// Props for [`PoolStat`].
 #[derive(Default, IdealystSchema)]
 pub struct PoolStatProps {
@@ -571,45 +515,6 @@ stylesheet! {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
             gap: t.spacing.xs(),
-        }
-    }
-}
-
-stylesheet! {
-    pub PagerBox<IdeaThemeRef> {
-        base(t) {
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            gap: t.spacing.sm(),
-        }
-    }
-}
-
-stylesheet! {
-    pub PagerButton<IdeaThemeRef> {
-        base(t) {
-            width: 24,
-            height: 24,
-            border_radius: t.radius.sm(),
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::Center,
-            cursor: runtime_core::Cursor::Pointer,
-        }
-        state hovered(t) {
-            background: t.color.surface_alt(),
-        }
-    }
-}
-
-stylesheet! {
-    pub Chevron<IdeaThemeRef> {
-        base(t) {
-            font_size: t.typography.body_size(),
-        }
-        variant live {
-            #[default]
-            no(t) { color: t.color.border() }
-            yes(t) { color: t.color.text() }
         }
     }
 }

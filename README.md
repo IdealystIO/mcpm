@@ -49,9 +49,12 @@ cargo run -p api --bin mcpm-web --features server     # http://127.0.0.1:3210
 
 It binds `127.0.0.1:3210`; `HOST` and `PORT` override the two halves. In
 a container, published ports only reach a process listening on the
-container's external interface, so run it with `HOST=0.0.0.0` there — and
-only there. The host is CORS-permissive and unauthenticated, so loopback
-stays the default.
+container's external interface, so run it with `HOST=0.0.0.0` there.
+
+On loopback the host runs open — no key, permissive CORS — which is what
+you want for local development. Setting `HOST` to anything else turns the
+key gate on automatically, so a host that the network can reach is never
+an unauthenticated one. See [Deploying it as a service](#deploying-it-as-a-service).
 
 **3. Start the console.**
 
@@ -84,6 +87,10 @@ Agents reach mcpm over stdio through `.mcp.json`, already in this repo:
 The server is launched per connection and shares one database, so claims
 and gates stay race-safe across concurrent agents. Restart your MCP
 client after changing this file.
+
+Stdio carries no authentication, and does not need any: the process is a
+local pipe that your own agent runner started. Agents on *other* machines
+connect over HTTP instead — see below.
 
 ### Verifying
 
@@ -201,12 +208,124 @@ in-process broadcast would only ever carry the console's own captures.
 
 A 30 second snapshot poll remains as the fallback for a dropped socket.
 
+## Deploying it as a service
+
+One shared instance for a cluster of agents running on their own
+machines. Two things change from the local setup: the MCP server gets an
+HTTP transport, and every caller presents an **API key**.
+
+### Keys are identities, not passwords
+
+A key is issued *for* an agent name and a role, and that is what the
+server uses — not what the agent says about itself:
+
+```bash
+mcpm-mcp --issue-key --agent planner-01 --role manager --label "planning crew"
+mcpm-mcp --issue-key --agent worker-03  --role worker
+mcpm-mcp --issue-key --agent console    --role console
+```
+
+Each prints one token on stdout. That is the only time its secret
+exists: only a SHA-256 of it is stored, so the `api_keys` table is not a
+set of usable credentials. Three consequences:
+
+- **`get_context` takes no arguments over HTTP.** The key already said
+  who is calling, so the `agent` column in the event ledger stops being
+  self-reported — an agent cannot attribute its writes to someone else.
+- **Roles are enforced.** A `worker` key is refused by `plan_feature`,
+  `revise_plan`, `complete_feature` and `promote_wants` with a
+  `FORBIDDEN` envelope. A `console` key is refused by the MCP endpoint
+  entirely, so a leaked dashboard key cannot claim a module.
+- **Revocation is immediate.** `mcpm-mcp --revoke-key <id>` locks the
+  bearer out on its next request; the key stays in `--list-keys` with the
+  date, because "what did we withdraw, and when" is what that list gets
+  asked.
+
+Issuing and revoking both land in the event ledger — who may act, and as
+whom — without the token or its hash.
+
+```bash
+mcpm-mcp --list-keys
+KEY            ROLE       AGENT       LABEL             LAST USED    STATE
+179422e65c3d   manager    planner-01  planning crew     2026-09-01   live
+1a4a78a5ce04   worker     worker-03   worker-03         never        revoked 2026-09-01
+```
+
+### The MCP server over HTTP
+
+```bash
+mcpm-mcp --http --bind 0.0.0.0:3211
+```
+
+`POST /mcp` carries one JSON-RPC message and answers with one reply;
+`GET /health` is an unauthenticated liveness probe. Every request needs
+`Authorization: Bearer <token>`, and a bad or missing one gets a `401`
+with a `WWW-Authenticate` challenge and the same error envelope the tools
+use.
+
+There is deliberately no session state — the key identifies the caller on
+every request, so there is no `Mcp-Session-Id` to expire and no way for a
+reconnect to land on someone else's identity. `--bind` defaults to
+loopback; the listener refuses to start if no live key exists, rather
+than becoming a wall every agent bounces off.
+
+An agent connects with an HTTP MCP client:
+
+```json
+{
+  "mcpServers": {
+    "mcpm": {
+      "type": "http",
+      "url": "https://mcpm.internal:3211/mcp",
+      "headers": { "Authorization": "Bearer mcpm_..." }
+    }
+  }
+}
+```
+
+### The console host
+
+```bash
+HOST=0.0.0.0 \
+MCPM_ALLOWED_ORIGIN=https://console.internal \
+cargo run -p api --bin mcpm-web --features server
+```
+
+A non-loopback `HOST` turns the gate on by itself; `MCPM_REQUIRE_AUTH=1`
+turns it on for a loopback host too. Turning it *off* for a reachable
+host is not expressible — that combination is the accident this
+arrangement exists to prevent. With the gate on, `/_srv/*` needs a bearer
+key and CORS narrows to `MCPM_ALLOWED_ORIGIN` (unset means no browser
+origin at all: a loud misconfiguration rather than a silent hole).
+Console captures are then recorded under the key's agent name instead of
+`console`.
+
+Open the console and it will ask for a key; paste a `console` one. It is
+kept in the browser's local storage, and the header's key pill is how you
+rotate or forget it.
+
+### What this does not cover
+
+- **The event WebSocket carries its key in the connect URL**, not a
+  header, because a browser cannot set headers on a WebSocket handshake.
+  A URL is likelier to end up in a proxy log than a header is. It is the
+  least-privileged key the system issues and both ends sit inside the
+  deployment; if this ever fronts something untrusted, the fix is a
+  short-lived ticket minted over the authenticated POST channel.
+- **The browser holds the console key in `localStorage`.** The
+  `credentials` SDK errors on web rather than pretend the browser has a
+  keychain, and web is the console's only target.
+- **No TLS of its own.** Both listeners speak plain HTTP; terminate TLS
+  at your ingress. A bearer token over plaintext on an untrusted network
+  is a token you have given away.
+- **No rate limiting** on the key check.
+
 ## Crates
 
 | Crate | What it is |
 | --- | --- |
 | `crates/mcpm-core` | Domain and Postgres store. The stage gate, exclusive claims, checklist-proven completion, the want pool, the append-only event ledger, and scoped memory search. Every invariant is enforced inside a transaction. |
-| `crates/mcpm-mcp` | The MCP server: 22 tools, three briefing prompts, and read-only `project://` resources, over stdio. |
+| `crates/mcpm-mcp` | The MCP server: 22 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, the `#[server]` functions and `#[subscription]` the console calls, plus the `mcpm-web` host binary (feature-gated). |
 | `src/` | The Idealyst console: want pool with capture composer, board, hierarchy, live feed, dependency graph, composed-from, and the module and want drawers. |
 

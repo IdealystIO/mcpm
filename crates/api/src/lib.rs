@@ -161,6 +161,39 @@ pub struct Tick {
 }
 
 // ---------------------------------------------------------------------
+// Who is calling
+// ---------------------------------------------------------------------
+
+/// The resolved identity behind one console request, put on the request
+/// context by `mcpm-web`'s dispatch gate and read back here as
+/// `Extension<Caller>`.
+///
+/// It always resolves, in both postures: with the gate on it is the
+/// agent name off a verified key, and with the gate off (loopback dev)
+/// it is the anonymous console author. A handler therefore never has to
+/// ask whether authentication was configured — it just records who the
+/// write belongs to.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug)]
+pub struct Caller {
+    /// The name every write in this request is attributed to.
+    pub name: String,
+    /// The key's role, or `None` on an unauthenticated loopback host.
+    pub role: Option<mcpm_core::KeyRole>,
+}
+
+#[cfg(feature = "server")]
+impl Caller {
+    /// The posture an open loopback host runs in: a person at the
+    /// console, not an agent. Recorded as `console` exactly as before
+    /// the gate existed, so the pool's provenance does not shift under
+    /// a deployment that never turned auth on.
+    pub fn local() -> Caller {
+        Caller { name: CONSOLE_AUTHOR.to_string(), role: None }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Server functions
 // ---------------------------------------------------------------------
 
@@ -171,21 +204,95 @@ pub struct Tick {
 /// trigger announces on, so it carries writes from EVERY process
 /// against this database — the MCP server's agent writes as much as the
 /// console's own captures. See `Store::watch_events`.
+///
+/// # Why the key is an argument and not a header
+///
+/// This one endpoint authenticates in its own body rather than at the
+/// dispatch gate, because a browser cannot set `Authorization` on a
+/// WebSocket handshake — the request that opens this socket carries no
+/// headers we control. The SDK's one channel for caller-supplied data
+/// at open time is the subscription's own arguments, so the key rides
+/// there, hex-encoded into the connect URL.
+///
+/// That is a real trade: a URL is likelier to be logged by a proxy than
+/// a header, so a console key can end up in somebody's access log. It is
+/// the least-privileged key this system issues (read plus capture, never
+/// the agent surface) and both ends sit inside the deployment, which is
+/// what makes the trade acceptable rather than fine. The upgrade, if
+/// this ever fronts something untrusted, is a short-lived ticket minted
+/// over the authenticated POST channel and spent here.
 // NOT `#[cfg(feature = "server")]`: the macro cfgs the real body itself
 // and emits the client stub under `not(server)`. Gating the whole item
 // would delete the stub the console calls. The `State<_>` param is an
 // extractor, so it never appears in that stub — the client build never
-// names `mcpm_core`.
+// names `mcpm_core`; `key` is an open arg and DOES.
 #[subscription]
 pub async fn watch_events(
+    key: String,
     store: server::State<mcpm_core::Store>,
 ) -> impl futures_core::Stream<Item = Tick> {
     use futures_util::StreamExt as _;
+    // An unauthenticated socket yields nothing rather than erroring:
+    // the console degrades to its fallback poll, which is the same
+    // place a dropped socket lands it, and the poll's own 401 is what
+    // tells the reader their key is wrong. Two reports of one fact
+    // would just be noise.
+    if !socket_authorized(&store, &key).await {
+        return futures_util::stream::empty().left_stream();
+    }
     // A listener that cannot be opened yields an empty stream: the
     // console keeps its slow fallback poll, which is exactly the
     // degraded mode this is a fast path over.
     let seqs = store.watch_events().await;
-    async_stream_compat(seqs).map(|seq| Tick { seq })
+    async_stream_compat(seqs).map(|seq| Tick { seq }).right_stream()
+}
+
+/// Whether this socket may open. Mirrors `mcpm-web`'s gate: with auth
+/// off (loopback dev) every socket is admitted; with it on the key must
+/// verify. Reading the same env var as the host binary keeps the two
+/// postures from drifting apart.
+#[cfg(feature = "server")]
+async fn socket_authorized(store: &mcpm_core::Store, key: &str) -> bool {
+    if !auth_required() {
+        return true;
+    }
+    match store.verify_key(key).await {
+        Ok(_) => true,
+        Err(_) => {
+            eprintln!("mcpm-web: event socket refused — no valid API key");
+            false
+        }
+    }
+}
+
+/// Whether this host demands a key. Defined here rather than only in
+/// the binary because the subscription gate above has to agree with it
+/// and cannot see the binary's locals.
+///
+/// Two ways in, and the second is the point: a host that binds anything
+/// but loopback is reachable from the network, and an unauthenticated
+/// console on the network is precisely the accident this refuses to let
+/// you have. Turning auth OFF there is not expressible.
+#[cfg(feature = "server")]
+pub fn auth_required() -> bool {
+    let explicit = std::env::var("MCPM_REQUIRE_AUTH")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    explicit || !binds_loopback()
+}
+
+/// Whether `HOST` keeps this process on the loopback interface. An
+/// unparseable or unset `HOST` counts as loopback, matching the
+/// binary's own default.
+#[cfg(feature = "server")]
+pub fn binds_loopback() -> bool {
+    match std::env::var("HOST") {
+        Ok(host) => host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(true),
+        Err(_) => true,
+    }
 }
 
 /// `Store::watch_events` returns a `Result`; flatten it to a stream so
@@ -370,7 +477,10 @@ const CONSOLE_AUTHOR: &str = "console";
 /// was colored is what is written. The whole buffer lands in one
 /// transaction — a half-captured list is worse than a rejected one.
 #[server]
-pub async fn capture_wants(text: String) -> Result<CaptureResult, ServerError> {
+pub async fn capture_wants(
+    text: String,
+    caller: server::Extension<Caller>,
+) -> Result<CaptureResult, ServerError> {
     let store = server::use_state::<mcpm_core::Store>()
         .ok_or_else(|| ServerError::failed("Store not installed"))?;
     let drafts = capture::parse_buffer(&text);
@@ -399,7 +509,7 @@ pub async fn capture_wants(text: String) -> Result<CaptureResult, ServerError> {
 
     let wants = store
         .add_wants(
-            CONSOLE_AUTHOR,
+            &caller.name,
             drafts
                 .into_iter()
                 .map(|d| mcpm_core::WantDraft {
@@ -421,11 +531,14 @@ pub async fn capture_wants(text: String) -> Result<CaptureResult, ServerError> {
 /// Create a tag with no want attached — a preset to file later ideas
 /// under. Idempotent, so pressing the button twice is not an error.
 #[server]
-pub async fn create_tag(label: String) -> Result<TagDto, ServerError> {
+pub async fn create_tag(
+    label: String,
+    caller: server::Extension<Caller>,
+) -> Result<TagDto, ServerError> {
     let store = server::use_state::<mcpm_core::Store>()
         .ok_or_else(|| ServerError::failed("Store not installed"))?;
     let tag = store
-        .create_tag(CONSOLE_AUTHOR, &label)
+        .create_tag(&caller.name, &label)
         .await
         .map_err(fail)?;
     Ok(TagDto {
@@ -538,6 +651,16 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
         "want_updated" => (format!("Want revised: {}", s("body")), String::new()),
         "memory_committed" => (
             format!("Memory committed at {} scope", s("level")),
+            String::new(),
+        ),
+        // Never the token, and never its hash — this feed is read by
+        // everything with console access. Who may act, and as whom.
+        "key_issued" => (
+            format!("API key issued for {}", s("agent")),
+            format!("{} key {}.", s("role"), s("key_id")),
+        ),
+        "key_revoked" => (
+            format!("API key revoked: {}", s("key_id")),
             String::new(),
         ),
         other => (other.to_string(), String::new()),

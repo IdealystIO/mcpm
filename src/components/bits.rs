@@ -1,8 +1,11 @@
 //! Small shared console pieces: status dot, status badge, monospace
 //! metadata text, the per-task tick strip, and the `?` hint.
 
-use idea_ui::{Badge, Tooltip};
-use runtime_core::{component, ui, Element, IdealystSchema};
+use std::rc::Rc;
+
+use idea_ui::{typography_kind, Badge, Spacer, Tooltip, Typography};
+use runtime_core::{component, pressable, ui, Element, IdealystSchema, IntoElement,
+    StyleApplication};
 
 use crate::model::Status;
 use crate::styles::{
@@ -151,6 +154,117 @@ runtime_core::stylesheet! {
             font_size: t.typography.overline_size(),
             font_weight: runtime_core::FontWeight::SemiBold,
             color: t.color.text_muted(),
+        }
+    }
+}
+
+/// Props for [`Pager`].
+#[derive(Default, IdealystSchema)]
+pub struct PagerProps {
+    /// Where to go. `None` renders the footer inert — the shape is the
+    /// same, which is the point: a table with one page must not be a
+    /// different height from a table with four.
+    pub on_page: Option<Rc<dyn Fn(usize)>>,
+    /// "1-20 of 47", already formatted.
+    pub summary: String,
+    /// Zero-based current page.
+    pub page: usize,
+    /// Total pages, at least 1.
+    pub pages: usize,
+}
+
+/// The table's footer: what you are looking at, and the way to the rest
+/// of it. The chevrons stay put on a single page rather than vanishing,
+/// so the footer never changes width under you.
+///
+/// Shared by every paged table in the console. A second copy of this
+/// would be a second place for the ghost-chevron rule to be forgotten.
+#[component]
+pub fn Pager(props: &PagerProps) -> Element {
+    let step = props.on_page.clone();
+    let summary = props.summary.clone();
+    let page = props.page;
+    let pages = props.pages;
+    let of_label = format!("Page {} of {}", page + 1, pages);
+    let back_on = page > 0;
+    let next_on = page + 1 < pages;
+
+    // Dimmed rather than removed: a chevron that vanishes on the last
+    // page resizes the footer under the reader (rule 18).
+    let back_arm = Chevron().live(if back_on { ChevronLive::Yes } else { ChevronLive::No });
+    let next_arm = Chevron().live(if next_on { ChevronLive::Yes } else { ChevronLive::No });
+    let back_step = step.clone();
+    let back = pressable(
+        vec![ui! { text(style = back_arm) { "\u{2039}" } }],
+        move || {
+            if let (true, Some(step)) = (page > 0, back_step.as_ref()) {
+                step(page - 1);
+            }
+        },
+    )
+    .with_style(StyleApplication::new(pager_button_style()))
+    .into_element();
+    let next_step = step;
+    let next = pressable(
+        vec![ui! { text(style = next_arm) { "\u{203a}" } }],
+        move || {
+            if let (true, Some(step)) = (page + 1 < pages, next_step.as_ref()) {
+                step(page + 1);
+            }
+        },
+    )
+    .with_style(StyleApplication::new(pager_button_style()))
+    .into_element();
+
+    ui! {
+        view(style = PagerBox()) {
+            Typography(content = summary, kind = typography_kind::Caption, muted = true)
+            Spacer()
+            Typography(content = of_label, kind = typography_kind::Caption, muted = true)
+            back
+            next
+        }
+    }
+}
+
+
+runtime_core::stylesheet! {
+    pub PagerBox<idea_ui::IdeaThemeRef> {
+        base(t) {
+            flex_direction: runtime_core::FlexDirection::Row,
+            align_items: runtime_core::AlignItems::Center,
+            gap: t.spacing.sm(),
+        }
+    }
+}
+
+
+runtime_core::stylesheet! {
+    pub PagerButton<idea_ui::IdeaThemeRef> {
+        base(t) {
+            width: 24,
+            height: 24,
+            border_radius: t.radius.sm(),
+            align_items: runtime_core::AlignItems::Center,
+            justify_content: runtime_core::JustifyContent::Center,
+            cursor: runtime_core::Cursor::Pointer,
+        }
+        state hovered(t) {
+            background: t.color.surface_alt(),
+        }
+    }
+}
+
+
+runtime_core::stylesheet! {
+    pub Chevron<idea_ui::IdeaThemeRef> {
+        base(t) {
+            font_size: t.typography.body_size(),
+        }
+        variant live {
+            #[default]
+            no(t) { color: t.color.border() }
+            yes(t) { color: t.color.text() }
         }
     }
 }

@@ -72,6 +72,16 @@ codeblock = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d822
 # dep is linked but not nameable.
 table = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
 server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+# Where the console's API key survives a reload. `reactive` gives
+# `persisted_signal`, which hydrates and persists a signal race-correctly
+# — hand-rolled load/persist wiring clobbers a write made before the
+# async load resolves.
+#
+# This is the INSECURE store (localStorage on web) and it is the honest
+# choice here: the `credentials` SDK errors on web rather than pretend
+# the browser has a keychain, and web is the console's only target. The
+# key it holds is the least-privileged one this system issues.
+storage = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca", features = ["reactive"] }
 
 # Test-only mock scene host. It realizes a component tree through the
 # REAL `realize` path against an in-memory backend, which is the only

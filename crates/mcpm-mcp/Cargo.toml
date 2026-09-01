@@ -14,4 +14,10 @@ license = "MIT OR Apache-2.0"
 mcpm-core = { path = "../mcpm-core" }
 serde = "1"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# The HTTP transport (`--http`): the shared listener remote agents
+# connect to. Stdio needs none of this, but the binary is one artifact
+# and a feature flag on the transport would mean the deployed server and
+# the locally tested one are different programs.
+axum = "0.7"
+chrono = "0.4"

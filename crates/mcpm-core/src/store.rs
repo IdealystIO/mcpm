@@ -20,6 +20,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{McpmError, ErrorCode};
 use crate::ids::{id_level, new_id, new_memory_id, new_want_id, normalize_tag, Level};
+use crate::keys::{ApiKeyInfo, IssuedKey, KeyIdentity, KeyRole};
 use crate::types::*;
 
 /// The Postgres NOTIFY channel the `events_notify` trigger announces
@@ -2044,6 +2045,178 @@ impl Store {
         }
         Ok(sets)
     }
+
+    // -----------------------------------------------------------------
+    // API keys
+    // -----------------------------------------------------------------
+    //
+    // The credential is an identity, not just a gate: `verify_key`
+    // returns the agent name and role the key was issued for, and every
+    // caller attributes its writes to THAT rather than to anything the
+    // agent sent. Which is why verification lives here with the other
+    // invariants — the check and the identity it produces must not be
+    // separable by a caller.
+
+    /// Mint a key for `agent_name` at `role`. The returned
+    /// [`IssuedKey::token`] is the only time the secret exists outside
+    /// the bearer's hands: only its hash is written.
+    pub async fn issue_key(
+        &self,
+        issuer: &str,
+        label: &str,
+        agent_name: &str,
+        role: KeyRole,
+    ) -> Result<IssuedKey> {
+        let label = label.trim();
+        let agent_name = agent_name.trim();
+        if agent_name.is_empty() {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                "A key must name the agent it speaks for.",
+                json!({}),
+                "Pass --agent <name>. That name is what the ledger records for every write \
+                 this key makes, so make it the one you want to read back.",
+            ));
+        }
+        let label = if label.is_empty() { agent_name } else { label };
+        let (token, id, hash) = crate::keys::mint();
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO api_keys (id, hash, label, agent_name, role, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&id)
+        .bind(&hash)
+        .bind(label)
+        .bind(agent_name)
+        .bind(role.as_str())
+        .bind(issuer)
+        .execute(&mut *tx)
+        .await?;
+        // The ledger records that a credential now exists and who for.
+        // Never the token, and never the hash — an event feed is read by
+        // everything with console access.
+        record_event(
+            &mut tx,
+            "key_issued",
+            None,
+            None,
+            Some(issuer),
+            json!({ "key_id": id, "label": label, "agent": agent_name, "role": role.as_str() }),
+        )
+        .await?;
+        tx.commit().await?;
+
+        let info = self
+            .key_info(&id)
+            .await?
+            .ok_or_else(|| McpmError::internal("issued key vanished before it could be read"))?;
+        Ok(IssuedKey { token, info })
+    }
+
+    /// Resolve a presented token to the identity it carries, or reject
+    /// it. Every failure — malformed, unknown, revoked — returns the
+    /// same [`McpmError::unauthorized`]: a caller probing the endpoint
+    /// must not learn which of its guesses was closer.
+    pub async fn verify_key(&self, token: &str) -> Result<KeyIdentity> {
+        // Shape first: junk never reaches the database, so an
+        // unauthenticated flood costs no connections from a 4-slot pool.
+        let parsed = crate::keys::parse(token).ok_or_else(McpmError::unauthorized)?;
+        let row = sqlx::query(
+            "SELECT hash, label, agent_name, role FROM api_keys
+             WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(&parsed.id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(McpmError::unauthorized)?;
+
+        let stored: String = row.get("hash");
+        if !crate::keys::hash_eq(&stored, &parsed.secret_hash) {
+            return Err(McpmError::unauthorized());
+        }
+        let role = KeyRole::parse(row.get::<String, _>("role").as_str())
+            .ok_or_else(|| McpmError::internal("api_keys.role holds an unknown role"))?;
+
+        // Best-effort liveness stamp. A failure here must not fail an
+        // otherwise good request — the key is already verified, and the
+        // column is an operator convenience, not an invariant.
+        let _ = sqlx::query("UPDATE api_keys SET last_used = now() WHERE id = $1")
+            .bind(&parsed.id)
+            .execute(&self.pool)
+            .await;
+
+        Ok(KeyIdentity {
+            key_id: parsed.id,
+            label: row.get("label"),
+            agent_name: row.get("agent_name"),
+            role,
+        })
+    }
+
+    /// Every key ever issued, newest first — revoked ones included, so
+    /// the operator can see what was withdrawn and when.
+    pub async fn list_keys(&self) -> Result<Vec<ApiKeyInfo>> {
+        let rows = sqlx::query(
+            "SELECT id, label, agent_name, role, created_at, created_by, last_used, revoked_at
+             FROM api_keys ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_key_row).collect()
+    }
+
+    /// Withdraw a key. Idempotent: revoking an already-revoked key is a
+    /// no-op that still succeeds, because the caller's intent ("this
+    /// key must not work") is satisfied either way.
+    pub async fn revoke_key(&self, revoker: &str, key_id: &str) -> Result<ApiKeyInfo> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() > 0 {
+            record_event(
+                &mut tx,
+                "key_revoked",
+                None,
+                None,
+                Some(revoker),
+                json!({ "key_id": key_id }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        self.key_info(key_id)
+            .await?
+            .ok_or_else(|| McpmError::not_found("api key", key_id))
+    }
+
+    /// Whether this deployment has any live key at all. The HTTP
+    /// listener refuses to start without one — a server that would
+    /// admit nobody is a misconfiguration worth failing loudly on,
+    /// rather than a silent wall every agent bounces off.
+    pub async fn live_key_count(&self) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn key_info(&self, key_id: &str) -> Result<Option<ApiKeyInfo>> {
+        let row = sqlx::query(
+            "SELECT id, label, agent_name, role, created_at, created_by, last_used, revoked_at
+             FROM api_keys WHERE id = $1",
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_key_row).transpose()
+    }
 }
 
 #[derive(Default)]
@@ -2538,4 +2711,20 @@ async fn insert_tag(tx: &mut Tx<'_>, agent: &str, name: &str, label: &str) -> Re
     .execute(&mut **tx)
     .await?;
     Ok(inserted.rows_affected() > 0)
+}
+
+/// Row → [`ApiKeyInfo`]. Shared by every read path so the display shape
+/// of a key is defined once.
+fn map_key_row(r: &sqlx::postgres::PgRow) -> Result<ApiKeyInfo> {
+    Ok(ApiKeyInfo {
+        id: r.get("id"),
+        label: r.get("label"),
+        agent_name: r.get("agent_name"),
+        role: KeyRole::parse(r.get::<String, _>("role").as_str())
+            .ok_or_else(|| McpmError::internal("api_keys.role holds an unknown role"))?,
+        created_at: r.get("created_at"),
+        created_by: r.get("created_by"),
+        last_used: r.get("last_used"),
+        revoked_at: r.get("revoked_at"),
+    })
 }

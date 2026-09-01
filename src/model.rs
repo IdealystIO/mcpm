@@ -327,6 +327,63 @@ pub fn filter_wants(query: &str, status: &str, tags: &[String]) -> Vec<usize> {
         .collect()
 }
 
+/// The features the sidebar rail shows: everything still in play, plus
+/// whichever one is selected.
+///
+/// A finished feature is the bulk of a long-lived project and the part
+/// nobody is steering, so the rail — which exists to be scanned while
+/// work is happening — drops it. `selected` is the exception: opening a
+/// completed feature from the all-features screen must not make its own
+/// card vanish out from under the reader.
+pub fn rail_features(selected: usize) -> Vec<usize> {
+    features()
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| f.status != Status::Done || *i == selected)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The first feature still in play, for the console to land on.
+///
+/// Without this the console opens on index 0, which on a mature project
+/// is the oldest feature and almost certainly a finished one — the
+/// reader's first sight of the board would be work nobody is doing.
+pub fn first_open_feature() -> Option<usize> {
+    features().iter().position(|f| f.status != Status::Done)
+}
+
+/// How many features the rail is leaving out, for the all-features
+/// entry to name.
+pub fn completed_count() -> usize {
+    features().iter().filter(|f| f.status == Status::Done).count()
+}
+
+/// The all-features screen's rows, as indices into [`features`].
+///
+/// `query` matches the feature name case-insensitively; `status` is
+/// "all" / "open" / "done". Open is defined as "not complete" rather
+/// than as a list of the other states, so a feature can never be
+/// unreachable under every filter the way an enumerated list lets
+/// happen when a new state is added.
+pub fn filter_features(query: &str, status: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    features()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            let state_ok = match status {
+                "open" => f.status != Status::Done,
+                "done" => f.status == Status::Done,
+                _ => true,
+            };
+            let text_ok = needle.is_empty() || f.name.to_lowercase().contains(&needle);
+            state_ok && text_ok
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Index of a want in the pool by id, or `None` if it is no longer
 /// there. The want drawer addresses its target by id — the pool
 /// re-sorts under a poll, so a held index would drift onto another
@@ -431,6 +488,8 @@ fn event_display(kind: &str) -> (&'static str, Status) {
         "want_added" | "want_updated" | "want_reopened" => ("want", Status::Planning),
         "want_declined" => ("want", Status::Queued),
         "tag_created" => ("tag", Status::Planning),
+        "key_issued" => ("key", Status::Planning),
+        "key_revoked" => ("key", Status::Queued),
         _ => ("event", Status::Queued),
     }
 }

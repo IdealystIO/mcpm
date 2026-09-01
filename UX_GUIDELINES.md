@@ -300,3 +300,29 @@ The same fact often has both halves: the *attempt* is history, the
 (the locked lane says it is locked), and let the attempt live in the
 ledger. Deriving a standing banner from "the most recent event of kind
 X" is the anti-pattern — a rule with no clearing condition.
+
+### 22. Text in a row must be told it may shrink
+
+A `text` node in a flex row takes its **intrinsic, unwrapped** width. It
+does not wrap to fit its container by default and it does not yield to
+its siblings — so one long name in a card's title row pushes itself and
+everything after it straight through the card's edge, over whatever
+border was there.
+
+`flex_shrink` alone does not fix it: there is nothing to shrink against
+until the item is allowed below its intrinsic size. The pattern is a
+slot per side:
+
+- The **flexible** side (the title, the name, the sentence) gets
+  `min_width: 0` **and** `flex_shrink: 1.0`. `min_width: 0` is the
+  load-bearing half.
+- The **fixed** side (a badge, a count, a chevron) gets
+  `flex_shrink: 0.0`. A status pill squeezed to three letters is worse
+  than a title on two lines.
+- The **container** gets `overflow: Hidden` as the backstop, for content
+  with no break opportunity in it at all — an id, a slug, a URL — which
+  cannot wrap however much it is allowed to shrink.
+
+The tell is a screen that looks right with your test data and breaks on
+real names. Any row that pairs caller-supplied text with chrome needs
+this; narrow surfaces (a sidebar, a drawer, a table cell) hit it first.

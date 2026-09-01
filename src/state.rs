@@ -48,6 +48,25 @@ pub struct Console {
     /// "we managed a fetch once" — the header reports it.
     pub connected: Signal<bool>,
 
+    // --- The API key ------------------------------------------------
+    /// The console's API key, attached to every RPC as a bearer token.
+    /// Empty on a host that does not ask for one.
+    ///
+    /// Persisted (see [`use_console_live`]), because a key you have to
+    /// re-paste on every reload is a key people will keep in a text
+    /// file instead.
+    pub api_key: Signal<String>,
+    /// The host answered 401. Set by the snapshot poll, cleared by the
+    /// first fetch that succeeds — a live condition, not the memory of
+    /// one failure, so the gate screen disappears on its own the moment
+    /// a good key lands.
+    pub denied: Signal<bool>,
+    /// The key-entry field's buffer. Lives here rather than in the gate
+    /// component so a poll landing mid-paste cannot rebuild the input
+    /// under the cursor — the same reason the capture composer's
+    /// buffers do.
+    pub key_draft: Signal<String>,
+
     // --- The want pool's toolbar ------------------------------------
     /// Free-text filter over want bodies.
     pub pool_query: Signal<String>,
@@ -57,6 +76,14 @@ pub struct Console {
     pub pool_tags: Signal<Vec<String>>,
     /// Zero-based page of the filtered pool.
     pub pool_page: Signal<usize>,
+
+    // --- The all-features screen's toolbar --------------------------
+    /// Free-text filter over feature names.
+    pub feature_query: Signal<String>,
+    /// Status filter: "all" | "open" | "done".
+    pub feature_status: Signal<String>,
+    /// Zero-based page of the filtered list.
+    pub feature_page: Signal<usize>,
 
     // --- The capture composer ---------------------------------------
     // These live here, not inside the composer component, so a data
@@ -70,6 +97,23 @@ pub struct Console {
     /// Bumped to make the poller fetch NOW rather than waiting out its
     /// window — so your own write appears immediately.
     pub refresh: Signal<u64>,
+}
+
+/// The namespace the console's persisted state is filed under.
+const STORE: &str = "control-center";
+
+/// The console state `app()` actually runs on: [`use_console`] with the
+/// API key restored from local storage and written back as it changes.
+///
+/// Kept separate from [`use_console`] because `Console::default` calls
+/// that one to satisfy the props machinery, and a `Default` impl is not
+/// the place to touch the browser's storage — it runs for prop structs
+/// nobody reads.
+pub fn use_console_live() -> Console {
+    Console {
+        api_key: storage::persisted_signal(STORE, "api_key", String::new()),
+        ..use_console()
+    }
 }
 
 /// Create the console state. Call once from `app()` inside the mounted
@@ -91,6 +135,12 @@ pub fn use_console() -> Console {
         pool_status: signal("all".to_string()),
         pool_tags: signal(Vec::new()),
         pool_page: signal(0),
+        api_key: signal(String::new()),
+        denied: signal(false),
+        key_draft: signal(String::new()),
+        feature_query: signal(String::new()),
+        feature_status: signal("all".to_string()),
+        feature_page: signal(0),
         draft: signal(String::new()),
         status: signal(String::new()),
         busy: signal(false),
@@ -115,10 +165,66 @@ impl Console {
         self.close_drawer();
     }
 
+    /// Leave the key screen without changing anything. Only reachable
+    /// while the host is still answering us — a refused console has
+    /// nothing to go back to.
+    pub fn dismiss_key(&self) {
+        self.pane.set("feature".to_string());
+    }
+
+    /// Show the key screen, seeding the field with the key in use so
+    /// rotating one is an edit rather than a retype.
+    pub fn show_key(&self) {
+        self.key_draft.set(self.api_key.get());
+        self.pane.set("key".to_string());
+        self.close_drawer();
+    }
+
+    /// Adopt the typed key and leave the gate. The poll picks it up on
+    /// its next tick, and `denied` clears when a fetch succeeds — this
+    /// does not clear it optimistically, because a second wrong key
+    /// would then look accepted until the next failure.
+    pub fn save_key(&self, key: String) {
+        self.api_key.set(key.trim().to_string());
+        self.pane.set("feature".to_string());
+    }
+
     /// Show the want pool.
     pub fn show_wants(&self) {
         self.pane.set("wants".to_string());
         self.close_drawer();
+    }
+
+    /// Show every feature, including the completed ones the rail hides.
+    pub fn show_features(&self) {
+        self.pane.set("features".to_string());
+        self.close_drawer();
+    }
+
+    /// Narrow the feature list by name. Any filter change returns to the
+    /// first page — page 4 of the old result set means nothing in the
+    /// new one.
+    pub fn set_feature_query(&self, text: String) {
+        self.feature_query.set(text);
+        self.feature_page.set(0);
+    }
+
+    /// Narrow the feature list to one status (or "all").
+    pub fn set_feature_status(&self, status: String) {
+        self.feature_status.set(status);
+        self.feature_page.set(0);
+    }
+
+    /// Drop every feature filter at once.
+    pub fn clear_feature_filters(&self) {
+        self.feature_query.set(String::new());
+        self.feature_status.set("all".to_string());
+        self.feature_page.set(0);
+    }
+
+    /// Step the feature list's page. Callers clamp to the page count.
+    pub fn set_feature_page(&self, page: usize) {
+        self.feature_page.set(page);
     }
 
     /// Open the module drawer.

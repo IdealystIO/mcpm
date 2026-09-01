@@ -1,5 +1,5 @@
-//! Main pane: either the want pool, or one feature — header (title,
-//! stats, tabs) and the active view. Rebuilt via one
+//! Main pane: the want pool, the all-features screen, or one feature —
+//! header (title, stats, tabs) and the active view. Rebuilt via one
 //! coarse `switch` whenever the pane, selection, view tab, tree toggles,
 //! or drawer target change, which keeps every view a plain function of
 //! state.
@@ -15,6 +15,7 @@ use runtime_core::{
 
 use crate::components::bits::{Mono, StatusBadge};
 use crate::components::board::BoardView;
+use crate::components::feature_list::FeaturesView;
 use crate::components::feed::FeedView;
 use crate::components::graph::GraphView;
 use crate::components::tree::TreeView;
@@ -41,7 +42,15 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             // recreate the capture editor under the user's cursor every
             // time a poll landed.
             let pane = console.pane.get();
-            let rev = if pane == "wants" { 0 } else { console.rev.get() };
+            // Neither the pool nor the features screen reads `rev`
+            // here: both own their own data-keyed switches, and
+            // rebuilding them from this one would recreate the field
+            // the user is typing into every time a poll landed.
+            let rev = if pane == "wants" || pane == "features" {
+                0
+            } else {
+                console.rev.get()
+            };
             (
                 pane,
                 console.feature.get(),
@@ -55,6 +64,9 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             let (pane, fi, active_view, toggled, selected, _rev) = state.clone();
             if pane == "wants" {
                 return ui! { WantsView(console = console) };
+            }
+            if pane == "features" {
+                return ui! { FeaturesView(console = console) };
             }
             if features().get(fi).is_none() {
                 return empty_pane();
