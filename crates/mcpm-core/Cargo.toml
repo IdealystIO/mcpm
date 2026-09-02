@@ -26,9 +26,17 @@ rand = "0.8"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Plain-TCP Postgres (local/devcontainer only — no TLS feature on purpose).
+# Postgres. `tls-rustls` is NOT optional: every managed Postgres
+# requires TLS (RDS ships `rds.force_ssl=1`, and Cloud SQL, Azure
+# Database, Neon and Supabase all demand it), and a client built
+# without it cannot negotiate — it is refused before `sslmode` is ever
+# consulted, with a `pg_hba.conf` message that reads like a firewall
+# problem. The devcontainer path is unaffected: sqlx defaults to
+# `sslmode=prefer`, so a TLS-capable client still connects to the plain
+# TCP sidecar.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
+    "tls-rustls",
     "postgres",
     "macros",
     "migrate",

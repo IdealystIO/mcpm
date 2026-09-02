@@ -40,38 +40,38 @@ sidecar = ["dep:dev-server"]
 # the target needs — `backend-web` + the wasm-bindgen glue on wasm, a
 # native shell otherwise — so this manifest names no backend directly
 # and `cargo build` alone produces a runnable artifact.
-idealyst = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+idealyst = { version = "1.5.2", registry = "idealyst" }
 # The author surface. `runtime-core` is the crate this project aliases
 # to `runtime_core` at its root (see src/lib.rs). `runtime-vocabulary` is
 # needed because the `ui!` emission spells absolute
 # `::runtime_vocabulary::glue::…` paths, and `runtime-scene` because
 # `register_scene_extensions` is generic over the scene `Registry` host.
-runtime-core = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca", features = ["async-driver"] }
-runtime-vocabulary = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
-runtime-scene = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+runtime-core = { version = "1.5.2", registry = "idealyst", features = ["async-driver"] }
+runtime-vocabulary = { version = "1.5.2", registry = "idealyst" }
+runtime-scene = { version = "1.5.2", registry = "idealyst" }
 # Recorder backend for the runtime-server sidecar wrapper. Optional —
 # pulled in only by the `sidecar` feature (host-side sidecar build);
 # never compiled for device/web targets.
-dev-server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca", optional = true }
+dev-server = { version = "1.5.2", registry = "idealyst", optional = true }
 # The idea-ui component library (Badge, Progress, Button, Typography, …)
 # and its theme runtime — the MCP Project Console composes these rather
 # than re-implementing chrome on bare primitives.
-idea-ui = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
-idea-theme = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+idea-ui = { version = "1.5.2", registry = "idealyst" }
+idea-theme = { version = "1.5.2", registry = "idealyst" }
 # Live data: the console calls the `api` crate's #[server] fns (RPC
 # stubs on this side; mcpm-web hosts the bodies) via the server SDK.
 api = { path = "crates/api" }
 # The editable code surface behind the bulk want composer: `code_editor`
 # takes author-supplied BYTE-RANGE decorations, so `#tag` highlighting is
 # our tokenizer's output rather than a language the SDK has to know.
-codeblock = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+codeblock = { version = "1.5.2", registry = "idealyst" }
 # The `table` SDK, named DIRECTLY even though `idea-ui`'s default `table`
 # feature already pulls it: `idea_ui::Table` renders the SDK's payloads
 # (`table`/`table_row`/`table_cell`), and a payload with no handler panics
 # at realize. Registering it needs the crate in scope here — a transitive
 # dep is linked but not nameable.
-table = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
-server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+table = { version = "1.5.2", registry = "idealyst" }
+server = { version = "1.5.2", registry = "idealyst" }
 # Where the console's API key survives a reload. `reactive` gives
 # `persisted_signal`, which hydrates and persists a signal race-correctly
 # — hand-rolled load/persist wiring clobbers a write made before the
@@ -81,14 +81,14 @@ server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c7
 # choice here: the `credentials` SDK errors on web rather than pretend
 # the browser has a keychain, and web is the console's only target. The
 # key it holds is the least-privileged one this system issues.
-storage = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca", features = ["reactive"] }
+storage = { version = "1.5.2", registry = "idealyst", features = ["reactive"] }
 
 # Test-only mock scene host. It realizes a component tree through the
 # REAL `realize` path against an in-memory backend, which is the only
 # way to prove a payload has a handler without a browser: an
 # unregistered one panics at mount exactly as it does on web.
 [dev-dependencies]
-host-mock = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+host-mock = { version = "1.5.2", registry = "idealyst" }
 
 # No backend deps: `register_scene_extensions` is generic over the scene
 # `Host` (this scaffold registers no third-party SDKs), so the app crate

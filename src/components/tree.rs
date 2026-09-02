@@ -2,7 +2,7 @@
 //! as collapsible rows. Stage rows toggle their modules; module rows
 //! toggle their task checklists and open the drawer.
 
-use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, Typography};
+use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, ProgressCap, Typography};
 use runtime_core::{
     component, pressable, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
     IdealystSchema, IntoElement, StyleApplication, TextAlign,
@@ -307,7 +307,7 @@ pub fn TreeRow(props: &TreeRowProps) -> Element {
             }
             view(style = BarCell()) {
                 if has_bar {
-                    Progress(value = bar, tone = bar_tone)
+                    Progress(value = bar, tone = bar_tone, cap = ProgressCap::Rounded)
                 }
             }
         }

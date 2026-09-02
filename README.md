@@ -27,6 +27,13 @@ boundary.
 - The [Idealyst](https://github.com/IdealystIO/idealyst-native) CLI, for
   the console only: `cargo install --git https://github.com/IdealystIO/idealyst-native idealyst-cli`
 
+The Idealyst framework crates come from **crates.idealyst.io**, not
+crates.io. Nothing to install: `.cargo/config.toml` names the index and
+is checked in, so `cargo build` resolves them on a fresh clone. Keep the
+CLI's version in step with the crates — it post-processes the wasm the
+crates produce, and a mismatch surfaces in the browser as a wasm
+init failure rather than a build error.
+
 ## Setup
 
 **1. Start Postgres.** Published on host port 55432 to avoid colliding
@@ -214,6 +221,22 @@ One shared instance for a cluster of agents running on their own
 machines. Two things change from the local setup: the MCP server gets an
 HTTP transport, and every caller presents an **API key**.
 
+### A managed database
+
+Point `DATABASE_URL` at it and add `?sslmode=require`. RDS, Cloud SQL,
+Azure Database, Neon and Supabase all refuse an unencrypted connection,
+and the client is built with TLS for that reason.
+
+**Percent-encode the password.** A generated master password is drawn
+from a wide punctuation alphabet, and `:` `/` `?` `#` `[` `]` `@` are
+all structural in a URL — an unencoded one makes the URL parse as
+something else entirely rather than fail as a bad password. mcpm names
+this cause when it sees it, but encoding the value is what fixes it.
+
+No binary here ever prints a `DATABASE_URL`: banners and connect
+failures alike go through `mcpm_core::redact_url`, so a log or a pasted
+error carries the host and database without the credential.
+
 ### Keys are identities, not passwords
 
 A key is issued *for* an agent name and a role, and that is what the
@@ -243,6 +266,11 @@ set of usable credentials. Three consequences:
 
 Issuing and revoking both land in the event ledger — who may act, and as
 whom — without the token or its hash.
+
+This imposes an order on an automated deployment: `--issue-key` writes
+to the database, and a network-facing `mcpm-web` refuses to start with
+no keys on file. So the sequence is **database up → migrate → mint keys
+→ enable the services**, not the other way round.
 
 ```bash
 mcpm-mcp --list-keys
@@ -300,6 +328,18 @@ origin at all: a loud misconfiguration rather than a silent hole).
 Console captures are then recorded under the key's agent name instead of
 `console`.
 
+The console's API origin is baked into the wasm at build time, so a
+console served from anywhere other than the machine running `mcpm-web`
+must be built with it:
+
+```bash
+MCPM_API_ORIGIN=https://console.internal idealyst build --web
+```
+
+Left at its default the page loads perfectly and points every visitor's
+browser at *their own* loopback, so the calls fail on the visitor's
+machine and the server logs stay clean and empty.
+
 Open the console and it will ask for a key; paste a `console` one. It is
 kept in the browser's local storage, and the header's key pill is how you
 rotate or forget it.
@@ -315,7 +355,8 @@ rotate or forget it.
 - **The browser holds the console key in `localStorage`.** The
   `credentials` SDK errors on web rather than pretend the browser has a
   keychain, and web is the console's only target.
-- **No TLS of its own, by design.** Both listeners speak plain HTTP and
+- **No TLS of its own, by design** — its own listeners, not its
+  database connection, which does use TLS. Both listeners speak plain HTTP and
   expect to sit behind an ingress that terminates TLS — a load balancer
   for a public deployment, nothing at all for a private network. What
   the deployment must not do is carry bearer tokens over plaintext

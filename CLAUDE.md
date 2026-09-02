@@ -189,6 +189,21 @@ of the `server` SDK, and only running one hides breakage in the other.
   Gating it in the hook would reject every socket, and the console
   would silently fall back to its 30s poll — the same failure mode
   `tests/notify.rs` exists to catch.
+- **Never print a `DATABASE_URL`; print `redact_url` of one.** The
+  userinfo is a rotating credential, and a log has a different retention
+  policy and a different audience than the secret store it came from —
+  so this is a leak that raises no error and shows up in a journal weeks
+  later. It applies to the SUCCESS path (a startup banner) as much as an
+  error branch; the failure path is worse only because it is the one
+  people paste into chats. `redact_url` redacts wholesale rather than
+  guess when it cannot find the boundary, because an unencoded `/` or
+  `?` in a password is exactly what makes a naive scan conclude there is
+  no credential to hide.
+- **`API_ORIGIN` in `src/app.rs` is baked into the wasm** at build time
+  from `MCPM_API_ORIGIN`, defaulting to loopback. A hosted console built
+  without it points every visitor's browser at THEIR own loopback: the
+  page renders perfectly, every call fails on the visitor's machine, and
+  the server logs show a healthy host that nobody is talking to.
 - **`mcpm-web` must reference the `api` crate** (`api::Snapshot::default()`)
   or the linker dead-strips its route inventory and every `/_srv/` path
   404s with no build error.

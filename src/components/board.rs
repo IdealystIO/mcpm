@@ -1,7 +1,7 @@
 //! Stage-pipeline board: one lane per stage, gate markers between
 //! lanes, module cards inside. Lanes scroll horizontally.
 
-use idea_ui::{typography_kind, IdeaThemeRef, Progress, Spacer, Stack, StackAlign, StackAxis, Typography};
+use idea_ui::{typography_kind, IdeaThemeRef, Progress, ProgressCap, Spacer, Stack, StackAlign, StackAxis, Typography};
 use runtime_core::{
     component, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight, IdealystSchema,
     TextAlign,
@@ -109,7 +109,7 @@ pub fn StageLane(props: &StageLaneProps) -> Element {
                     Spacer()
                     Typography(content = done_label, kind = typography_kind::Caption, muted = true)
                 }
-                Progress(value = fraction, tone = status_tone(status))
+                Progress(value = fraction, tone = status_tone(status), cap = ProgressCap::Rounded)
             }
             scroll_view(style = LaneCards()) {
                 for mi in 0..module_count {

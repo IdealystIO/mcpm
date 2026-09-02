@@ -1,6 +1,12 @@
 /target
 /pkg
-Cargo.lock
+# Cargo.lock IS checked in. This workspace builds applications — the
+# console, `mcpm-web`, `mcpm-mcp` — not a library, so the exact
+# dependency set is part of the deliverable. It also carries a pin the
+# manifests no longer can: the framework crates come from
+# crates.idealyst.io under caret requirements, so without this file a
+# fresh clone can resolve different 1.5.x code, including transitive
+# crates (runtime-shared) that no manifest here names.
 /.idealyst/
 /dist/
 .env

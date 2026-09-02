@@ -38,7 +38,7 @@ server = [
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-server = { git = "https://github.com/IdealystIO/idealyst-native", rev = "d8226c721745143f2fad9e8edfa1ac8cd4a23fca" }
+server = { version = "1.5.2", registry = "idealyst" }
 
 # Server-only. Optional so the wasm build never pulls sqlx/tokio/axum.
 axum = { version = "0.7", optional = true }

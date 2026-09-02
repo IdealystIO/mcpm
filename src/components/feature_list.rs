@@ -9,7 +9,7 @@
 
 use std::rc::Rc;
 
-use idea_ui::{size, typography_kind, variant, Button, Field, IdeaThemeRef, Progress,
+use idea_ui::{size, typography_kind, variant, Button, Field, IdeaThemeRef, Progress, ProgressCap,
     SegmentOption, SegmentedControl, Spacer, Table, TableCell, TableRow, Typography};
 use runtime_core::{
     component, rx, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
@@ -231,7 +231,7 @@ pub fn FeatureRow(props: &FeatureRowProps) -> Element {
             }
             TableCell {
                 view(style = ProgressCell()) {
-                    Progress(value = fraction, tone = status_tone(status))
+                    Progress(value = fraction, tone = status_tone(status), cap = ProgressCap::Rounded)
                     view(style = ProgressLabels()) {
                         Mono(content = modules)
                         Spacer()

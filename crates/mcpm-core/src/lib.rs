@@ -12,11 +12,13 @@
 mod error;
 mod ids;
 mod keys;
+mod redact;
 mod store;
 mod types;
 
 pub use error::{McpmError, ErrorCode};
 pub use ids::{id_level, new_id, new_want_id, normalize_tag, Level, PROJECT_SUBJECT};
 pub use keys::{display_key, from_bearer, ApiKeyInfo, IssuedKey, KeyIdentity, KeyRole, MANAGER_ONLY};
+pub use redact::redact_url;
 pub use store::Store;
 pub use types::*;

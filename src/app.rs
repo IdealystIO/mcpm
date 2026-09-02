@@ -18,7 +18,19 @@ use crate::state::{use_console_live, Console};
 
 /// Where the mcpm-web API listens
 /// (`cargo run -p api --bin mcpm-web --features server`).
-const API_ORIGIN: &str = "http://127.0.0.1:3210";
+///
+/// Baked into the wasm at build time, so it must be set for any build
+/// served from somewhere other than the machine running `mcpm-web`:
+/// the default points every visitor's browser at THEIR OWN loopback,
+/// where the page loads perfectly and every call fails against nothing
+/// — on the visitor's machine, so the server logs show a healthy host
+/// with no traffic. Set `MCPM_API_ORIGIN` to the deployment's own
+/// origin when building a hosted console; the devcontainer path needs
+/// nothing.
+const API_ORIGIN: &str = match option_env!("MCPM_API_ORIGIN") {
+    Some(origin) => origin,
+    None => "http://127.0.0.1:3210",
+};
 /// Snapshot poll cadence — the FALLBACK, not the primary path. Every
 /// committed event arrives over `watch_events` within a frame or two;
 /// this is what keeps the console correct if that socket is down (the

@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use mcpm_core::{from_bearer, Store};
+use mcpm_core::{from_bearer, redact_url, Store};
 use tower_http::cors::CorsLayer;
 
 #[tokio::main]
@@ -36,7 +36,7 @@ async fn main() {
         .unwrap_or_else(|_| "postgres://app:app@localhost:55432/app".to_string());
     let store = Store::connect(&database_url)
         .await
-        .expect("connect to the mcpm database (is the devcontainer db up on 55432?)");
+        .expect("connect to the mcpm database at DATABASE_URL");
     store
         .ensure_project(
             &std::env::var("MCPM_PROJECT_NAME").unwrap_or_else(|_| "control-center".into()),
@@ -86,7 +86,10 @@ async fn main() {
         Err(_) => std::net::Ipv4Addr::LOCALHOST.into(),
     };
     let addr: std::net::SocketAddr = (host, port).into();
-    println!("mcpm-web: API at http://{addr}/_srv/<fn> (db: {database_url})");
+    println!(
+        "mcpm-web: API at http://{addr}/_srv/<fn> (db: {})",
+        redact_url(&database_url)
+    );
     println!(
         "mcpm-web: {}",
         if require_auth {

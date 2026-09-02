@@ -8,7 +8,7 @@
 //! click away on the Features screen, which the entry under the cards
 //! opens and which says how many it is holding.
 
-use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, Spacer, Stack, StackAlign,
+use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, ProgressCap, Spacer, Stack, StackAlign,
     StackAxis, StackGap, Typography};
 use runtime_core::{
     component, pressable, stylesheet, switch, ui, Element, FlexDirection, FontWeight,
@@ -297,7 +297,7 @@ pub fn FeatureCard(props: &FeatureCardProps) -> Element {
                     StatusBadge(status = status)
                 }
             }
-            Progress(value = fraction, tone = status_tone(status))
+            Progress(value = fraction, tone = status_tone(status), cap = ProgressCap::Rounded)
             Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
                 view(style = TitleSlot()) {
                     Mono(content = agent)

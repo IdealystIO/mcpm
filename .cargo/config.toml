@@ -1,0 +1,7 @@
+# The Idealyst framework crates come from the project's own registry
+# rather than crates.io. Cargo needs the index named here before a
+# `registry = "idealyst"` dependency in any manifest will resolve —
+# this file is the whole configuration, and it is checked in so a fresh
+# clone builds without a setup step.
+[registries.idealyst]
+index = "sparse+https://crates.idealyst.io/index/"

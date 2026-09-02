@@ -360,3 +360,17 @@ the strip be the row they sit in.
 
 The tell is a view that looks finished with three items and truncates
 at eight. Test wide and deep, not typical.
+
+### 24. A progress bar has pill ends
+
+Every `Progress` in this console passes `cap = ProgressCap::Rounded`.
+The bar is a small, repeated shape that appears on four screens — the
+board, the feature table, the sidebar rail and the tree — so its
+silhouette is a thing the eye learns; two screens disagreeing about it
+reads as one of them being unfinished rather than as a choice.
+
+The prop is explicit at every call site because idea-ui's default is
+`ProgressCap::None` (square). That default is not wrong, it is simply
+not ours, and a `Progress` added without the prop will silently render
+square next to four rounded ones. This is why the prop is not noise to
+be tidied away: deleting it changes the picture.

@@ -53,7 +53,25 @@ impl Store {
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .connect(database_url)
-            .await?;
+            .await
+            // `Configuration` is how sqlx reports a URL it could not
+            // parse, and its own text names whatever token it choked
+            // on — classically "invalid port number" for a password
+            // beginning with ':', which points at nothing the operator
+            // typed. Name the real cause: percent-encoding the
+            // userinfo is the fix in nearly every case, and inspecting
+            // the URL to find that out is what gets a credential
+            // pasted into a terminal.
+            .map_err(|err| match err {
+                sqlx::Error::Configuration(inner) => McpmError::internal(format!(
+                    "could not parse DATABASE_URL ({inner}). If the password contains any of \
+                     : / ? # [ ] @ it must be percent-encoded — an unencoded ':' is read as \
+                     the start of a port and an unencoded '?' as the start of a query \
+                     string. Parsed as: {}",
+                    crate::redact_url(database_url)
+                )),
+                other => McpmError::from(other),
+            })?;
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await

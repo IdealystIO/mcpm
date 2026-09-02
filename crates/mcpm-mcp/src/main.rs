@@ -34,7 +34,7 @@ mod tools;
 
 use std::io::{BufRead, Write};
 
-use mcpm_core::{ApiKeyInfo, McpmError, Store};
+use mcpm_core::{redact_url, ApiKeyInfo, McpmError, Store};
 use serde_json::Value;
 
 use crate::cli::Mode;
@@ -122,7 +122,10 @@ async fn connect() -> Store {
         Ok(store) => store,
         Err(err) => {
             eprintln!("mcpm-mcp: cannot start: {err}");
-            eprintln!("mcpm-mcp: is the devcontainer database up? (DATABASE_URL={database_url})");
+            eprintln!(
+                "mcpm-mcp: could not reach the database at {}",
+                redact_url(&database_url)
+            );
             std::process::exit(1);
         }
     };
@@ -139,7 +142,7 @@ async fn connect() -> Store {
         eprintln!("mcpm-mcp: cannot start: {err}");
         std::process::exit(1);
     }
-    eprintln!("mcpm-mcp: db {database_url}");
+    eprintln!("mcpm-mcp: db {}", redact_url(&database_url));
     store
 }
 
