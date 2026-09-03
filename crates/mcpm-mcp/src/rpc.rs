@@ -12,9 +12,17 @@
 //! is where that difference is named: over stdio an agent declares
 //! itself through `get_context`; over HTTP the verified key already
 //! said who it is, and `get_context` takes no arguments at all.
+//!
+//! A third source cuts across both. A `delegation_token` argument, when
+//! it resolves, REPLACES the session's identity for that one call: the
+//! write is attributed to the minted name, the role is forced to worker
+//! whatever the key says, and the actor is confined to the module the
+//! token names. That is how one process tree — which can only ever hold
+//! one key — holds more than one agent.
 
 use mcpm_core::{
-    EdgeKind, ErrorCode, KeyIdentity, KeyRole, McpmError, MemoryKind, MemoryQuery, MemoryScope, PlanFeature,
+    Actor, Delegation, EdgeKind, ErrorCode, KeyIdentity, KeyRole, McpmError, MemoryKind, MemoryQuery,
+    MemoryScope, PlanFeature,
     PlanOp, PromoteWants, SearchDirection, Store, Supersede, TaskOutcome, WantDraft, WantEdit,
     WantFilter, WantState,
 };
@@ -35,7 +43,11 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     manager. Loose ideas live in the want pool (add_want / list_wants); \
     features are composed out of GROUPS of wants with promote_wants, \
     never one want to one feature. Ids are prefixed by kind: feat_ stg_ mod_ \
-    tsk_ want_. Beyond tools there are prompts (manager_briefing, \
+    tsk_ want_. Subagents that share one machine's key each get their own \
+    identity from mint_worker: the manager mints one per module and puts \
+    the token in the subagent's prompt, and the subagent passes \
+    delegation_token on get_context and on every write. Beyond tools \
+    there are prompts (manager_briefing, \
     worker_briefing, compose_wants) that brief a fresh agent for a role, \
     and read-only project:// resources for the board, the want pool, and \
     the event ledger.";
@@ -153,40 +165,66 @@ async fn call_tool(
     name: &str,
     args: &Value,
 ) -> Result<Value, McpmError> {
-    // The role gate, before anything else. It binds only where a role
-    // was actually PROVEN: on an unauthenticated stdio session the role
-    // is self-declared, so refusing a call on it would be theatre —
+    // A delegation token, if one was presented, is resolved BEFORE the
+    // gate — because resolving it is what decides which role the gate
+    // applies. It is verified against the session's own key, so a token
+    // from another machine resolves to nothing here.
+    let delegation = resolve_delegation(store, session, args).await?;
+
+    // The role gate. It binds where a role was PROVEN — by a key, or by
+    // a delegation the server just minted and resolved itself. On an
+    // unauthenticated stdio session with no token the role is
+    // self-declared, so refusing a call on it would be theatre —
     // whoever typed "worker" can type "manager" — while breaking the
     // local workflow this transport exists for.
-    if let Some(role) = session.verified_role() {
+    //
+    // A resolved delegation forces WORKER whatever key carried it. That
+    // single line is what lets a manager's process tree contain workers:
+    // the minting key stays a manager, every subagent holding one of its
+    // tokens is not.
+    let effective_role = match &delegation {
+        Some(_) => Some(KeyRole::Worker),
+        None => session.verified_role(),
+    };
+    if let Some(role) = effective_role {
         if !role.may_call(name) {
             return Err(McpmError::forbidden(name, role));
         }
     }
 
     if name == "get_context" {
-        // A verified key already said who this is, and its word beats
-        // the arguments: taking `agent_name` from a keyed caller would
-        // hand back the one thing the key exists to make unforgeable.
-        let (agent, role) = match &session.key {
-            Some(key) => (key.agent_name.clone(), key.role.as_str().to_string()),
-            None => (str_arg(args, "agent_name")?, str_arg(args, "role")?),
+        // A verified identity already said who this is, and its word
+        // beats the arguments: taking `agent_name` from a keyed or
+        // delegated caller would hand back the one thing the credential
+        // exists to make unforgeable. A subagent needs this call to
+        // re-orient — `your_claims` and the suggested next step are
+        // wrong for it otherwise — so the token is honoured here too.
+        let (agent, role) = match (&delegation, &session.key) {
+            (Some(d), _) => (d.agent_name.clone(), KeyRole::Worker.as_str().to_string()),
+            (None, Some(key)) => (key.agent_name.clone(), key.role.as_str().to_string()),
+            (None, None) => (str_arg(args, "agent_name")?, str_arg(args, "role")?),
         };
         let ctx = store.get_context(&agent, &role).await?;
-        if session.key.is_none() {
+        if session.key.is_none() && delegation.is_none() {
             session.declared = Some((agent, role));
         }
         return to_value(ctx);
     }
-    let agent = session.agent().ok_or_else(|| {
-        McpmError::new(
-            ErrorCode::NotRegistered,
-            "This session has no identity yet.",
-            Value::Null,
-            "Call get_context(agent_name, role) first — every other tool attributes its \
-             writes to that identity.",
-        )
-    })?;
+    // Who this write is recorded as, and what it is allowed to touch.
+    // The store enforces the scope; the dispatcher only carries it.
+    let actor = match &delegation {
+        Some(d) => Actor::delegated(&d.agent_name, &d.module_id),
+        None => Actor::new(session.agent().ok_or_else(|| {
+            McpmError::new(
+                ErrorCode::NotRegistered,
+                "This session has no identity yet.",
+                Value::Null,
+                "Call get_context(agent_name, role) first — every other tool attributes its \
+                 writes to that identity.",
+            )
+        })?),
+    };
+    let agent = actor.name.clone();
 
     match name {
         "plan_feature" => {
@@ -203,6 +241,17 @@ async fn call_tool(
             let summary = str_arg(args, "summary")?;
             to_value(store.complete_feature(&agent, &feature_id, &summary).await?)
         }
+        "mint_worker" => {
+            let module_id = str_arg(args, "module_id")?;
+            let agent_name = str_arg(args, "agent_name")?;
+            let ttl = args.get("ttl_minutes").and_then(Value::as_i64);
+            let key_id = session.key.as_ref().map(|k| k.key_id.as_str());
+            to_value(
+                store
+                    .mint_worker(&actor, key_id, &module_id, &agent_name, ttl)
+                    .await?,
+            )
+        }
         "next_work" => {
             let feature_id = str_arg(args, "feature_id")?;
             to_value(store.next_work(&feature_id).await?)
@@ -214,7 +263,7 @@ async fn call_tool(
         }
         "claim_module" => {
             let module_id = str_arg(args, "module_id")?;
-            to_value(store.claim_module(&agent, &module_id).await?)
+            to_value(store.claim_module(&actor, &module_id).await?)
         }
         "complete_task" => {
             let task_id = str_arg(args, "task_id")?;
@@ -222,7 +271,7 @@ async fn call_tool(
             let note = opt_str_arg(args, "note");
             to_value(
                 store
-                    .complete_task(&agent, &task_id, outcome, note.as_deref())
+                    .complete_task(&actor, &task_id, outcome, note.as_deref())
                     .await?,
             )
         }
@@ -232,7 +281,7 @@ async fn call_tool(
             let note = opt_str_arg(args, "note");
             to_value(
                 store
-                    .add_task(&agent, &module_id, &task_name, note.as_deref())
+                    .add_task(&actor, &module_id, &task_name, note.as_deref())
                     .await?,
             )
         }
@@ -240,18 +289,18 @@ async fn call_tool(
             let module_id = str_arg(args, "module_id")?;
             let summary = str_arg(args, "summary")?;
             let used: Vec<String> = json_field(args, "used_memories")?.unwrap_or_default();
-            to_value(store.complete_module(&agent, &module_id, &summary, &used).await?)
+            to_value(store.complete_module(&actor, &module_id, &summary, &used).await?)
         }
         "report_blocker" => {
             let module_id = str_arg(args, "module_id")?;
             let description = str_arg(args, "description")?;
             let misled: Vec<String> = json_field(args, "misled_by")?.unwrap_or_default();
-            to_value(store.report_blocker(&agent, &module_id, &description, &misled).await?)
+            to_value(store.report_blocker(&actor, &module_id, &description, &misled).await?)
         }
         "release_module" => {
             let module_id = str_arg(args, "module_id")?;
             let reason = str_arg(args, "reason")?;
-            to_value(store.release_module(&agent, &module_id, &reason).await?)
+            to_value(store.release_module(&actor, &module_id, &reason).await?)
         }
         "commit_memory" => {
             let scope: MemoryScope = parse_field(args, "scope")?;
@@ -410,6 +459,30 @@ async fn call_tool(
             "Use one of the tools from tools/list.",
         )),
     }
+}
+
+/// Pull `delegation_token` out of the arguments and resolve it, or
+/// `None` when the caller did not present one.
+///
+/// An unresolvable token is an ERROR, never a silent fall-back to the
+/// session's own identity: falling back would attribute a subagent's
+/// work to the machine — quietly, and exactly in the case the token
+/// exists to prevent.
+async fn resolve_delegation(
+    store: &Store,
+    session: &Session,
+    args: &Value,
+) -> Result<Option<Delegation>, McpmError> {
+    let Some(token) = args
+        .get("delegation_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return Ok(None);
+    };
+    let key_id = session.key.as_ref().map(|k| k.key_id.as_str());
+    store.resolve_delegation(key_id, token).await.map(Some)
 }
 
 // ---------------------------------------------------------------------

@@ -118,7 +118,7 @@ tool attributes its writes to that identity and will refuse until it is
 made. Errors carry a `code`, a `message`, and a `hint` saying what to do
 next, so recovery does not require reading this file.
 
-Beyond the 22 tools there are:
+Beyond the 28 tools there are:
 
 - **Prompts**, which brief a fresh agent for a role:
   `manager_briefing`, `worker_briefing`, `compose_wants`.
@@ -267,6 +267,45 @@ set of usable credentials. Three consequences:
 Issuing and revoking both land in the event ledger — who may act, and as
 whom — without the token or its hash.
 
+### Many agents, one key
+
+A key belongs to a MACHINE, and a subagent inherits its parent's MCP
+configuration wholesale — it cannot present a different key, or set a
+header of its own. So on a laptop holding a manager key, every subagent
+is that laptop and is a manager; on a branch box holding a worker key,
+every subagent is that box and can never plan. Concurrency survives
+this (claims are exclusive per module, and one identity may hold
+several), but attribution, mutual exclusion between siblings, and the
+manager/worker split do not.
+
+`mint_worker` is the way out, and it is deliberately not an `as_agent`
+argument the caller asserts:
+
+```
+mint_worker(module_id='mod_4f1c88ae', agent_name='agent.mod.schema')
+→ { "delegation_token": "dlg_9a3f…", "expires_at": "…" }
+```
+
+The manager puts the token in the subagent's prompt; the subagent passes
+`delegation_token` on `get_context` and on every write. The server then
+records the minted name instead of the machine's. Five rules make that
+safe enough to paste into a prompt:
+
+- **Token + key.** A token is honoured only alongside the key that
+  minted it, so off that machine it is inert.
+- **Always a worker.** A manager key mints it, but it never inherits
+  manager authority — which is what finally lets planning and working
+  coexist in one process tree.
+- **One module.** The token names its module and is refused against any
+  other, so a confused subagent cannot reach into a sibling's work.
+- **One level deep.** A delegated identity cannot mint another.
+- **It dies with the work.** `complete_module` and `release_module`
+  retire it in the same transaction that ends the module, and it expires
+  on a TTL regardless (4 hours by default).
+
+Minting lands in the event ledger with the name and the module. The
+token itself never does.
+
 This imposes an order on an automated deployment: `--issue-key` writes
 to the database, and a network-facing `mcpm-web` refuses to start with
 no keys on file. So the sequence is **database up → migrate → mint keys
@@ -368,7 +407,7 @@ rotate or forget it.
 | Crate | What it is |
 | --- | --- |
 | `crates/mcpm-core` | Domain and Postgres store. The stage gate, exclusive claims, checklist-proven completion, the want pool, the append-only event ledger, and scoped memory search. Every invariant is enforced inside a transaction. |
-| `crates/mcpm-mcp` | The MCP server: 27 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
+| `crates/mcpm-mcp` | The MCP server: 28 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, the `#[server]` functions and `#[subscription]` the console calls, plus the `mcpm-web` host binary (feature-gated). |
 | `src/` | The Idealyst console: want pool with capture composer, board, hierarchy, live feed, dependency graph, composed-from, and the module and want drawers. |
 

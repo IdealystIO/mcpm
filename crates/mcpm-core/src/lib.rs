@@ -18,7 +18,10 @@ mod types;
 
 pub use error::{McpmError, ErrorCode};
 pub use ids::{id_level, new_id, new_want_id, normalize_tag, Level, PROJECT_SUBJECT};
-pub use keys::{display_key, from_bearer, ApiKeyInfo, IssuedKey, KeyIdentity, KeyRole, MANAGER_ONLY};
+pub use keys::{
+    display_key, from_bearer, Actor, ApiKeyInfo, Delegation, IssuedKey, KeyIdentity, KeyRole,
+    MintedWorker, MANAGER_ONLY,
+};
 pub use redact::redact_url;
 pub use store::Store;
 pub use types::*;

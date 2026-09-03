@@ -20,9 +20,9 @@ use std::rc::Rc;
 use codeblock::{code_editor, Decoration, DecorationStyle, Underline};
 use idea_ui::{tone, typography_kind, variant, Button, IdeaThemeRef, Spacer, Tag, Typography};
 use runtime_core::{
-    component, primitives::key::KeyOutcome, primitives::text_area::TextAreaHandle, pressable,
-    spawn_then, stylesheet, switch, ui, AlignItems, Cursor, Element, FlexDirection, FlexWrap,
-    FontWeight, IdealystSchema, IntoElement, Ref,
+    component, primitives::key::KeyOutcome, primitives::text_area::TextAreaHandle, pressable, rx,
+    signal, spawn_then, stylesheet, switch, ui, AlignItems, Cursor, Element, FlexDirection,
+    FlexWrap, FontWeight, IdealystSchema, IntoElement, Ref,
 };
 
 use crate::model;
@@ -44,72 +44,113 @@ pub fn Composer(props: &ComposerProps) -> Element {
     // completion at the real caret instead of rewriting the buffer.
     let editor: Ref<TextAreaHandle> = Ref::new();
 
+    // Pressing the button BUMPS this counter; the request itself is
+    // spawned from the hole below.
+    //
+    // `spawn_then` anchors its callback to the scope that spawned it,
+    // and the scope of a press handler is the button's own node — which
+    // this very handler rebuilds by flipping `busy`. Spawned from here,
+    // the callback was dropped as a dead scope's on the way out: the
+    // server captured the wants, and the console kept spinning with the
+    // buffer still full because the half that clears them never ran.
+    let submits = signal(0u64);
+
     let submit = move || {
         if console.busy.get() {
             return;
         }
-        let text = console.draft.get();
-        if text.trim().is_empty() {
+        if console.draft.get().trim().is_empty() {
             return;
         }
         console.busy.set(true);
         console.status.set(String::new());
-        spawn_then(api::capture_wants(text), move |result| {
-            console.busy.set(false);
-            match result {
-                Ok(capture) => {
-                    console.draft.set(String::new());
-                    console.status.set(describe(&capture));
-                    // Don't wait out the poll window for your own write.
-                    console.refresh.update(|r| r + 1);
-                }
-                Err(err) => console.status.set(format!("Nothing captured — {err}")),
-            }
-        });
+        submits.update(|n| n + 1);
     };
 
-    let body: Element = ui! { view(style = EditorHost()) { bulk_editor(console, editor) } };
-
-    // The live count and the submit button read signals, so this strip
-    // rebuilds while the editor above it does not.
-    let controls = switch(
-        move || (console.busy.get(), console.draft.get(), console.status.get()),
-        move |state: &(bool, String, String)| {
-            let (busy, text, status) = state.clone();
-            let drafts = api::parse_buffer(&text);
-            let ready = !drafts.is_empty() && !busy;
-            let label = match drafts.len() {
-                0 => "Add want".to_string(),
-                1 => "Add 1 want".to_string(),
-                n => format!("Add {n} wants"),
-            };
-            // One text slot, not two: the last capture's result replaces
-            // the pending count rather than appearing beside it, so the
-            // row never gains or loses a node. Everything variable sits
-            // left of the Spacer, so its width can't shove the button.
-            let note = if status.is_empty() { summarize(&drafts) } else { status };
-            let on_click: Rc<dyn Fn()> = Rc::new(submit);
-            ui! {
-                view(style = ControlRow()) {
-                    Typography(content = note, kind = typography_kind::Caption, muted = true)
-                    Spacer()
-                    // Fixed width: the label counts up as you type, and a
-                    // control that resizes on every keystroke twitches the
-                    // whole row (UX_GUIDELINES rule 18).
-                    view(style = SubmitSlot()) {
-                        Button(
-                            label = label,
-                            on_click = on_click,
-                            size = idea_ui::size::Sm,
-                            disabled = !ready,
-                            loading = busy,
-                            block = true,
-                        )
+    // The capture itself. Keyed on the counter, so the scope that owns
+    // an in-flight request is torn down only by the NEXT submit — never
+    // by the state the request's own callback writes. A `switch` build
+    // closure runs UNTRACKED, which is what keeps the draft read here
+    // from re-firing the capture on every keystroke.
+    let capture = switch(
+        move || submits.get(),
+        move |&n: &u64| {
+            // 0 is the mount, not a submit.
+            if n > 0 {
+                spawn_then(api::capture_wants(console.draft.get()), move |result| {
+                    console.busy.set(false);
+                    match result {
+                        Ok(capture) => {
+                            console.draft.set(String::new());
+                            console.status.set(describe(&capture));
+                            // Don't wait out the poll window for your own write.
+                            console.refresh.update(|r| r + 1);
+                        }
+                        Err(err) => console.status.set(format!("Nothing captured — {err}")),
                     }
-                }
+                });
             }
+            ui! { view(style = CaptureHole()) {} }
         },
     );
+
+    // The editor neither wraps nor scrolls itself: its decorated layer
+    // measures the WHOLE text and the editing layer is stretched over
+    // that, so a long line paints straight out through the card's
+    // border unless an ancestor both clamps the width and scrolls it.
+    // `min_width: 0` on the host is the load-bearing half (rule 22):
+    // without it nothing may size below the text and there is nothing
+    // for the scroller to scroll against (rule 23).
+    //
+    // The row INSIDE the scroller is what the board does too, and for
+    // the same reason: a flex item may not shrink below its own
+    // content, so the editor's box grows to the longest line and the
+    // editing layer — which is stretched over that box — grows with it.
+    // Dropped straight into the scroller the box would stay the card's
+    // width instead and the editor's own text node would scroll itself:
+    // two horizontal scrollbars, and the highlighting drifting off the
+    // glyphs it belongs to.
+    let body: Element = ui! {
+        view(style = EditorHost()) {
+            scroll_view(horizontal = true, style = EditorBox()) {
+                view(style = EditorRow()) {
+                    bulk_editor(console, editor)
+                }
+            }
+        }
+    };
+
+    // Live props, NOT a `switch` on the draft: every prop here is a
+    // `Reactive`, so each one re-renders in place and the row keeps its
+    // nodes. Keyed on the draft the whole strip — the button included —
+    // was torn down and rebuilt on every keystroke, which is both waste
+    // and the reason a press handler is not a safe place to spawn from.
+    //
+    // One text slot, not two: the last capture's result replaces the
+    // pending count rather than appearing beside it, so the row never
+    // gains or loses a node. Everything variable sits left of the
+    // Spacer, so its width can't shove the button.
+    let on_click: Rc<dyn Fn()> = Rc::new(submit);
+    let controls: Element = ui! {
+        view(style = ControlRow()) {
+            Typography(content = rx!(note(console)), kind = typography_kind::Caption,
+                       muted = true)
+            Spacer()
+            // Fixed width: the label counts up as you type, and a
+            // control that resizes on every keystroke twitches the
+            // whole row (UX_GUIDELINES rule 18).
+            view(style = SubmitSlot()) {
+                Button(
+                    label = rx!(submit_label(console)),
+                    on_click = on_click,
+                    size = idea_ui::size::Sm,
+                    disabled = rx!(!submit_ready(console)),
+                    loading = rx!(console.busy.get()),
+                    block = true,
+                )
+            }
+        }
+    };
 
     ui! {
         view(style = CardBox()) {
@@ -118,6 +159,7 @@ pub fn Composer(props: &ComposerProps) -> Element {
             }
             body
             controls
+            capture
             TagRail(console = console)
         }
     }
@@ -129,7 +171,12 @@ fn bulk_editor(console: Console, handle: Ref<TextAreaHandle>) -> Element {
     let t = idea_theme::tokens();
     code_editor(console.draft, move |text| console.draft.set(text))
         .decorate(decorate)
-        .placeholder("One want per line.\nTag with #ux — press Tab to complete.")
+        // ONE line, and that is a constraint rather than a preference:
+        // the editing layer is stretched over the DECORATED layer, which
+        // measures the buffer — one line tall while the buffer is empty.
+        // A two-line placeholder has nowhere to go and scrolls itself
+        // half out of view.
+        .placeholder("One want per line. Tag with #ux — Tab completes.")
         .font(crate::styles::MONO, 13.0)
         .line_height(22.0)
         .padding(12.0)
@@ -150,7 +197,14 @@ fn bulk_editor(console: Console, handle: Ref<TextAreaHandle>) -> Element {
             }
         })
         .bind(handle)
-        .with_style(EditorBox())
+        // No border or background here: this node is the scroller's
+        // CONTENT and grows with the text, so a border on it would slide
+        // sideways with the longest line. Those live on the scroller
+        // (`EditorBox`), which stays put. What this node does carry is
+        // `flex_grow`, so a short line still fills the card's width —
+        // otherwise the box hugs the text and the space beside it looks
+        // like editor you can click into but isn't.
+        .with_style(EditorSurface())
         .into_element()
 }
 
@@ -298,7 +352,35 @@ fn complete_tag(text: &str, caret: usize) -> Option<String> {
     Some(insert)
 }
 
-/// The line under the composer: what pressing the button will do.
+/// The line under the composer: what the last capture did, or — with
+/// nothing to report yet — what pressing the button will do.
+///
+/// Called from `rx!`, so the signals it reads are what make the slot
+/// live; it must not be handed a snapshot instead.
+fn note(console: Console) -> String {
+    let status = console.status.get();
+    if !status.is_empty() {
+        return status;
+    }
+    summarize(&api::parse_buffer(&console.draft.get()))
+}
+
+/// The button's own label, counting what is in the buffer (rule 16:
+/// what the action does is the label, not a line above it).
+fn submit_label(console: Console) -> String {
+    match api::parse_buffer(&console.draft.get()).len() {
+        0 => "Add want".to_string(),
+        1 => "Add 1 want".to_string(),
+        n => format!("Add {n} wants"),
+    }
+}
+
+/// Whether there is something to send and nothing already in flight.
+fn submit_ready(console: Console) -> bool {
+    !console.busy.get() && !api::parse_buffer(&console.draft.get()).is_empty()
+}
+
+/// The pending half of [`note`]: what pressing the button will do.
 fn summarize(drafts: &[api::WantDraftDto]) -> String {
     if drafts.is_empty() {
         // The editor's own placeholder carries the instruction; saying it
@@ -374,12 +456,42 @@ stylesheet! {
     pub EditorHost<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Column,
+            // The editor is as wide as its longest line. `min_width: 0`
+            // is what lets this column size below that content so the
+            // scroller inside gets a definite width to scroll against;
+            // `Hidden` is the backstop for a line with no break
+            // opportunity in it at all (rule 22).
+            min_width: 0,
+            overflow: runtime_core::Overflow::Hidden,
         }
     }
 }
 
+// The scroller's content row. No `min_width: 0` anywhere from here
+// inward — that floor is exactly what makes the editor's box take the
+// width of its longest line instead of the card's.
+stylesheet! {
+    pub EditorRow<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+        }
+    }
+}
 
+stylesheet! {
+    pub EditorSurface<IdeaThemeRef> {
+        base(t) {
+            flex_grow: 1.0,
+        }
+    }
+}
 
+// The bordered surface AND the horizontal scroller: one node, because a
+// border around a scroller keeps the scrollbar inside the box, and the
+// content the bar belongs to is the editor. No `min_height` — the
+// editor's own height is the buffer's (one line while it is empty), and
+// a floor here only adds box that no click can reach: the editing layer
+// is stretched over the decorated one, not over this.
 stylesheet! {
     pub EditorBox<IdeaThemeRef> {
         base(t) {
@@ -387,7 +499,19 @@ stylesheet! {
             border_color: t.color.border(),
             border_radius: t.radius.sm(),
             background: t.color.background(),
-            min_height: 96,
+            min_width: 0,
+        }
+    }
+}
+
+// The capture hole is a DRIVER, not layout: taken out of flow so its
+// zero-size node cannot collect one of the card's column gaps.
+stylesheet! {
+    pub CaptureHole<IdeaThemeRef> {
+        base(t) {
+            position: runtime_core::Position::Absolute,
+            width: 0,
+            height: 0,
         }
     }
 }

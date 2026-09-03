@@ -12,9 +12,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The prefix every token carries, so a leaked one is greppable and
+/// The prefix every key carries, so a leaked one is greppable and
 /// obviously ours.
 const TOKEN_PREFIX: &str = "mcpm";
+/// The prefix a delegation token carries. Deliberately different from
+/// the key prefix: the two are accepted in different places, and a
+/// token pasted into the wrong one must fail on shape rather than
+/// round-trip to the database and fail on lookup.
+const DELEGATION_PREFIX: &str = "dlg";
 /// Bytes in the public half (→ 12 hex chars).
 const ID_BYTES: usize = 6;
 /// Bytes in the secret half (→ 64 hex chars, 256 bits).
@@ -79,11 +84,16 @@ impl KeyRole {
 /// module it had already failed, or close a feature it had not
 /// finished — the gate the whole system exists to enforce would then
 /// only bind agents that chose to respect it.
+///
+/// `mint_worker` is here for a second reason as well: a delegated
+/// identity is gated as a worker whatever key carried it, so listing
+/// the tool here is what makes delegation exactly one level deep.
 pub const MANAGER_ONLY: &[&str] = &[
     "plan_feature",
     "revise_plan",
     "complete_feature",
     "promote_wants",
+    "mint_worker",
 ];
 
 /// A verified key, resolved to who is calling. This is what the MCP
@@ -97,6 +107,85 @@ pub struct KeyIdentity {
     /// The agent name every write by this key is recorded under.
     pub agent_name: String,
     pub role: KeyRole,
+}
+
+/// Who a write is attributed to, and what it is confined to.
+///
+/// This is what the store takes instead of a bare agent name, because
+/// a name alone cannot express the one thing a delegated identity adds:
+/// a boundary. A key's own identity carries `scope: None` and may write
+/// to any module it holds the claim on. A minted sub-identity carries
+/// `Some(module_id)` and may write to that module and nothing else —
+/// however many claims the key that minted it happens to hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Actor {
+    /// The name the event ledger records.
+    pub name: String,
+    /// The single module a delegated identity is confined to.
+    pub scope: Option<String>,
+}
+
+impl Actor {
+    /// An identity that speaks for itself: a key's own agent name, or
+    /// the name declared on an unauthenticated stdio session.
+    pub fn new(name: impl Into<String>) -> Actor {
+        Actor { name: name.into(), scope: None }
+    }
+
+    /// A minted sub-identity, confined to the module it was minted for.
+    pub fn delegated(name: impl Into<String>, module_id: impl Into<String>) -> Actor {
+        Actor { name: name.into(), scope: Some(module_id.into()) }
+    }
+
+    /// Whether this actor's authority came from a delegation token
+    /// rather than from a key of its own. Delegation is one level deep:
+    /// a delegated actor cannot mint.
+    pub fn is_delegated(&self) -> bool {
+        self.scope.is_some()
+    }
+}
+
+impl From<&str> for Actor {
+    fn from(name: &str) -> Actor {
+        Actor::new(name)
+    }
+}
+
+impl From<String> for Actor {
+    fn from(name: String) -> Actor {
+        Actor::new(name)
+    }
+}
+
+impl From<&Actor> for Actor {
+    fn from(actor: &Actor) -> Actor {
+        actor.clone()
+    }
+}
+
+/// A freshly minted delegation. `token` is the only time the secret
+/// exists outside the minting manager's hands — it goes straight into
+/// the subagent's prompt.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MintedWorker {
+    pub delegation_token: String,
+    pub agent_name: String,
+    pub module_id: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// What the manager should paste into the subagent's prompt, spelled
+    /// out — the token is useless to a subagent that was not told it
+    /// must pass it on every write.
+    pub instructions: String,
+}
+
+/// A delegation token resolved back to the identity it carries. The
+/// scope is not advisory: it is what [`Actor::delegated`] is built from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delegation {
+    pub id: String,
+    pub agent_name: String,
+    pub module_id: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// One key as `--list-keys` and the console show it. Carries no secret
@@ -136,9 +225,21 @@ pub struct ParsedToken {
 
 /// Mint `(token, id, secret_hash)` from the OS CSPRNG.
 pub fn mint() -> (String, String, String) {
+    mint_with_prefix(TOKEN_PREFIX)
+}
+
+/// Mint a delegation token — same construction, same entropy, its own
+/// prefix. It is a weaker credential than a key by SCOPE (one module,
+/// worker role, a TTL, and only alongside the key that minted it), not
+/// by how hard it is to guess.
+pub fn mint_delegation() -> (String, String, String) {
+    mint_with_prefix(DELEGATION_PREFIX)
+}
+
+fn mint_with_prefix(prefix: &str) -> (String, String, String) {
     let id = hex(&random_bytes(ID_BYTES));
     let secret = hex(&random_bytes(SECRET_BYTES));
-    let token = format!("{TOKEN_PREFIX}_{id}_{secret}");
+    let token = format!("{prefix}_{id}_{secret}");
     let secret_hash = sha256_hex(&secret);
     (token, id, secret_hash)
 }
@@ -148,7 +249,18 @@ pub fn mint() -> (String, String, String) {
 /// checked before any database round trip, so a malformed header costs
 /// nothing.
 pub fn parse(token: &str) -> Option<ParsedToken> {
-    let rest = token.trim().strip_prefix(TOKEN_PREFIX)?.strip_prefix('_')?;
+    parse_with_prefix(TOKEN_PREFIX, token)
+}
+
+/// The same, for a delegation token. A key presented here — or a
+/// delegation token presented to [`parse`] — is refused on its prefix,
+/// before any database round trip.
+pub fn parse_delegation(token: &str) -> Option<ParsedToken> {
+    parse_with_prefix(DELEGATION_PREFIX, token)
+}
+
+fn parse_with_prefix(prefix: &str, token: &str) -> Option<ParsedToken> {
+    let rest = token.trim().strip_prefix(prefix)?.strip_prefix('_')?;
     let (id, secret) = rest.split_once('_')?;
     if id.len() != ID_BYTES * 2 || secret.len() != SECRET_BYTES * 2 {
         return None;
@@ -274,6 +386,29 @@ mod tests {
         // A console key is not an agent at all.
         assert!(!KeyRole::Console.may_call("claim_module"));
         assert!(!KeyRole::Console.is_agent());
+    }
+
+    /// The two token kinds are accepted in different places and mean
+    /// very different things. Neither may be mistaken for the other,
+    /// and the refusal must happen on shape — before a lookup that
+    /// would otherwise turn a pasted-in-the-wrong-box credential into a
+    /// database round trip.
+    #[test]
+    fn a_key_and_a_delegation_token_never_parse_as_each_other() {
+        let (key, ..) = mint();
+        let (delegation, ..) = mint_delegation();
+        assert!(parse(&key).is_some());
+        assert!(parse_delegation(&delegation).is_some());
+        assert!(parse(&delegation).is_none(), "a delegation token is not a key");
+        assert!(parse_delegation(&key).is_none(), "a key is not a delegation token");
+    }
+
+    #[test]
+    fn a_minted_delegation_parses_back_to_its_own_id_and_hash() {
+        let (token, id, secret_hash) = mint_delegation();
+        let parsed = parse_delegation(&token).expect("a freshly minted token must parse");
+        assert_eq!(parsed.id, id);
+        assert!(hash_eq(&parsed.secret_hash, &secret_hash));
     }
 
     #[test]

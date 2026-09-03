@@ -10,6 +10,10 @@
 //!   unfinished; finishing a stage's last module emits `stage_unlocked`.
 //! - **Everything leaves a trace**: every mutation appends an event and
 //!   every completion/blocker commits a memory.
+//! - **A delegated identity is confined to one module**, and that is
+//!   checked in [`require_claim`] — the same choke point the claim
+//!   itself goes through, so a write cannot land inside scope by
+//!   skipping the check rather than passing it.
 
 use serde_json::json;
 use std::sync::Arc;
@@ -20,7 +24,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{McpmError, ErrorCode};
 use crate::ids::{id_level, new_id, new_memory_id, new_want_id, normalize_tag, Level};
-use crate::keys::{ApiKeyInfo, IssuedKey, KeyIdentity, KeyRole};
+use crate::keys::{Actor, ApiKeyInfo, Delegation, IssuedKey, KeyIdentity, KeyRole, MintedWorker};
 use crate::types::*;
 
 /// The Postgres NOTIFY channel the `events_notify` trigger announces
@@ -28,6 +32,16 @@ use crate::types::*;
 /// `0005_notify_channel_rename.sql` (0004 installed it under the old
 /// name and is frozen — sqlx checksums applied migrations).
 const EVENT_CHANNEL: &str = "mcpm_events";
+
+/// How long a minted worker identity lives when the manager does not
+/// say. Long enough for a real module, short enough that a token
+/// forgotten in a prompt is not a standing grant.
+const DEFAULT_DELEGATION_TTL_MINUTES: i64 = 240;
+/// The floor and ceiling on a caller-chosen TTL. The ceiling matters
+/// more: a manager that asks for a week has misunderstood what the
+/// token is for, and clamping is friendlier than refusing mid-dispatch.
+const MIN_DELEGATION_TTL_MINUTES: i64 = 5;
+const MAX_DELEGATION_TTL_MINUTES: i64 = 1440;
 
 type Result<T> = std::result::Result<T, McpmError>;
 type Tx<'a> = Transaction<'a, Postgres>;
@@ -584,7 +598,14 @@ impl Store {
     /// Take an exclusive claim. THE gate check lives here, inside the
     /// claiming transaction. A rejection still commits its
     /// `premature_claim` event.
-    pub async fn claim_module(&self, agent: &str, module_id: &str) -> Result<Briefing> {
+    pub async fn claim_module(
+        &self,
+        actor: impl Into<Actor>,
+        module_id: &str,
+    ) -> Result<Briefing> {
+        let actor = actor.into();
+        require_scope(&actor, module_id)?;
+        let agent: &str = &actor.name;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT m.id, m.name, m.description, m.status, m.claimed_by, m.summary,
@@ -785,11 +806,13 @@ impl Store {
     /// Check off (or skip, with a reason) one task.
     pub async fn complete_task(
         &self,
-        agent: &str,
+        actor: impl Into<Actor>,
         task_id: &str,
         outcome: TaskOutcome,
         note: Option<&str>,
     ) -> Result<Ack> {
+        let actor = actor.into();
+        let agent: &str = &actor.name;
         if outcome == TaskOutcome::Skipped && note.map(str::trim).unwrap_or("").is_empty() {
             return Err(McpmError::new(
                 ErrorCode::SkipNeedsReason,
@@ -810,7 +833,7 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| McpmError::not_found("task", task_id))?;
-        require_claim(&row, agent, "check off its tasks")?;
+        require_claim(&row, &actor, "check off its tasks")?;
         let task_name: String = row.get("name");
         let module_id: String = row.get("module_id");
         let feature_id: String = row.get("feature_id");
@@ -846,7 +869,15 @@ impl Store {
     }
 
     /// A worker extends its own checklist (`origin: discovered`).
-    pub async fn add_task(&self, agent: &str, module_id: &str, name: &str, note: Option<&str>) -> Result<Ack> {
+    pub async fn add_task(
+        &self,
+        actor: impl Into<Actor>,
+        module_id: &str,
+        name: &str,
+        note: Option<&str>,
+    ) -> Result<Ack> {
+        let actor = actor.into();
+        let agent: &str = &actor.name;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, s.feature_id
@@ -867,7 +898,7 @@ impl Store {
                  plan revision, not a closed checklist.",
             ));
         }
-        require_claim(&row, agent, "extend its checklist")?;
+        require_claim(&row, &actor, "extend its checklist")?;
         let feature_id: String = row.get("feature_id");
         let task_id = new_id(Level::Task);
         sqlx::query(
@@ -911,11 +942,13 @@ impl Store {
     /// available without asking anyone to grade anything.
     pub async fn complete_module(
         &self,
-        agent: &str,
+        actor: impl Into<Actor>,
         module_id: &str,
         summary: &str,
         used: &[String],
     ) -> Result<Ack> {
+        let actor = actor.into();
+        let agent: &str = &actor.name;
         if summary.trim().is_empty() {
             return Err(plan_invalid(
                 "complete_module requires a non-empty summary — it becomes the memory the \
@@ -942,7 +975,7 @@ impl Store {
                 "Nothing to do.",
             ));
         }
-        require_claim(&row, agent, "complete it")?;
+        require_claim(&row, &actor, "complete it")?;
         let module_name: String = row.get("module_name");
         let stage_id: String = row.get("stage_id");
         let stage_name: String = row.get("stage_name");
@@ -978,6 +1011,12 @@ impl Store {
             .bind(summary)
             .execute(&mut *tx)
             .await?;
+        // A delegated identity outlives nothing. Retiring inside the
+        // completing transaction is what makes "the token dies with the
+        // module" true rather than nearly true: a token that survived a
+        // rolled-back completion would be a standing grant nobody
+        // issued.
+        retire_delegations(&mut tx, module_id).await?;
         insert_memory(
             &mut tx,
             Level::Module,
@@ -1067,11 +1106,13 @@ impl Store {
     /// nobody had actually examined.
     pub async fn report_blocker(
         &self,
-        agent: &str,
+        actor: impl Into<Actor>,
         module_id: &str,
         description: &str,
         misled_by: &[String],
     ) -> Result<Ack> {
+        let actor = actor.into();
+        let agent: &str = &actor.name;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, s.feature_id
@@ -1082,7 +1123,7 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| McpmError::not_found("module", module_id))?;
-        require_claim(&row, agent, "report a blocker on it")?;
+        require_claim(&row, &actor, "report a blocker on it")?;
         let module_name: String = row.get("module_name");
         let feature_id: String = row.get("feature_id");
         sqlx::query("UPDATE modules SET status = 'blocked' WHERE id = $1")
@@ -1118,7 +1159,14 @@ impl Store {
 
     /// Hand the module back with task states intact — the honorable
     /// exit for a worker that cannot finish.
-    pub async fn release_module(&self, agent: &str, module_id: &str, reason: &str) -> Result<Ack> {
+    pub async fn release_module(
+        &self,
+        actor: impl Into<Actor>,
+        module_id: &str,
+        reason: &str,
+    ) -> Result<Ack> {
+        let actor = actor.into();
+        let agent: &str = &actor.name;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, s.feature_id
@@ -1129,13 +1177,16 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| McpmError::not_found("module", module_id))?;
-        require_claim(&row, agent, "release it")?;
+        require_claim(&row, &actor, "release it")?;
         let module_name: String = row.get("module_name");
         let feature_id: String = row.get("feature_id");
         sqlx::query("UPDATE modules SET status = 'todo', claimed_by = NULL WHERE id = $1")
             .bind(module_id)
             .execute(&mut *tx)
             .await?;
+        // The module is going back in the pool, so the identity minted
+        // to work it stops resolving with it.
+        retire_delegations(&mut tx, module_id).await?;
         record_event(
             &mut tx,
             "module_released",
@@ -2777,6 +2828,173 @@ impl Store {
         })
     }
 
+    // -----------------------------------------------------------------
+    // Delegated identities
+    // -----------------------------------------------------------------
+
+    /// Mint one worker identity, scoped to one module.
+    ///
+    /// This exists because a key is per MACHINE and a subagent cannot
+    /// present a different one — so without it every subagent in a
+    /// process tree IS that machine, and attribution, mutual exclusion
+    /// between siblings, and the manager/worker split all collapse
+    /// inside the tree while still holding between trees.
+    ///
+    /// Two invariants are enforced here and the rest by the columns and
+    /// by `require_claim`:
+    ///
+    /// - **Delegation is one level deep.** A delegated actor cannot
+    ///   mint. The role gate says the same thing (a delegated caller is
+    ///   gated as a worker, and `mint_worker` is manager-only), but it
+    ///   is repeated here because the gate binds only where a role was
+    ///   proven, and an unauthenticated stdio session proves nothing.
+    /// - **One live token per module.** Minting again for the same
+    ///   module retires the previous token in the same transaction, so
+    ///   a manager re-dispatching a module cannot leave a second
+    ///   identity able to write to it.
+    pub async fn mint_worker(
+        &self,
+        minter: &Actor,
+        key_id: Option<&str>,
+        module_id: &str,
+        agent_name: &str,
+        ttl_minutes: Option<i64>,
+    ) -> Result<MintedWorker> {
+        if minter.is_delegated() {
+            return Err(McpmError::new(
+                ErrorCode::Forbidden,
+                "A delegated identity cannot mint another one.",
+                json!({ "agent": minter.name, "scope": minter.scope }),
+                "Delegation is one level deep so the tree stays legible. If the work needs \
+                 splitting further, report that to the manager that minted you.",
+            ));
+        }
+        let agent_name = agent_name.trim();
+        if agent_name.is_empty() {
+            return Err(plan_invalid(
+                "mint_worker requires the agent_name the subagent will be recorded as — that \
+                 name is the whole point of minting.",
+            ));
+        }
+        let ttl = ttl_minutes
+            .unwrap_or(DEFAULT_DELEGATION_TTL_MINUTES)
+            .clamp(MIN_DELEGATION_TTL_MINUTES, MAX_DELEGATION_TTL_MINUTES);
+        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(ttl);
+
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT m.id, m.name AS module_name, m.status, s.feature_id
+             FROM modules m JOIN stages s ON s.id = m.stage_id
+             WHERE m.id = $1 FOR UPDATE OF m",
+        )
+        .bind(module_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| McpmError::not_found("module", module_id))?;
+        let module_name: String = row.get("module_name");
+        let feature_id: String = row.get("feature_id");
+        let status: String = row.get("status");
+        if status == "done" {
+            return Err(McpmError::new(
+                ErrorCode::AlreadyDone,
+                format!("Module '{module_name}' is already complete."),
+                json!({ "module_id": module_id }),
+                "There is no work to delegate. Dispatch what next_work returns instead.",
+            ));
+        }
+
+        let superseded = retire_delegations(&mut tx, module_id).await?;
+        let (token, id, hash) = crate::keys::mint_delegation();
+        sqlx::query(
+            "INSERT INTO delegations
+                 (id, hash, key_id, agent_name, module_id, minted_by, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&id)
+        .bind(&hash)
+        .bind(key_id)
+        .bind(agent_name)
+        .bind(module_id)
+        .bind(&minter.name)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        // The ledger records that an identity now exists and who for.
+        // Never the token: an event feed is read by everything with
+        // console access, and this one is meant to be pasted into a
+        // prompt, not stored.
+        record_event(
+            &mut tx,
+            "worker_minted",
+            Some(&feature_id),
+            Some(module_id),
+            Some(&minter.name),
+            json!({
+                "agent_name": agent_name,
+                "module": module_name,
+                "expires_at": expires_at,
+                "superseded": superseded,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+
+        Ok(MintedWorker {
+            instructions: format!(
+                "Give this token to the subagent in its prompt and tell it: you are \
+                 '{agent_name}'; pass delegation_token on get_context and on every write \
+                 (claim_module, complete_task, add_task, complete_module, report_blocker, \
+                 release_module). It is scoped to {module_id} alone and stops working when \
+                 that module completes or is released, or at {expires_at}."
+            ),
+            delegation_token: token,
+            agent_name: agent_name.to_string(),
+            module_id: module_id.to_string(),
+            expires_at,
+        })
+    }
+
+    /// Resolve a delegation token to the identity it carries.
+    ///
+    /// `key_id` is the key the request authenticated with, and the match
+    /// is on equality INCLUDING null: a token minted on a keyed
+    /// connection resolves only alongside that same key, and one minted
+    /// on a keyless stdio session resolves only on a keyless session.
+    /// That pairing is what lets the token travel in band — off the
+    /// machine that minted it, it is inert.
+    pub async fn resolve_delegation(
+        &self,
+        key_id: Option<&str>,
+        token: &str,
+    ) -> Result<Delegation> {
+        // Shape first, so junk never reaches the database.
+        let parsed = crate::keys::parse_delegation(token)
+            .ok_or_else(McpmError::delegation_invalid)?;
+        let row = sqlx::query(
+            "SELECT hash, agent_name, module_id, expires_at FROM delegations
+             WHERE id = $1
+               AND revoked_at IS NULL
+               AND expires_at > now()
+               AND key_id IS NOT DISTINCT FROM $2",
+        )
+        .bind(&parsed.id)
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(McpmError::delegation_invalid)?;
+
+        let stored: String = row.get("hash");
+        if !crate::keys::hash_eq(&stored, &parsed.secret_hash) {
+            return Err(McpmError::delegation_invalid());
+        }
+        Ok(Delegation {
+            id: parsed.id,
+            agent_name: row.get("agent_name"),
+            module_id: row.get("module_id"),
+            expires_at: row.get("expires_at"),
+        })
+    }
+
     /// Every key ever issued, newest first — revoked ones included, so
     /// the operator can see what was withdrawn and when.
     pub async fn list_keys(&self) -> Result<Vec<ApiKeyInfo>> {
@@ -2915,8 +3133,24 @@ async fn insert_memory(
     Ok(id)
 }
 
-/// Writes to a module's checklist require holding its claim.
-fn require_claim(row: &sqlx::postgres::PgRow, agent: &str, action: &str) -> std::result::Result<(), McpmError> {
+/// Writes to a module's checklist require holding its claim — and, for
+/// a delegated identity, require the module to be the one it was minted
+/// for.
+///
+/// Both checks live here because both answer the same question ("may
+/// this actor write to this module?") and every write verb already
+/// funnels through it with the module row in hand. Splitting them would
+/// mean a new verb could pick up one and miss the other.
+///
+/// The row must carry `module_id`, `module_name` and `claimed_by`.
+fn require_claim(
+    row: &sqlx::postgres::PgRow,
+    actor: &Actor,
+    action: &str,
+) -> std::result::Result<(), McpmError> {
+    let module_id: String = row.get("module_id");
+    require_scope(actor, &module_id)?;
+    let agent: &str = &actor.name;
     let claimed_by: Option<String> = row.get("claimed_by");
     let module_name: String = row.get("module_name");
     match claimed_by.as_deref() {
@@ -2934,6 +3168,31 @@ fn require_claim(row: &sqlx::postgres::PgRow, agent: &str, action: &str) -> std:
             serde_json::Value::Null,
             "Call claim_module first; the claim is also your briefing.",
         )),
+    }
+}
+
+/// Retire every live delegation on a module. Called inside the
+/// transaction that ends the module's life as claimed work — completion
+/// or release — never from a caller, so there is no path that finishes a
+/// module and leaves its token usable.
+async fn retire_delegations(tx: &mut Tx<'_>, module_id: &str) -> Result<u64> {
+    let done = sqlx::query(
+        "UPDATE delegations SET revoked_at = now()
+         WHERE module_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(module_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// A delegated actor may touch exactly the module it was minted for.
+/// An undelegated one — a key speaking for itself — is unconstrained
+/// here and answers to `require_claim` alone.
+fn require_scope(actor: &Actor, module_id: &str) -> std::result::Result<(), McpmError> {
+    match actor.scope.as_deref() {
+        Some(scope) if scope != module_id => Err(McpmError::out_of_scope(module_id, scope)),
+        _ => Ok(()),
     }
 }
 

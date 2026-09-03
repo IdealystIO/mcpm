@@ -1,4 +1,4 @@
-//! The 22 tool definitions (architecture doc §5). Descriptions are the
+//! The 28 tool definitions (architecture doc §5). Descriptions are the
 //! agent UX: they say what the tool does, who calls it, and what the
 //! caller should do with the answer.
 
@@ -25,7 +25,8 @@ fn tree_tools() -> Value {
                 "type": "object",
                 "properties": {
                     "agent_name": { "type": "string", "description": "Your stable agent name, e.g. 'agent.feature.invoicing' or 'agent.mod.schema'." },
-                    "role": { "type": "string", "enum": ["manager", "worker", "observer"], "description": "manager = owns a feature end to end; worker = owns one module." }
+                    "role": { "type": "string", "enum": ["manager", "worker", "observer"], "description": "manager = owns a feature end to end; worker = owns one module." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["agent_name", "role"]
             }
@@ -141,6 +142,26 @@ fn tree_tools() -> Value {
             }
         },
         {
+            "name": "mint_worker",
+            "description": "MANAGER. Mint one worker identity for one module, so a subagent \
+                sharing your machine's key stops being recorded as the machine. Returns a \
+                delegation_token: put it in the subagent's prompt and tell it to pass \
+                delegation_token on get_context and on every write. The token is a worker \
+                whatever key minted it, works only against that one module, only alongside \
+                your key, and stops working when the module completes or is released. Mint \
+                one per module you dispatch — minting again for the same module retires the \
+                previous token.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "module_id": { "type": "string", "description": "The module this identity may work, from next_work." },
+                    "agent_name": { "type": "string", "description": "The name the ledger will record for the subagent, e.g. 'agent.mod.schema'." },
+                    "ttl_minutes": { "type": "integer", "description": "How long the token lives. Defaults to 4 hours; clamped to 5 minutes .. 24 hours." }
+                },
+                "required": ["module_id", "agent_name"]
+            }
+        },
+        {
             "name": "claim_module",
             "description": "WORKER. Take the exclusive claim on your module — the gate check \
                 happens here, in the same transaction. A legal claim returns your full \
@@ -150,7 +171,10 @@ fn tree_tools() -> Value {
                 the event record).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "module_id": { "type": "string", "description": "Module id (`mod_...`), from next_work or your claim briefing." } },
+                "properties": {
+                    "module_id": { "type": "string", "description": "Module id (`mod_...`), from next_work or your claim briefing." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
+                },
                 "required": ["module_id"]
             }
         },
@@ -164,7 +188,8 @@ fn tree_tools() -> Value {
                 "properties": {
                     "task_id": { "type": "string", "description": "Task id (`tsk_...`), from your claim briefing's checklist." },
                     "outcome": { "type": "string", "enum": ["done", "skipped"] },
-                    "note": { "type": "string", "description": "REQUIRED when outcome is 'skipped': why it was not done. Becomes part of the record." }
+                    "note": { "type": "string", "description": "REQUIRED when outcome is 'skipped': why it was not done. Becomes part of the record." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["task_id", "outcome"]
             }
@@ -179,7 +204,8 @@ fn tree_tools() -> Value {
                 "properties": {
                     "module_id": { "type": "string", "description": "Module id (`mod_...`), from next_work or your claim briefing." },
                     "name": { "type": "string" },
-                    "note": { "type": "string", "description": "Why the plan missed this work." }
+                    "note": { "type": "string", "description": "Why the plan missed this work." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["module_id", "name"]
             }
@@ -194,7 +220,8 @@ fn tree_tools() -> Value {
                 "type": "object",
                 "properties": {
                     "module_id": { "type": "string", "description": "Module id (`mod_...`), from next_work or your claim briefing." },
-                    "summary": { "type": "string", "description": "What you built, decisions made, interfaces exposed, gotchas." }
+                    "summary": { "type": "string", "description": "What you built, decisions made, interfaces exposed, gotchas." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["module_id", "summary"]
             }
@@ -208,7 +235,8 @@ fn tree_tools() -> Value {
                 "type": "object",
                 "properties": {
                     "module_id": { "type": "string", "description": "Module id (`mod_...`), from next_work or your claim briefing." },
-                    "description": { "type": "string", "description": "What is blocking you, concretely enough for the manager to act." }
+                    "description": { "type": "string", "description": "What is blocking you, concretely enough for the manager to act." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["module_id", "description"]
             }
@@ -222,7 +250,8 @@ fn tree_tools() -> Value {
                 "type": "object",
                 "properties": {
                     "module_id": { "type": "string", "description": "Module id (`mod_...`), from next_work or your claim briefing." },
-                    "reason": { "type": "string", "description": "Why you are handing the module back unfinished." }
+                    "reason": { "type": "string", "description": "Why you are handing the module back unfinished." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["module_id", "reason"]
             }

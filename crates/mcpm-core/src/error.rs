@@ -89,6 +89,28 @@ impl McpmError {
         )
     }
 
+    /// A delegation token that did not resolve: unknown, expired,
+    /// revoked, or presented alongside a key that did not mint it.
+    ///
+    /// Unlike [`unauthorized`](Self::unauthorized) this one is
+    /// forthcoming, because the caller has ALREADY authenticated — it
+    /// is a subagent holding a token its manager handed it, and the
+    /// four causes want four different reactions from it. A probe
+    /// learns nothing here that the key it already presented did not
+    /// tell it.
+    pub fn delegation_invalid() -> Self {
+        Self::new(
+            ErrorCode::Unauthorized,
+            "This delegation_token does not resolve to a live identity.",
+            serde_json::Value::Null,
+            "The token is unknown, expired, already retired by complete_module or \
+             release_module, or was minted for a different machine's key. Do not retry and \
+             do not fall back to calling without it — that would attribute your work to the \
+             machine instead of to you. Report to your manager and ask for a fresh \
+             mint_worker.",
+        )
+    }
+
     /// A good credential, used somewhere it does not reach.
     pub fn forbidden(action: &str, role: crate::KeyRole) -> Self {
         Self::new(
@@ -97,6 +119,24 @@ impl McpmError {
             serde_json::json!({ "role": role.as_str(), "action": action }),
             "This is a permission boundary, not a transient failure — retrying will not \
              help. Report it to your manager, who holds a key that can.",
+        )
+    }
+
+    /// A delegated identity reaching outside the one module it was
+    /// minted for. This is the rule that makes an in-band token safe to
+    /// paste into a prompt, so it is enforced on every write and not
+    /// only on the claim.
+    pub fn out_of_scope(module_id: &str, scope: &str) -> Self {
+        Self::new(
+            ErrorCode::Forbidden,
+            format!(
+                "Your delegation is scoped to module '{scope}' — it cannot touch \
+                 '{module_id}'."
+            ),
+            serde_json::json!({ "module_id": module_id, "scope": scope }),
+            "You were minted for one module. Work that one; if the work you found belongs \
+             to another, report it to your manager rather than reaching for it — retrying \
+             will not help.",
         )
     }
 

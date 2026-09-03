@@ -374,3 +374,56 @@ The prop is explicit at every call site because idea-ui's default is
 not ours, and a `Progress` added without the prop will silently render
 square next to four rounded ones. This is why the prop is not noise to
 be tidied away: deleting it changes the picture.
+
+### 25. A control's own state must not rebuild the control
+
+A `switch` keyed on the state a control *writes* tears that control
+down as a consequence of using it. The strip under the capture composer
+was keyed on `(busy, draft, status)`, so every keystroke rebuilt the
+button and pressing it rebuilt it again.
+
+Three things break, in increasing order of how long they take to find:
+
+- **Waste.** A whole subtree rebuilds per keystroke to change one
+  label.
+- **Focus and gesture state.** A node that is replaced mid-interaction
+  loses the caret, the hover, the press.
+- **In-flight work, silently.** `spawn_then` anchors its callback to
+  the scope that spawned it, and the scope of a press handler is the
+  button's own node. Flip a `busy` flag that rebuilds that node and the
+  callback is dropped as a dead scope's: the request still reaches the
+  server, but nothing that was going to clear the spinner, empty the
+  buffer or report the result ever runs. There is no error anywhere —
+  the console just spins forever.
+
+So: give a control **live props** (`label = rx!(…)`, `disabled =
+rx!(…)`, `loading = rx!(…)`) — idea-ui props are `Reactive`, and each
+re-renders in place — and keep the enclosing scope out of it. When an
+action needs to run IO, spawn it from a hole keyed on a **request
+counter** the handler bumps, never from the handler: the scope that
+owns the task is then torn down only by the next request. (A `switch`
+build closure runs untracked, so it can read the buffer it is about to
+send without subscribing to it.)
+
+### 26. A surface that measures its own content is not clipped by a card
+
+Some surfaces size themselves from their content and expect an ancestor
+to do the scrolling — a code editor, a diagram, a wide table. Drop one
+straight into a card and the card does not grow: the content paints out
+through the border, over whatever sits beside it, with no scrollbar
+anywhere.
+
+- Pair `min_width: 0` on the surface's host with a **scroller on the
+  axis it overflows** (rule 23). `min_width: 0` is the load-bearing
+  half — until the host may size below its content there is nothing for
+  a scroller to scroll against — and `overflow: Hidden` on the host is
+  the backstop (rule 22).
+- Put the border, background and radius on the **scroller**, not on the
+  content: a border on a node that grows with the text slides sideways
+  with the longest line.
+- **Do not give such a surface a `min_height` floor.** The box grows;
+  the surface does not. What you get is a tall bordered rectangle whose
+  bottom half no click can reach, and — where the surface overlays an
+  editing layer on a measured one — a placeholder taller than the
+  resting box that scrolls itself half out of view. Let it rest at its
+  natural height and grow with what is typed.

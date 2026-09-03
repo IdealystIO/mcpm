@@ -31,7 +31,8 @@ pub fn prompt_defs() -> Value {
                 work the checklist, record what you learned, exit through one door.",
             "arguments": [
                 { "name": "module_id", "description": "The module this worker is dispatched to.", "required": true },
-                { "name": "agent_name", "description": "The agent name to register as (e.g. agent.mod.schema).", "required": false }
+                { "name": "agent_name", "description": "The agent name to register as (e.g. agent.mod.schema).", "required": false },
+                { "name": "delegation_token", "description": "The token from mint_worker, when this worker is a subagent sharing its manager's key.", "required": false }
             ]
         }
     ])
@@ -86,7 +87,12 @@ run strictly in order; modules within a stage run concurrently, one worker subag
 each; tasks are each module's checklist.\n\
 3. Dispatch loop, until done: call next_work(feature_id) and spawn ONE worker subagent \
 per dispatchable module (give each the worker_briefing prompt with its module_id). \
-Never compute stage gating yourself — next_work already did. When workers return, poll \
+If your subagents share this machine's key — they do, unless each runs on its own box \
+with its own key — call mint_worker(module_id, agent_name) for each and pass the token \
+into worker_briefing as delegation_token. Without it every subagent IS this machine: \
+the ledger cannot tell them apart, they can complete each other's modules, and each \
+inherits your MANAGER authority. Never compute stage gating yourself — next_work \
+already did. When workers return, poll \
 feature_status(feature_id, events_since=<cursor>) and read the new events: completions, \
 blockers, premature claims, discovered tasks, stage_unlocked. Dispatch the next wave.\n\
 4. On blocker_reported or premature_claim: fix the plan (revise_plan), re-dispatch, or \
@@ -167,11 +173,35 @@ fn worker_briefing(args: &Value) -> Result<Value, McpmError> {
         .get("agent_name")
         .and_then(Value::as_str)
         .unwrap_or("agent.mod.<short-name>");
+    let token = args
+        .get("delegation_token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty());
+    // The token is threaded into every call the briefing spells out,
+    // rather than mentioned once at the top. A worker that passes it on
+    // claim_module and forgets it on complete_module has its exit
+    // recorded as the machine — the one event the manager most needs
+    // signed.
+    let (pass, carry) = match token {
+        Some(t) => (
+            format!(", delegation_token='{t}'"),
+            format!(
+                "\n\nYOUR IDENTITY: you share this machine's key with other agents, so you \
+were minted a delegated one. Pass delegation_token='{t}' on EVERY call below, including \
+get_context. Without it your work is recorded as the machine rather than as you. It \
+works only against {module_id} and stops working when that module completes or is \
+released — if a call rejects it, stop and report to your manager rather than retrying \
+without it."
+            ),
+        ),
+        None => (String::new(), String::new()),
+    };
     let text = format!(
         "You are a WORKER agent on the mcpm project-management MCP server. You own exactly \
-ONE module: {module_id}.\n\n\
+ONE module: {module_id}.{carry}\n\n\
 Your loop:\n\
-1. get_context(agent_name='{agent_name}', role='worker') then claim_module('{module_id}'). \
+1. get_context(agent_name='{agent_name}'{pass}, role='worker') then \
+claim_module('{module_id}'{pass}). \
 The claim IS your briefing: it returns your checklist, the memories recorded above your \
 module, and the completed-module summaries from earlier stages.\n\
    - If claim_module returns STAGE_LOCKED: STOP. Do no work. Report the error to your \
@@ -188,10 +218,10 @@ When reality reveals work the plan missed, add_task it — it is recorded as dis
 scope={{level:'project'}} for something you learned that will bite anyone here, not \
 just the next worker on this feature.\n\
 5. Exit through exactly ONE door:\n\
-   - complete_module(module_id, summary) — all tasks resolved; your summary is what \
+   - complete_module(module_id, summary{pass}) — all tasks resolved; your summary is what \
 downstream workers read.\n\
-   - report_blocker(module_id, description) — you cannot proceed; keep the claim, stop.\n\
-   - release_module(module_id, reason) — you must abandon; task states survive you.\n\
+   - report_blocker(module_id, description{pass}) — you cannot proceed; keep the claim, stop.\n\
+   - release_module(module_id, reason{pass}) — you must abandon; task states survive you.\n\
 Never exit silently."
     );
     Ok(prompt_result("Worker operating protocol.", &text))

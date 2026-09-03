@@ -27,6 +27,15 @@ dispatchers read that one list. And `get_context` must keep ignoring its
 arguments on a keyed connection: taking `agent_name` from the caller
 there hands back the one thing the key exists to make unforgeable.
 
+A key is per MACHINE, and a subagent cannot present a different one, so
+**a delegation token is the one identity that travels in band** —
+`mint_worker` issues it, the manager pastes it into the subagent's
+prompt, and `Store::resolve_delegation` turns it back into an `Actor`.
+It is still not an argument the caller gets to assert: it is minted
+server-side, paired to the minting key, forced to WORKER whatever key
+carried it, and scoped to one module. That is what lets one process tree
+hold a manager and its workers.
+
 ## UI work: read UX_GUIDELINES.md first
 
 **Anything that touches a screen — new components, edits to existing
@@ -174,6 +183,21 @@ of the `server` SDK, and only running one hides breakage in the other.
   test cannot see the failure: pair the mount test with the
   handler-count assertion in `wants.rs`, and check a new SDK-backed
   component in the browser.
+- **A delegation token is resolved BEFORE the role gate, not after.**
+  Resolving it is what decides which role the gate applies: a token
+  forces `KeyRole::Worker` however manager the key behind it is, and
+  that single substitution in `rpc.rs` is the whole manager/worker split
+  inside one process tree. Gate first and every subagent on a laptop
+  inherits MANAGER again — silently, because everything still works.
+  The other half is the scope: a delegated `Actor` may touch only the
+  module it was minted for, and that check lives in `require_claim`
+  beside the claim check, because both answer "may this actor write to
+  this module?" and every write verb already funnels through it. A new
+  write verb that reads `claimed_by` itself picks up neither.
+- **An unresolvable `delegation_token` is an error, never a fall-back.**
+  Quietly proceeding as the session's own identity would attribute a
+  subagent's work to the machine — exactly the failure the token exists
+  to prevent, in exactly the case nobody is watching.
 - **The auth posture is derived from `HOST`, not configured
   alongside it.** `api::auth_required()` is true whenever `HOST` is not
   loopback, so a reachable console host cannot be an unauthenticated

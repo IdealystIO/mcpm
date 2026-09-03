@@ -220,9 +220,9 @@ dependencies = [
 
 [[package]]
 name = "backend-apple-core"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "cb7c45816c35b40f27844affbb47fcdd8874ac93d5e50a4542aa6aaf4606ecf4"
+checksum = "9fff87c47cad716ca0b736197af90267e712345909add76710bbffefe3e83ea6"
 dependencies = [
  "block2",
  "objc2",
@@ -232,9 +232,9 @@ dependencies = [
 
 [[package]]
 name = "backend-ios-core"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "035caa7c4644d0ded70a2a33c0922dd6b61b7cb87f5b6ec26f4c716a86187db0"
+checksum = "da1b1165283be9c06fbe25bac1fdf1c25314bcd9e220dea9a24493731376caef"
 dependencies = [
  "backend-apple-core",
  "block2",
@@ -248,9 +248,9 @@ dependencies = [
 
 [[package]]
 name = "backend-ios-mobile"
-version = "1.5.2"
+version = "1.6.0"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "1923c2e686ef31ce355800d228e416873aa8c6d6121654196d05667c76050066"
+checksum = "7459839550179f27ba0e48f4c43b1e89c41ba2e6d940490a11fa7e42d55e44d9"
 dependencies = [
  "backend-apple-core",
  "backend-ios-core",
@@ -286,9 +286,9 @@ dependencies = [
 
 [[package]]
 name = "backend-macos"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "852cc3a03196f0c228720da8a5cfbf2ada702132077dd156ecb652aab534fc44"
+checksum = "9cb4c6572b72778f606afdbc756ec2cb1867120a6337c13840d15ec44dcf98e5"
 dependencies = [
  "backend-apple-core",
  "block2",
@@ -306,9 +306,9 @@ dependencies = [
 
 [[package]]
 name = "backend-web"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "0f4cd83614adbf79d52122090811c225273a09c177d8a929dfd0555a1f54d381"
+checksum = "120f06534cc73cb59460cb7388425d8001ca28861ad6382ba2ac520b42eaf393"
 dependencies = [
  "css",
  "inventory",
@@ -496,9 +496,9 @@ dependencies = [
 
 [[package]]
 name = "codeblock"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "717f9569dc017eafdbeca726d082f302439ec25e0a9b8f1981c4fdbf0ce79efc"
+checksum = "1a01717c9eda61346a36a76b69fd6b35dc8ea6bd07dc0fc3c29c218455c76b1d"
 dependencies = [
  "backend-android-mobile",
  "backend-ios-core",
@@ -1317,9 +1317,9 @@ dependencies = [
 
 [[package]]
 name = "host-mock"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "10b38acce777634d18e0088d3abc2954cf0ffd6af356e4b49a8f56ba600439c9"
+checksum = "05110979922118d7f69c7f02049cba73bd79433732aadc97eca3805af460c9e4"
 dependencies = [
  "runtime-scene",
  "runtime-shared",
@@ -1552,9 +1552,9 @@ dependencies = [
 
 [[package]]
 name = "idea-ui"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "fad5829783d55c1c43ce1b65efca0580da2201bb19578192c231742b585ed70c"
+checksum = "81d951a4091d96106915120250d3716994e537d5cb7411ff381f87301a364158"
 dependencies = [
  "idea-theme",
  "runtime-core",
@@ -1924,9 +1924,9 @@ dependencies = [
 
 [[package]]
 name = "net"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "15d68976b0de2c395997e2cec81550952a4eeda1ffd9ff2265edbfafdfa4e702"
+checksum = "ad40f2dc6df611ccdefcbca9264972ac314afdbaea5c4428fe73bb4143a7628f"
 dependencies = [
  "block2",
  "futures-channel",
@@ -2668,9 +2668,9 @@ dependencies = [
 
 [[package]]
 name = "runtime-layout"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "64867c61a719369710b339297564e92f3d9414ec7f5a5ddd356b92764a0c3f11"
+checksum = "35d3432cf2cdf6620564abfc01c1650724d914bec9bb9f48ed622c5f9781c088"
 dependencies = [
  "runtime-shared",
  "taffy",
@@ -2690,9 +2690,9 @@ dependencies = [
 
 [[package]]
 name = "runtime-scene"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "8aa4265f301e2e71440e04164863f8d90d2adfbfe489ef56dc9c1ad2a19817ce"
+checksum = "20172b0dffd1e211c30d084283de788331fef48c2086a2f849b3f9cf22a7e086"
 dependencies = [
  "runtime-world",
  "rustc-hash",
@@ -2700,9 +2700,9 @@ dependencies = [
 
 [[package]]
 name = "runtime-shared"
-version = "1.5.3"
+version = "1.5.4"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "46fed0e184971ba086b73cce1dd097a738e89787fee278cc21abd9cf5a119f0c"
+checksum = "0e2f2e2189be501990b938cae32d867356d4ef70f67cd13c1e059a5629302659"
 dependencies = [
  "base64",
  "bitflags 2.13.1",
@@ -2719,9 +2719,9 @@ dependencies = [
 
 [[package]]
 name = "runtime-vocabulary"
-version = "1.5.3"
+version = "1.5.4"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "1f6d40f7920fe07758fb9a8fa261257bf828c4a6a41f8615fff4f07f81fc40dc"
+checksum = "2bbc56603cb787416725eb9f9047e2e19b07edb655087bad91dcb02d663e66b0"
 dependencies = [
  "runtime-scene",
  "runtime-shared",
@@ -2931,9 +2931,9 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "1.5.2"
+version = "1.5.3"
 source = "sparse+https://crates.idealyst.io/index/"
-checksum = "eec06271684ee443844ca4c13184e31eb4a29f1c301fc6128fd89ebcb34912a8"
+checksum = "e9200044a3973d9fbc8abcecd00ee7feb78d6385469938bf48cd7f550265e722"
 dependencies = [
  "axum",
  "futures-channel",
