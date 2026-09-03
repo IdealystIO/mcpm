@@ -43,6 +43,22 @@ const DEFAULT_DELEGATION_TTL_MINUTES: i64 = 240;
 const MIN_DELEGATION_TTL_MINUTES: i64 = 5;
 const MAX_DELEGATION_TTL_MINUTES: i64 = 1440;
 
+/// What every [`Briefing`] tells a worker about its checklist.
+///
+/// Measured over 37 modules and 268 ticks, the median tick landed 81%
+/// of the way through its module and only 1.5% arrived in the first
+/// 40%. That is structural rather than sloppy: `complete_module`
+/// refuses with `TASKS_OPEN`, so ticking reads as an exit requirement
+/// and the only gate sits at the end. Telling a worker to be tidier
+/// does not move a gate. Durability does — these workers run on
+/// reclaimable instances, where a mid-module reclaim loses the whole
+/// checklist and the resuming agent cannot tell "not started" from
+/// "done but unrecorded".
+const CLAIM_GUIDANCE: &str = "Tick each task as you finish it. A task ticked when it \
+     is done survives an interruption; one ticked at the end only survives if you \
+     get there. On a spot instance the replacement sees your checklist, not your \
+     intentions.";
+
 type Result<T> = std::result::Result<T, McpmError>;
 type Tx<'a> = Transaction<'a, Postgres>;
 
@@ -598,6 +614,10 @@ impl Store {
     /// Take an exclusive claim. THE gate check lives here, inside the
     /// claiming transaction. A rejection still commits its
     /// `premature_claim` event.
+    ///
+    /// The result carries [`CLAIM_GUIDANCE`]: this is the one call a
+    /// worker makes before it has any habits for the module, so it is
+    /// where the habit is worth setting.
     pub async fn claim_module(
         &self,
         actor: impl Into<Actor>,
@@ -800,6 +820,7 @@ impl Store {
                     summary: r.get::<Option<String>, _>("summary").unwrap_or_default(),
                 })
                 .collect(),
+            guidance: CLAIM_GUIDANCE.to_string(),
         })
     }
 

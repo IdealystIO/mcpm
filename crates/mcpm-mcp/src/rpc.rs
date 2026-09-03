@@ -38,8 +38,13 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     to register your identity — every other tool requires it. Managers \
     plan features and dispatch what next_work returns; workers claim one \
     module, work its checklist, and exit through complete_module, \
-    report_blocker, or release_module. Stage order is enforced by the \
-    server: a STAGE_LOCKED rejection means stop and report to your \
+    report_blocker, or release_module. Workers are dispatched, not \
+    self-directing: a worker's module ids arrive from its manager in its \
+    launch prompt, in stage order, so a worker box started without them \
+    has nothing to claim — the board and next_work are readable by any \
+    agent, but nothing assigns a worker its own module. Stage order is \
+    enforced by the server: a STAGE_LOCKED rejection means stop and \
+    report to your \
     manager. Loose ideas live in the want pool (add_want / list_wants); \
     features are composed out of GROUPS of wants with promote_wants, \
     never one want to one feature. Ids are prefixed by kind: feat_ stg_ mod_ \

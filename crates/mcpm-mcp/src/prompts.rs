@@ -211,8 +211,10 @@ direction='up') for conventions and interfaces decided upstream — that walk en
 the project's standing knowledge, so it covers house rules as well as this feature's. \
 Ask in plain words; matching is fuzzy. Narrow with kinds=['convention','gotcha'] when \
 you want the rules rather than the history.\n\
-3. Work the checklist: complete_task each item as it lands (not in a batch at the end). \
-When reality reveals work the plan missed, add_task it — it is recorded as discovered.\n\
+3. Work the checklist: complete_task each item as it lands. A task ticked when it is done \
+survives an interruption; one ticked at the end only survives if you get there. On a spot \
+instance the replacement sees your checklist, not your intentions. When reality reveals \
+work the plan missed, add_task it — it is recorded as discovered.\n\
 4. commit_memory anything the next agent will need, with the kind that fits \
 (decision, gotcha, reference). Module scope for what is true of your module; \
 scope={{level:'project'}} for something you learned that will bite anyone here, not \

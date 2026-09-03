@@ -646,6 +646,13 @@ pub struct Briefing {
     pub ancestor_memories: Vec<Memory>,
     /// Completed-module summaries from earlier stages of this feature.
     pub upstream_summaries: Vec<UpstreamSummary>,
+    /// How to work the checklist, said at the one moment the worker is
+    /// setting its habits for this module. `complete_module` refuses
+    /// with TASKS_OPEN, so ticking reads as an exit requirement and the
+    /// gate sits at the end — advice framed as tidiness loses to that.
+    /// Framed as durability it does not: the checklist is the only part
+    /// of a worker that survives the worker.
+    pub guidance: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
