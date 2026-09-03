@@ -24,7 +24,9 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{McpmError, ErrorCode};
 use crate::ids::{id_level, new_id, new_memory_id, new_want_id, normalize_tag, Level};
-use crate::keys::{Actor, ApiKeyInfo, Delegation, IssuedKey, KeyIdentity, KeyRole, MintedWorker};
+use crate::keys::{
+    Actor, ApiKeyInfo, Delegation, IssuedKey, KeyIdentity, KeyRole, MintRequest, MintedWorker,
+};
 use crate::types::*;
 
 /// The Postgres NOTIFY channel the `events_notify` trigger announces
@@ -42,6 +44,14 @@ const DEFAULT_DELEGATION_TTL_MINUTES: i64 = 240;
 /// token is for, and clamping is friendlier than refusing mid-dispatch.
 const MIN_DELEGATION_TTL_MINUTES: i64 = 5;
 const MAX_DELEGATION_TTL_MINUTES: i64 = 1440;
+/// How many live worker keys `issue_worker_key` will let exist. A key
+/// is a STANDING credential — it outlives the box it was issued to
+/// unless somebody revokes it — so the failure this bounds is a
+/// dispatch loop quietly accumulating credentials, which raises nothing
+/// at the time and is only visible in `--list-keys` weeks later. The
+/// operator's `--issue-key` is not capped: a human at a shell is the
+/// thing that fixes a deployment that has hit this.
+const MAX_LIVE_WORKER_KEYS: i64 = 64;
 
 /// What every [`Briefing`] tells a worker about its checklist.
 ///
@@ -2772,6 +2782,122 @@ impl Store {
                  this key makes, so make it the one you want to read back.",
             ));
         }
+        self.insert_key(issuer, label, agent_name, role, "cli").await
+    }
+
+    /// Issue a WORKER key to a manager, so a box that is not this
+    /// machine can hold an identity of its own.
+    ///
+    /// This is the other half of the fleet story, and it is deliberately
+    /// not delegation. A delegation token is scoped, expiring, and
+    /// paired to one key precisely because it travels in band as plain
+    /// text in a prompt; stretching it to cover boxes that already have
+    /// their own credentials would make every box in a fleet share one
+    /// identity, which is the exact collapse `mint_worker` exists to
+    /// undo one level down. A box gets a key, and then delegation goes
+    /// back to meaning what it means.
+    ///
+    /// Three things bound it, because it mints a STANDING credential
+    /// where every other tool mints scoped ones:
+    ///
+    /// - **Worker only.** The role is not an argument. A manager that
+    ///   could issue manager keys could escalate a subagent past the
+    ///   gate this whole system is; a console key could not present the
+    ///   result anyway.
+    /// - **One live key per agent name.** Two live keys naming the same
+    ///   agent are two boxes the ledger cannot tell apart and that can
+    ///   complete each other's modules — the failure this exists to
+    ///   fix. Rotation is revoke-then-issue, which is one call more and
+    ///   leaves the withdrawal on the record.
+    /// - **A cap.** A dispatch loop that issues a key per attempt would
+    ///   otherwise fill `api_keys` with live credentials nobody is
+    ///   holding, and nothing about that raises an error at the time.
+    ///
+    /// The operator's `--issue-key` is under none of these: it is a
+    /// human at a shell, and it is how the first manager key exists at
+    /// all.
+    pub async fn issue_worker_key(
+        &self,
+        issuer: &Actor,
+        agent_name: &str,
+        label: Option<&str>,
+    ) -> Result<IssuedKey> {
+        if issuer.is_delegated() {
+            return Err(McpmError::new(
+                ErrorCode::Forbidden,
+                "A delegated identity cannot issue a key.",
+                json!({ "agent": issuer.name, "scope": issuer.scope }),
+                "You were minted for one module and hold no authority to create \
+                 credentials. If the work needs another box, report that to the manager \
+                 that minted you.",
+            ));
+        }
+        let agent_name = agent_name.trim();
+        if agent_name.is_empty() {
+            return Err(plan_invalid(
+                "issue_worker_key requires the agent_name the box will be recorded as — \
+                 that name is the whole point of giving it a key of its own. Use something \
+                 that identifies the box, e.g. the branch slug it runs.",
+            ));
+        }
+        if let Some(existing) = sqlx::query(
+            "SELECT id FROM api_keys
+             WHERE agent_name = $1 AND revoked_at IS NULL AND role = 'worker'",
+        )
+        .bind(agent_name)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            let id: String = existing.get("id");
+            return Err(McpmError::new(
+                ErrorCode::PlanConflict,
+                format!("A live worker key already names agent '{agent_name}'."),
+                json!({ "agent_name": agent_name, "key_id": id }),
+                "Two live keys under one name are two boxes the ledger cannot tell apart, \
+                 which is the problem a key per box exists to fix. If that box is still \
+                 running, use the key it has. If it lost the key, ask the operator to \
+                 revoke this one first. If this is a different box, give it a different \
+                 name.",
+            ));
+        }
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_keys WHERE role = 'worker' AND revoked_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if live >= MAX_LIVE_WORKER_KEYS {
+            return Err(McpmError::new(
+                ErrorCode::Forbidden,
+                format!("This deployment already holds {live} live worker keys."),
+                json!({ "live_worker_keys": live, "cap": MAX_LIVE_WORKER_KEYS }),
+                "A key outlives the box it was issued to unless somebody revokes it, so \
+                 this cap is what stops a dispatch loop leaving a pile of live \
+                 credentials nobody holds. Reuse the key a box already has, or ask the \
+                 operator to revoke the keys of boxes that are gone.",
+            ));
+        }
+        self.insert_key(
+            &issuer.name,
+            label.unwrap_or("").trim(),
+            agent_name,
+            KeyRole::Worker,
+            "issue_worker_key",
+        )
+        .await
+    }
+
+    /// The insert both issuance paths share, so a key issued by an
+    /// agent and one issued at a shell are the same row and the same
+    /// ledger entry — differing only in `via`, which is what tells an
+    /// audit which door a credential came through.
+    async fn insert_key(
+        &self,
+        issuer: &str,
+        label: &str,
+        agent_name: &str,
+        role: KeyRole,
+        via: &str,
+    ) -> Result<IssuedKey> {
         let label = if label.is_empty() { agent_name } else { label };
         let (token, id, hash) = crate::keys::mint();
 
@@ -2797,7 +2923,13 @@ impl Store {
             None,
             None,
             Some(issuer),
-            json!({ "key_id": id, "label": label, "agent": agent_name, "role": role.as_str() }),
+            json!({
+                "key_id": id,
+                "label": label,
+                "agent": agent_name,
+                "role": role.as_str(),
+                "via": via,
+            }),
         )
         .await?;
         tx.commit().await?;
@@ -2873,14 +3005,22 @@ impl Store {
     ///   module retires the previous token in the same transaction, so
     ///   a manager re-dispatching a module cannot leave a second
     ///   identity able to write to it.
+    ///
+    /// `req.for_key_id` moves where the token's boundary sits without
+    /// weakening its shape — see [`MintRequest::for_key_id`]. It is
+    /// checked against `api_keys` HERE rather than left to the foreign
+    /// key, because a manager naming a key that is revoked, absent, or
+    /// a console key has made a dispatch error it needs to read as one:
+    /// the foreign key would either accept it (revoked, console) or
+    /// surface as an opaque constraint violation, and both end with a
+    /// box that cannot work and a manager that thinks it dispatched.
     pub async fn mint_worker(
         &self,
         minter: &Actor,
         key_id: Option<&str>,
-        module_id: &str,
-        agent_name: &str,
-        ttl_minutes: Option<i64>,
+        req: MintRequest<'_>,
     ) -> Result<MintedWorker> {
+        let MintRequest { module_id, agent_name, ttl_minutes, for_key_id } = req;
         if minter.is_delegated() {
             return Err(McpmError::new(
                 ErrorCode::Forbidden,
@@ -2903,6 +3043,15 @@ impl Store {
         let expires_at = chrono::Utc::now() + chrono::Duration::minutes(ttl);
 
         let mut tx = self.pool.begin().await?;
+        // Which credential this token will answer to. Exactly one,
+        // always — the default is the minter's own. Checked inside the
+        // transaction that writes the row, like every other rule here:
+        // a key revoked between a check and an insert would otherwise
+        // produce a token that is born dead.
+        let bound_key_id = match for_key_id {
+            Some(target) => Some(verify_mint_target(&mut tx, target).await?),
+            None => key_id.map(str::to_string),
+        };
         let row = sqlx::query(
             "SELECT m.id, m.name AS module_name, m.status, s.feature_id
              FROM modules m JOIN stages s ON s.id = m.stage_id
@@ -2933,7 +3082,7 @@ impl Store {
         )
         .bind(&id)
         .bind(&hash)
-        .bind(key_id)
+        .bind(bound_key_id.as_deref())
         .bind(agent_name)
         .bind(module_id)
         .bind(&minter.name)
@@ -2955,64 +3104,98 @@ impl Store {
                 "module": module_name,
                 "expires_at": expires_at,
                 "superseded": superseded,
+                // WHO was allowed to present this, on the record. The
+                // token itself is never here, but "which credential
+                // could have used it" is exactly the question an audit
+                // asks afterwards, and it cannot be reconstructed from
+                // the minter — `for_key_id` may point anywhere.
+                "bound_key_id": bound_key_id,
+                "delegated_off_machine": for_key_id.is_some(),
             }),
         )
         .await?;
         tx.commit().await?;
 
+        let where_it_works = match (&bound_key_id, for_key_id) {
+            (Some(id), Some(_)) => format!(
+                " It is bound to key '{id}', NOT to this machine — it works only where \
+                 that key is installed, and is inert anywhere else including here."
+            ),
+            _ => String::new(),
+        };
         Ok(MintedWorker {
             instructions: format!(
                 "Give this token to the subagent in its prompt and tell it: you are \
                  '{agent_name}'; pass delegation_token on get_context and on every write \
                  (claim_module, complete_task, add_task, complete_module, report_blocker, \
                  release_module). It is scoped to {module_id} alone and stops working when \
-                 that module completes or is released, or at {expires_at}."
+                 that module completes or is released, or at {expires_at}.{where_it_works}"
             ),
             delegation_token: token,
             agent_name: agent_name.to_string(),
             module_id: module_id.to_string(),
             expires_at,
+            bound_key_id,
         })
     }
+
 
     /// Resolve a delegation token to the identity it carries.
     ///
     /// `key_id` is the key the request authenticated with, and the match
-    /// is on equality INCLUDING null: a token minted on a keyed
-    /// connection resolves only alongside that same key, and one minted
-    /// on a keyless stdio session resolves only on a keyless session.
-    /// That pairing is what lets the token travel in band — off the
-    /// machine that minted it, it is inert.
+    /// is on equality INCLUDING null: a token bound to a key resolves
+    /// only alongside that same key, and one minted on a keyless stdio
+    /// session resolves only on a keyless session. That pairing is what
+    /// lets the token travel in band — off the machine it was bound to,
+    /// it is inert.
+    ///
+    /// The row is fetched by id ALONE and the four failures are then
+    /// told apart in order, because they want four different reactions
+    /// from the subagent holding the token. The order is the whole
+    /// safety argument: the secret is verified FIRST, so nothing below
+    /// it — not the expiry, not the key it is bound to — is observable
+    /// without already holding the token. A guesser only ever reaches
+    /// `delegation_unknown`.
     pub async fn resolve_delegation(
         &self,
         key_id: Option<&str>,
         token: &str,
     ) -> Result<Delegation> {
         // Shape first, so junk never reaches the database.
-        let parsed = crate::keys::parse_delegation(token)
-            .ok_or_else(McpmError::delegation_invalid)?;
+        let parsed =
+            crate::keys::parse_delegation(token).ok_or_else(McpmError::delegation_unknown)?;
         let row = sqlx::query(
-            "SELECT hash, agent_name, module_id, expires_at FROM delegations
-             WHERE id = $1
-               AND revoked_at IS NULL
-               AND expires_at > now()
-               AND key_id IS NOT DISTINCT FROM $2",
+            "SELECT hash, agent_name, module_id, expires_at, revoked_at, key_id,
+                    expires_at <= now() AS expired
+             FROM delegations WHERE id = $1",
         )
         .bind(&parsed.id)
-        .bind(key_id)
         .fetch_optional(&self.pool)
         .await?
-        .ok_or_else(McpmError::delegation_invalid)?;
+        .ok_or_else(McpmError::delegation_unknown)?;
 
+        // Gate one, and it is a gate: everything after this line is a
+        // fact about a token the caller has proven it holds.
         let stored: String = row.get("hash");
         if !crate::keys::hash_eq(&stored, &parsed.secret_hash) {
-            return Err(McpmError::delegation_invalid());
+            return Err(McpmError::delegation_unknown());
+        }
+        let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
+        if row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("revoked_at").is_some() {
+            return Err(McpmError::delegation_retired());
+        }
+        if row.get::<Option<bool>, _>("expired").unwrap_or(true) {
+            return Err(McpmError::delegation_expired(expires_at));
+        }
+        let bound: Option<String> = row.get("key_id");
+        if bound.as_deref() != key_id {
+            return Err(McpmError::delegation_wrong_key(bound.as_deref(), key_id));
         }
         Ok(Delegation {
             id: parsed.id,
             agent_name: row.get("agent_name"),
             module_id: row.get("module_id"),
-            expires_at: row.get("expires_at"),
+            expires_at,
         })
     }
 
@@ -3190,6 +3373,54 @@ fn require_claim(
             "Call claim_module first; the claim is also your briefing.",
         )),
     }
+}
+
+/// Check a `for_key_id` before a token is bound to it, and hand the id
+/// back so the caller cannot accidentally bind the unchecked one.
+///
+/// Revoked and console keys are refused rather than accepted-and-
+/// useless: a token bound to either resolves forever to
+/// `delegation_wrong_key` on the box holding it, which reads as an
+/// operator error on the WORKER's side and sends it chasing a
+/// mistake its manager made minutes earlier. Takes the transaction
+/// rather than the pool, so the key it approves is the key the row is
+/// written against.
+async fn verify_mint_target(tx: &mut Tx<'_>, target: &str) -> Result<String> {
+    let row = sqlx::query("SELECT role, revoked_at FROM api_keys WHERE id = $1 FOR SHARE")
+        .bind(target)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            McpmError::new(
+                ErrorCode::NotFound,
+                format!("No API key with id '{target}'."),
+                json!({ "for_key_id": target }),
+                "for_key_id is a key's PUBLIC half (the `mcpm_<id>_…` middle), not the \
+                 whole token and not an agent name. Issue the box a key with \
+                 issue_worker_key and bind to the key_id it returns.",
+            )
+        })?;
+    if row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("revoked_at").is_some() {
+        return Err(McpmError::new(
+            ErrorCode::Forbidden,
+            format!("API key '{target}' has been revoked."),
+            json!({ "for_key_id": target }),
+            "Nothing can present it, so a token bound to it would be born dead. Issue \
+             the box a fresh key and bind to that.",
+        ));
+    }
+    let role = KeyRole::parse(row.get::<String, _>("role").as_str())
+        .ok_or_else(|| McpmError::internal("api_keys.role holds an unknown role"))?;
+    if !role.is_agent() {
+        return Err(McpmError::new(
+            ErrorCode::Forbidden,
+            format!("API key '{target}' is a {} key.", role.as_str()),
+            json!({ "for_key_id": target, "role": role.as_str() }),
+            "A console key is refused by the MCP surface outright, so it could never \
+             present the token. Bind to the agent key the box actually runs with.",
+        ));
+    }
+    Ok(target.to_string())
 }
 
 /// Retire every live delegation on a module. Called inside the

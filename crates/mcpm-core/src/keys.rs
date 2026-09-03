@@ -88,12 +88,18 @@ impl KeyRole {
 /// `mint_worker` is here for a second reason as well: a delegated
 /// identity is gated as a worker whatever key carried it, so listing
 /// the tool here is what makes delegation exactly one level deep.
+///
+/// `issue_worker_key` is the heaviest thing on this list — it mints a
+/// standing credential rather than a scoped, expiring one — and it is
+/// gated the same way for the same reason: dispatch is the manager's
+/// act, and a fleet box is a thing a manager dispatches to.
 pub const MANAGER_ONLY: &[&str] = &[
     "plan_feature",
     "revise_plan",
     "complete_feature",
     "promote_wants",
     "mint_worker",
+    "issue_worker_key",
 ];
 
 /// A verified key, resolved to who is calling. This is what the MCP
@@ -163,6 +169,36 @@ impl From<&Actor> for Actor {
     }
 }
 
+/// What a manager is asking for when it mints a worker identity.
+///
+/// A struct rather than four positional arguments for one reason: two
+/// of the things in play here are key ids — the key the request
+/// authenticated with, and the key the token is to be bound to — and
+/// positionally they are the same type. Swapping them would bind a
+/// credential to the wrong machine and raise nothing, so only one of
+/// them is an argument the caller writes down, and it is named.
+#[derive(Clone, Debug, Default)]
+pub struct MintRequest<'a> {
+    /// The single module the minted identity may write to.
+    pub module_id: &'a str,
+    /// The name the ledger records for every write it makes.
+    pub agent_name: &'a str,
+    /// How long it lives; `None` for the default, clamped either way.
+    pub ttl_minutes: Option<i64>,
+    /// The key this token will be honoured alongside.
+    ///
+    /// `None` — the default, and the only shape a same-machine subagent
+    /// needs — means the minter's own key: minted on this machine, inert
+    /// off it. Naming another key instead is for the case delegation was
+    /// not built for, a manager dispatching a worker that runs elsewhere
+    /// and holds a key of its own. It does not weaken the pairing rule
+    /// (a token is still honoured alongside exactly ONE key) but it does
+    /// move where the boundary sits: from "this machine" to "whoever
+    /// holds that key". Point it at a key you would trust with the
+    /// module, because that is what you are doing.
+    pub for_key_id: Option<&'a str>,
+}
+
 /// A freshly minted delegation. `token` is the only time the secret
 /// exists outside the minting manager's hands — it goes straight into
 /// the subagent's prompt.
@@ -172,6 +208,12 @@ pub struct MintedWorker {
     pub agent_name: String,
     pub module_id: String,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// The key this token is honoured alongside, echoed back so the
+    /// manager can see WHERE it will work — the answer differs from
+    /// "here" the moment `for_key_id` was used, and a token dispatched
+    /// to the wrong box is otherwise indistinguishable from a dead one
+    /// until the box calls. `None` is a keyless local stdio session.
+    pub bound_key_id: Option<String>,
     /// What the manager should paste into the subagent's prompt, spelled
     /// out — the token is useless to a subagent that was not told it
     /// must pass it on every write.

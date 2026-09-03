@@ -179,6 +179,56 @@ the components guide, that `Fn`-closure child slots (`ui!`'s `for`,
 `presence`, `switch`) all push data behind props or index-keyed
 re-reads, since discovering it per-site costs the same time each time.
 
+### 9. `insert_text` leaves the caret before the text it inserted (web)
+
+`TextAreaHandle::insert_text` documents its own contract:
+
+> Replace the current selection (or insert at the caret if no
+> selection) with `text`, then **place the caret immediately after the
+> inserted text**.
+
+On web it does the opposite. `backend-web`'s `TextAreaOps::insert_text`
+(`src/primitives/text_area.rs`) calls the three-argument form:
+
+```rust
+let _ = t.set_range_text_with_start_and_end(text, start, end);
+```
+
+which leaves `selectionMode` at its default, `"preserve"`. The spec's
+preserve rule only moves a caret that sits *after* the replaced range:
+for a collapsed caret the replaced range is `[P, P]` and the caret is
+at `P`, so neither `selection start > end` nor `selection start >
+start` holds and it stays exactly where it was. The inserted text
+lands on the far side of the cursor. `text_input.rs` has the same call
+and the same bug.
+
+The fix is one argument —
+`set_range_text_with_start_and_end_and_selection_mode(text, start, end,
+SelectionMode::End)`.
+
+Why this is worth a report rather than a workaround: the canonical use
+of `insert_text` is the one the builder's own docs give — Tab
+completion from `code_editor::on_key_down` — and that is exactly where
+the caret has to end up after the completion. Every completion leaves
+the user arrowing past their own text. And app code cannot correct it:
+the handle exposes `focus`, `blur`, `select_all` and `insert_text` and
+no way to set a selection, and *every* reachable sequence of those
+lands the caret at the start of the replaced range (`select_all` +
+insert collapses it to 0). A `set_selection(start, end)` on the handle
+would be a good thing to have regardless, but here the argument alone
+fixes it.
+
+Where it bit: the capture composer's `#tag` completion. What we could
+do from app code was dodge the case where the completion is at the END
+of the buffer, by writing the whole buffer back through the
+controlling `Signal` — `textarea.value`'s setter is specified to move
+the caret to the end of the control, and at the end of the buffer that
+is the right place. Mid-buffer completions still keep `insert_text`
+and still put the caret in the wrong spot. Worth saying that the dodge
+is deliberately confined to the case that cannot rot: it stays correct
+once the backend passes `SelectionMode::End`, rather than depending on
+the bug.
+
 ## Small things
 
 - `Element` not being `Clone` is right, but the resulting error (`no

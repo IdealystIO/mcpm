@@ -32,9 +32,21 @@ A key is per MACHINE, and a subagent cannot present a different one, so
 `mint_worker` issues it, the manager pastes it into the subagent's
 prompt, and `Store::resolve_delegation` turns it back into an `Actor`.
 It is still not an argument the caller gets to assert: it is minted
-server-side, paired to the minting key, forced to WORKER whatever key
-carried it, and scoped to one module. That is what lets one process tree
-hold a manager and its workers.
+server-side, paired to ONE key, forced to WORKER whatever key carried
+it, and scoped to one module. That is what lets one process tree hold a
+manager and its workers.
+
+**Delegation is the same-machine mechanism; a box that is not this
+machine gets a key.** `issue_worker_key` is the manager-only tool for
+that, and it exists because boxes sharing one key are one identity the
+ledger cannot split — mutual exclusion between them silently does not
+hold. Do not reach for delegation to cover it: `mint_worker`'s
+`for_key_id` binds a token to another box's key for the case that needs
+both a box identity and a single-module scope, and it moves where the
+boundary sits (from "this machine" to "whoever holds that key") without
+changing its shape. One key honours a token, always — a design where
+"any key" resolves one gives up the property that makes pasting it into
+a prompt safe, and it is the one thing here that must not be traded.
 
 ## UI work: read UX_GUIDELINES.md first
 
@@ -197,7 +209,13 @@ of the `server` SDK, and only running one hides breakage in the other.
 - **An unresolvable `delegation_token` is an error, never a fall-back.**
   Quietly proceeding as the session's own identity would attribute a
   subagent's work to the machine — exactly the failure the token exists
-  to prevent, in exactly the case nobody is watching.
+  to prevent, in exactly the case nobody is watching. It is four errors
+  and not one, because the four causes want four different reactions and
+  a subagent that cannot tell them apart correctly blocks and escalates.
+  The order they are told apart in is the safety argument: the secret is
+  verified FIRST, so nothing below it — the expiry, the key it is bound
+  to — is observable without already holding the token, and a guesser
+  only ever reaches `delegation_unknown`.
 - **The auth posture is derived from `HOST`, not configured
   alongside it.** `api::auth_required()` is true whenever `HOST` is not
   loopback, so a reachable console host cannot be an unauthenticated

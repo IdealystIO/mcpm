@@ -89,25 +89,100 @@ impl McpmError {
         )
     }
 
-    /// A delegation token that did not resolve: unknown, expired,
-    /// revoked, or presented alongside a key that did not mint it.
+    /// A delegation token that resolved to nothing, and WHY.
     ///
-    /// Unlike [`unauthorized`](Self::unauthorized) this one is
+    /// Unlike [`unauthorized`](Self::unauthorized) these are
     /// forthcoming, because the caller has ALREADY authenticated — it
     /// is a subagent holding a token its manager handed it, and the
-    /// four causes want four different reactions from it. A probe
-    /// learns nothing here that the key it already presented did not
-    /// tell it.
-    pub fn delegation_invalid() -> Self {
+    /// four causes want four different reactions from it. Collapsing
+    /// them into one sentence made a subagent that could not tell an
+    /// operator error from a dead credential block and escalate, which
+    /// is the correct move given four causes and no way to choose.
+    ///
+    /// The one thing they share: never fall back to the session's own
+    /// identity. That would attribute a subagent's work to the machine,
+    /// quietly, in exactly the case nobody is watching.
+    ///
+    /// A probe learns nothing here that the key it already presented
+    /// did not tell it — with one deliberate exception, spelled out on
+    /// [`delegation_wrong_key`](Self::delegation_wrong_key).
+    fn delegation_dead(message: &str, data: serde_json::Value, remedy: &str) -> Self {
         Self::new(
             ErrorCode::Unauthorized,
-            "This delegation_token does not resolve to a live identity.",
+            message.to_string(),
+            data,
+            format!(
+                "{remedy} Do not fall back to calling without the token — that would \
+                 attribute your work to the machine instead of to you."
+            ),
+        )
+    }
+
+    /// No such token: malformed, never minted, or the secret half does
+    /// not match. Deliberately one error and not three — those three
+    /// differ only for someone guessing, and a guesser is the one
+    /// caller who must learn nothing.
+    pub fn delegation_unknown() -> Self {
+        Self::delegation_dead(
+            "This delegation_token does not resolve to any identity.",
             serde_json::Value::Null,
-            "The token is unknown, expired, already retired by complete_module or \
-             release_module, or was minted for a different machine's key. Do not retry and \
-             do not fall back to calling without it — that would attribute your work to the \
-             machine instead of to you. Report to your manager and ask for a fresh \
-             mint_worker.",
+            "The token is not one this server minted, or it was copied incompletely. \
+             Check you pasted all of it; if it is intact, ask your manager for a fresh \
+             mint_worker. Retrying will not help.",
+        )
+    }
+
+    /// The token was real and is now past its TTL.
+    pub fn delegation_expired(expires_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self::delegation_dead(
+            "This delegation_token has expired.",
+            serde_json::json!({ "expires_at": expires_at }),
+            "A token is time-boxed on purpose. Report where you got to and ask your \
+             manager for a fresh mint_worker — with a longer ttl_minutes if the work \
+             legitimately runs this long.",
+        )
+    }
+
+    /// The token was retired: its module completed or was released, or
+    /// the manager minted a replacement for the same module.
+    pub fn delegation_retired() -> Self {
+        Self::delegation_dead(
+            "This delegation_token has been retired.",
+            serde_json::Value::Null,
+            "Its module was completed or released, or your manager minted a replacement \
+             identity for it — which means someone else is now doing this work. Stop and \
+             report to your manager rather than asking for another token.",
+        )
+    }
+
+    /// The token is structurally fine and presented by the wrong key.
+    ///
+    /// This is an OPERATOR error with a specific remedy, and it used to
+    /// read as a dead credential. The bound key id is named because a
+    /// key id is the public half by design (`--list-keys` prints it),
+    /// the caller already holds both the token and a valid key, and
+    /// without it the remedy — present the right key, or re-mint bound
+    /// to this one — is not actionable from the error.
+    pub fn delegation_wrong_key(bound: Option<&str>, presented: Option<&str>) -> Self {
+        let where_it_works = match bound {
+            Some(id) => format!("the key '{id}' it was minted for"),
+            None => "a local stdio session with no key at all".to_string(),
+        };
+        let presenting = match presented {
+            Some(id) => format!("key '{id}'"),
+            None => "no key".to_string(),
+        };
+        Self::delegation_dead(
+            &format!(
+                "This delegation_token is live, but it is bound to a different \
+                 credential: it is only honoured alongside {where_it_works}, and this \
+                 request presented {presenting}."
+            ),
+            serde_json::json!({ "bound_key_id": bound, "presented_key_id": presented }),
+            "A token is paired to one key so that one leaked off its machine is inert. \
+             You are on the wrong machine for it. Report this to your manager: either \
+             you should be running where that key lives, or the token needs re-minting \
+             with for_key_id set to the key you actually hold. Retrying will not help.",
         )
     }
 

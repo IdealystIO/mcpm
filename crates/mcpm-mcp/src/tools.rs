@@ -148,7 +148,7 @@ fn tree_tools() -> Value {
                 delegation_token: put it in the subagent's prompt and tell it to pass \
                 delegation_token on get_context and on every write. The token is a worker \
                 whatever key minted it, works only against that one module, only alongside \
-                your key, and stops working when the module completes or is released. Mint \
+                one key, and stops working when the module completes or is released. Mint \
                 one per module you dispatch — minting again for the same module retires the \
                 previous token.",
             "inputSchema": {
@@ -156,9 +156,31 @@ fn tree_tools() -> Value {
                 "properties": {
                     "module_id": { "type": "string", "description": "The module this identity may work, from next_work." },
                     "agent_name": { "type": "string", "description": "The name the ledger will record for the subagent, e.g. 'agent.mod.schema'." },
-                    "ttl_minutes": { "type": "integer", "description": "How long the token lives. Defaults to 4 hours; clamped to 5 minutes .. 24 hours." }
+                    "ttl_minutes": { "type": "integer", "description": "How long the token lives. Defaults to 4 hours; clamped to 5 minutes .. 24 hours." },
+                    "for_key_id": { "type": "string", "description": "ONLY for a worker that runs somewhere else and holds its own key — a remote box, not a subagent of yours. The public id of that key (the `mcpm_<id>_…` middle, or the key_id issue_worker_key returned): the token is then honoured alongside THAT key instead of yours, and is inert on your machine. Omit for subagents sharing your key, which is what this tool is for." }
                 },
                 "required": ["module_id", "agent_name"]
+            }
+        },
+        {
+            "name": "issue_worker_key",
+            "description": "MANAGER. Issue a standing worker key so a box that is not your \
+                machine has an identity of its own. Use this when you dispatch to remote \
+                boxes: without it every box shares one key, so the ledger cannot tell them \
+                apart and any of them can complete another's module. Returns the token \
+                ONCE — it cannot be recovered, so put it straight into that box's \
+                environment. The key is always a WORKER (the role is not yours to choose), \
+                one live key per agent_name, and the deployment is capped — reuse the key a \
+                box already has rather than issuing per dispatch. For subagents that share \
+                YOUR key, use mint_worker instead: a delegation token is scoped and \
+                expiring where this is neither.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_name": { "type": "string", "description": "The name the ledger records for every write that box makes. Make it identify the box — the branch slug it runs, for instance. One live key per name." },
+                    "label": { "type": "string", "description": "Human note for --list-keys and the console. Defaults to the agent name." }
+                },
+                "required": ["agent_name"]
             }
         },
         {

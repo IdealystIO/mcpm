@@ -22,7 +22,7 @@
 
 use mcpm_core::{
     Actor, Delegation, EdgeKind, ErrorCode, KeyIdentity, KeyRole, McpmError, MemoryKind, MemoryQuery,
-    MemoryScope, PlanFeature,
+    MemoryScope, MintRequest, PlanFeature,
     PlanOp, PromoteWants, SearchDirection, Store, Supersede, TaskOutcome, WantDraft, WantEdit,
     WantFilter, WantState,
 };
@@ -51,7 +51,11 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     tsk_ want_. Subagents that share one machine's key each get their own \
     identity from mint_worker: the manager mints one per module and puts \
     the token in the subagent's prompt, and the subagent passes \
-    delegation_token on get_context and on every write. Beyond tools \
+    delegation_token on get_context and on every write. A worker that \
+    runs on its OWN box is a different case: give it a key of its own \
+    with issue_worker_key, because a delegation token is honoured \
+    alongside exactly one key and boxes sharing one key are one identity \
+    the ledger cannot split. Beyond tools \
     there are prompts (manager_briefing, \
     worker_briefing, compose_wants) that brief a fresh agent for a role, \
     and read-only project:// resources for the board, the want pool, and \
@@ -255,11 +259,22 @@ async fn call_tool(
         "mint_worker" => {
             let module_id = str_arg(args, "module_id")?;
             let agent_name = str_arg(args, "agent_name")?;
-            let ttl = args.get("ttl_minutes").and_then(Value::as_i64);
+            let for_key_id = opt_str_arg(args, "for_key_id");
             let key_id = session.key.as_ref().map(|k| k.key_id.as_str());
+            let req = MintRequest {
+                module_id: &module_id,
+                agent_name: &agent_name,
+                ttl_minutes: args.get("ttl_minutes").and_then(Value::as_i64),
+                for_key_id: for_key_id.as_deref(),
+            };
+            to_value(store.mint_worker(&actor, key_id, req).await?)
+        }
+        "issue_worker_key" => {
+            let agent_name = str_arg(args, "agent_name")?;
+            let label = opt_str_arg(args, "label");
             to_value(
                 store
-                    .mint_worker(&actor, key_id, &module_id, &agent_name, ttl)
+                    .issue_worker_key(&actor, &agent_name, label.as_deref())
                     .await?,
             )
         }

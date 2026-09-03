@@ -87,11 +87,18 @@ run strictly in order; modules within a stage run concurrently, one worker subag
 each; tasks are each module's checklist.\n\
 3. Dispatch loop, until done: call next_work(feature_id) and spawn ONE worker subagent \
 per dispatchable module (give each the worker_briefing prompt with its module_id). \
-If your subagents share this machine's key — they do, unless each runs on its own box \
-with its own key — call mint_worker(module_id, agent_name) for each and pass the token \
-into worker_briefing as delegation_token. Without it every subagent IS this machine: \
-the ledger cannot tell them apart, they can complete each other's modules, and each \
-inherits your MANAGER authority. Never compute stage gating yourself — next_work \
+Give each worker an identity, or they do not have one — how depends on where it runs:\n\
+   - A subagent on THIS machine shares your key. Call mint_worker(module_id, \
+agent_name) for each and pass the token into worker_briefing as delegation_token. \
+Without it every subagent IS this machine: the ledger cannot tell them apart, they \
+can complete each other's modules, and each inherits your MANAGER authority.\n\
+   - A worker on ANOTHER box needs a key, not a token: issue_worker_key(agent_name) \
+once per box, put the token it returns in that box's environment, and reuse it \
+thereafter. A delegation token is honoured alongside exactly ONE key, so boxes \
+sharing a key are one identity and mutual exclusion between them does not hold. If \
+you must also scope such a box to a single module, mint_worker(..., \
+for_key_id=<that box's key_id>) binds the token to its key instead of yours.\n\
+Never compute stage gating yourself — next_work \
 already did. When workers return, poll \
 feature_status(feature_id, events_since=<cursor>) and read the new events: completions, \
 blockers, premature claims, discovered tasks, stage_unlocked. Dispatch the next wave.\n\
