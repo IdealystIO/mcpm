@@ -50,7 +50,13 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     there are prompts (manager_briefing, \
     worker_briefing, compose_wants) that brief a fresh agent for a role, \
     and read-only project:// resources for the board, the want pool, and \
-    the event ledger.";
+    the event ledger. The project also has a knowledge base, and you are \
+    already using it: complete_module commits your summary to it, and \
+    claim_module pushes your lineage's memories into your briefing \
+    unasked. search_memory is for reaching OUTSIDE that lineage — why \
+    something load-bearing is the way it is, an answer that predates your \
+    feature, a constraint the code does not explain. It is a resource, \
+    not a ritual: a search at the top of every module is noise.";
 
 /// Who is calling, and how much of that the server had to take on
 /// trust.
