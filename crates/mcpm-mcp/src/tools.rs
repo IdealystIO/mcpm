@@ -143,14 +143,29 @@ fn tree_tools() -> Value {
         },
         {
             "name": "mint_worker",
-            "description": "MANAGER. Mint one worker identity for one module, so a subagent \
-                sharing your machine's key stops being recorded as the machine. Returns a \
+            "description": "Mint one worker identity for one module, so a subagent sharing \
+                your machine's key stops being recorded as the machine. Returns a \
                 delegation_token: put it in the subagent's prompt and tell it to pass \
                 delegation_token on get_context and on every write. The token is a worker \
                 whatever key minted it, works only against that one module, only alongside \
                 one key, and stops working when the module completes or is released. Mint \
                 one per module you dispatch — minting again for the same module retires the \
-                previous token.",
+                previous token. \
+                \
+                WORKERS MAY CALL THIS TOO, which is how a box runs a stage wide instead of \
+                one module at a time. A worker may mint only for a module in a feature it \
+                ALREADY holds a live claim in — so claim your own module first, then mint \
+                for the siblings you want running beside it. In practice, on a branch box \
+                dispatched a whole feature: claim the first module of the stage yourself; \
+                for each remaining dispatchable module in that SAME stage call \
+                mint_worker(module_id, agent_name) and spawn one subagent per module with \
+                its token; let them claim, work and complete_module independently; then \
+                move to the next stage when next_work says it is unlocked. Do not mint \
+                across stages — a locked stage refuses the claim anyway, and the token \
+                would sit unused. Two modules that own the same FILE are not concurrent \
+                work whatever the plan says: run those in sequence. Your authority to mint \
+                lapses by itself when you complete your last module in the feature, so \
+                nothing has to revoke it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

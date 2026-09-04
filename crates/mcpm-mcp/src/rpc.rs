@@ -49,9 +49,16 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     features are composed out of GROUPS of wants with promote_wants, \
     never one want to one feature. Ids are prefixed by kind: feat_ stg_ mod_ \
     tsk_ want_. Subagents that share one machine's key each get their own \
-    identity from mint_worker: the manager mints one per module and puts \
+    identity from mint_worker: mint one per module and put \
     the token in the subagent's prompt, and the subagent passes \
-    delegation_token on get_context and on every write. A worker that \
+    delegation_token on get_context and on every write. WORKERS MAY MINT \
+    TOO, which is how a box dispatched a whole feature runs a stage wide \
+    rather than one module at a time: claim your own module first, then \
+    mint for the siblings in that same stage and spawn one subagent \
+    each. A worker may only mint inside a feature it already holds a \
+    live claim in, and that authority lapses by itself when it completes \
+    its last module there. Delegation stays one level deep — a delegated \
+    identity cannot mint another. A worker that \
     runs on its OWN box is a different case: give it a key of its own \
     with issue_worker_key, because a delegation token is honoured \
     alongside exactly one key and boxes sharing one key are one identity \

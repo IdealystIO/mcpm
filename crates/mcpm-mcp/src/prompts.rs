@@ -98,6 +98,13 @@ thereafter. A delegation token is honoured alongside exactly ONE key, so boxes \
 sharing a key are one identity and mutual exclusion between them does not hold. If \
 you must also scope such a box to a single module, mint_worker(..., \
 for_key_id=<that box's key_id>) binds the token to its key instead of yours.\n\
+   - You can also hand a box a WHOLE FEATURE rather than one module at a time, and \
+let it fan each stage out itself. A worker key may now mint, but only inside a \
+feature it already holds a claim in, so a box claims one module of the stage and \
+mints for its siblings. Give it the module ids in stage order and say plainly that \
+it may keep going — a box that finishes what it was listed and correctly declines to \
+self-direct then sits idle, indistinguishable from working. You still poll \
+feature_status; the difference is one dispatch instead of one per stage.\n\
 Never compute stage gating yourself — next_work \
 already did. When workers return, poll \
 feature_status(feature_id, events_since=<cursor>) and read the new events: completions, \

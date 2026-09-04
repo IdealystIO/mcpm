@@ -36,6 +36,39 @@ server-side, paired to ONE key, forced to WORKER whatever key carried
 it, and scoped to one module. That is what lets one process tree hold a
 manager and its workers.
 
+**A WORKER MAY MINT, INSIDE A FEATURE IT ALREADY HOLDS.** `mint_worker`
+came off `MANAGER_ONLY` on 2026-09-04. A flat gate had made the fleet's
+own design impossible: a cloud branch box holds a worker key by
+construction, so "stages sequential on the box, modules concurrent as
+subagents" had never once happened — measured across two live boxes,
+zero subagents ever, and an 8-vCPU instance averaging under 15% CPU
+because one agent worked one module at a time.
+
+In practice a box dispatched a whole feature now: claims the first
+module of its stage itself, calls `mint_worker` for each remaining
+dispatchable module in that SAME stage, spawns one subagent per module
+with its token, lets them claim and complete independently, then moves
+on when `next_work` says the next stage is unlocked. Not across stages —
+a locked stage refuses the claim anyway. Not for two modules that own
+the same file, whatever the plan says.
+
+The rule that replaced the gate lives in `Store::mint_worker`, inside
+the transaction, like every other invariant here: a worker's key may
+mint only for a module whose feature it holds a live claim in. So
+authority comes from having been dispatched, and it lapses on its own
+when the box completes its last module — nothing revokes it. A manager
+is unrestricted, because dispatching into a feature it holds no claim in
+IS the manager's job.
+
+**The two properties the gate protected are still enforced, and neither
+ever depended on the list.** Delegation is one level deep because
+`Store::mint_worker` refuses a minter with `is_delegated()`, and a
+resolved delegation is forced to WORKER whatever key carried it. A
+worker still cannot hand itself work, because it cannot reach a feature
+it was never dispatched to. `issue_worker_key` stays manager-only: it
+mints a standing credential rather than a scoped expiring one, and
+dispatch is the manager's act.
+
 **Delegation is the same-machine mechanism; a box that is not this
 machine gets a key.** `issue_worker_key` is the manager-only tool for
 that, and it exists because boxes sharing one key are one identity the

@@ -85,20 +85,43 @@ impl KeyRole {
 /// finished — the gate the whole system exists to enforce would then
 /// only bind agents that chose to respect it.
 ///
-/// `mint_worker` is here for a second reason as well: a delegated
-/// identity is gated as a worker whatever key carried it, so listing
-/// the tool here is what makes delegation exactly one level deep.
+/// `mint_worker` is deliberately NOT here, and was until 2026-09-04.
+/// It came off because a flat gate made the fleet's own design
+/// impossible: a cloud branch box holds a WORKER key by construction,
+/// so "stages sequential on the box, modules concurrent as subagents"
+/// could never once happen — every box worked its whole feature one
+/// module at a time. Measured across two live boxes: zero subagents,
+/// ever, and an 8-vCPU instance averaging under 15% CPU because of it.
 ///
-/// `issue_worker_key` is the heaviest thing on this list — it mints a
-/// standing credential rather than a scoped, expiring one — and it is
-/// gated the same way for the same reason: dispatch is the manager's
-/// act, and a fleet box is a thing a manager dispatches to.
+/// The two properties that gate protected are both still enforced, and
+/// neither ever depended on this list:
+///
+/// - **Delegation stays exactly one level deep.** `Store::mint_worker`
+///   refuses a minter with `is_delegated()`, in the store, before it
+///   opens a transaction. A resolved delegation is forced to WORKER
+///   whatever key carried it, so that check — not this list — is what
+///   stops a subagent minting its own subagent.
+/// - **A worker still cannot hand itself work.** It may now mint, but
+///   only for a module in a feature it ALREADY holds a live claim in;
+///   see the check in `Store::mint_worker`. It cannot reach a feature
+///   it was never dispatched to, which is the thing this list exists
+///   to prevent.
+///
+/// The rule moved into the store because it is now conditional, and a
+/// conditional rule cannot live in a role gate that only sees a tool
+/// name — the same reason every other invariant here sits inside the
+/// transaction it guards.
+///
+/// `issue_worker_key` stays. It is the heaviest thing on this list — a
+/// standing credential rather than a scoped, expiring one — and the
+/// reasoning that took `mint_worker` off does not reach it: dispatch is
+/// the manager's act, and a fleet box is a thing a manager dispatches
+/// to.
 pub const MANAGER_ONLY: &[&str] = &[
     "plan_feature",
     "revise_plan",
     "complete_feature",
     "promote_wants",
-    "mint_worker",
     "issue_worker_key",
 ];
 
@@ -425,6 +448,12 @@ mod tests {
         for tool in ["claim_module", "complete_task", "complete_module", "report_blocker"] {
             assert!(KeyRole::Worker.may_call(tool));
         }
+        // mint_worker is NOT on the list: a box holds a worker key and
+        // must be able to fan its stage out. What stops it minting into
+        // somebody else's feature is a claim check in the store, not
+        // this gate — see MANAGER_ONLY's doc comment.
+        assert!(KeyRole::Worker.may_call("mint_worker"));
+        assert!(KeyRole::Manager.may_call("mint_worker"));
         // A console key is not an agent at all.
         assert!(!KeyRole::Console.may_call("claim_module"));
         assert!(!KeyRole::Console.is_agent());

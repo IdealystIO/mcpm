@@ -3064,6 +3064,60 @@ impl Store {
         let module_name: String = row.get("module_name");
         let feature_id: String = row.get("feature_id");
         let status: String = row.get("status");
+
+        // A WORKER MAY MINT, BUT ONLY INSIDE WORK IT ALREADY HOLDS.
+        //
+        // This is the rule that replaced mint_worker's place on
+        // MANAGER_ONLY (see that list's doc comment). A cloud branch box
+        // holds a worker key, and the fleet's design has it fan a stage
+        // out to one subagent per module — which a flat gate made
+        // impossible, so it had never once happened.
+        //
+        // The narrowing is the feature, not the module: a box mints for
+        // a SIBLING module it does not hold, which is the whole point,
+        // but only while it holds a live claim somewhere in that
+        // feature. So authority comes from having been dispatched, and
+        // it lapses on its own when the box completes its last module —
+        // nothing has to revoke it.
+        //
+        // Inside the transaction, after `FOR UPDATE OF m` above, for the
+        // usual reason: a claim released between a check and the insert
+        // would otherwise mint a token for work the minter no longer
+        // owns.
+        //
+        // A manager is unrestricted — dispatching into a feature it has
+        // no claim in IS the manager's job. An unauthenticated stdio
+        // session has no key and no role anywhere, and is not narrowed
+        // here either; that surface is trusted by being local.
+        if let Some(id) = key_id {
+            if minter_key_role(&mut tx, id).await? == Some(KeyRole::Worker) {
+                let held: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM modules m JOIN stages s ON s.id = m.stage_id
+                     WHERE s.feature_id = $1 AND m.claimed_by = $2
+                       AND m.status IN ('in_progress', 'blocked')",
+                )
+                .bind(&feature_id)
+                .bind(&minter.name)
+                .fetch_one(&mut *tx)
+                .await?;
+                if held == 0 {
+                    return Err(McpmError::new(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "A worker may only mint inside a feature it holds a claim in,                              and '{}' holds none in this one.",
+                            minter.name
+                        ),
+                        json!({
+                            "agent": minter.name,
+                            "module_id": module_id,
+                            "feature_id": feature_id,
+                        }),
+                        "Claim your own module in this feature first, then mint for the                          siblings you want to run beside it. If you were never dispatched                          to this feature, this is not your work to split — ask your                          manager.",
+                    ));
+                }
+            }
+        }
+
         if status == "done" {
             return Err(McpmError::new(
                 ErrorCode::AlreadyDone,
@@ -3385,6 +3439,31 @@ fn require_claim(
 /// mistake its manager made minutes earlier. Takes the transaction
 /// rather than the pool, so the key it approves is the key the row is
 /// written against.
+/// The role of the key a call arrived on, read inside the caller's
+/// transaction. `None` when the id resolves to nothing — a key revoked
+/// mid-call, which the caller treats as "not a worker" and therefore
+/// unrestricted, because a revoked key cannot have got this far: the
+/// transport resolved it moments earlier. Narrowing on it here would
+/// swap a clear auth failure for a confusing claim error.
+///
+/// Deliberately NOT taken from the transport as an argument. The role
+/// is a property of the credential, and re-reading it here keeps the
+/// rule and the fact it depends on inside one transaction — the same
+/// reason `verify_mint_target` below re-reads its target.
+async fn minter_key_role(tx: &mut Tx<'_>, key_id: &str) -> Result<Option<KeyRole>> {
+    let row = sqlx::query("SELECT role FROM api_keys WHERE id = $1 AND revoked_at IS NULL")
+        .bind(key_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(
+            KeyRole::parse(r.get::<String, _>("role").as_str())
+                .ok_or_else(|| McpmError::internal("api_keys.role holds an unknown role"))?,
+        )),
+    }
+}
+
 async fn verify_mint_target(tx: &mut Tx<'_>, target: &str) -> Result<String> {
     let row = sqlx::query("SELECT role, revoked_at FROM api_keys WHERE id = $1 FOR SHARE")
         .bind(target)

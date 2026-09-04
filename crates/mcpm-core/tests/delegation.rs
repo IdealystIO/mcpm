@@ -340,10 +340,77 @@ async fn a_delegated_identity_cannot_mint() {
             .expect_err("a delegated identity cannot re-mint");
         assert_eq!(err.code, ErrorCode::Forbidden);
 
-        // The role gate says the same thing on the transports that have
-        // one, so the two cannot disagree.
-        assert!(!KeyRole::Worker.may_call("mint_worker"));
+        // The one-level-deep property is the STORE's, not the role
+        // gate's — mint_worker came off MANAGER_ONLY on 2026-09-04 so a
+        // box could fan its stage out, and this test is what proves
+        // that did not buy depth along with it.
+        assert!(KeyRole::Worker.may_call("mint_worker"));
         assert!(KeyRole::Manager.may_call("mint_worker"));
+    })
+    .await;
+}
+
+/// A worker key may mint, but only inside a feature it already holds a
+/// claim in. That is the whole of what replaced mint_worker's place on
+/// MANAGER_ONLY: a box fans its own stage out, and still cannot reach
+/// work it was never dispatched to.
+#[tokio::test]
+async fn a_worker_mints_only_inside_a_feature_it_holds() {
+    with_scratch("wkrmint", |store, _url| async move {
+        let (_feature_id, modules) = seed(&store).await;
+        let key = store
+            .issue_key("operator", "Branch box", "boxy", KeyRole::Worker)
+            .await
+            .expect("issue worker key");
+
+        // Holding nothing, it may not mint — not even for a real module.
+        let err = store
+            .mint_worker(
+                &Actor::new("boxy"),
+                Some(&key.info.id),
+                MintRequest {
+                    module_id: &modules[0],
+                    agent_name: "agent.mod.one",
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a claimless worker cannot mint");
+        assert_eq!(err.code, ErrorCode::Forbidden);
+
+        // With a claim in the feature it may mint for a SIBLING module
+        // it does not itself hold — which is the point of the change.
+        store.claim_module("boxy", &modules[0]).await.expect("claim");
+        let minted = store
+            .mint_worker(
+                &Actor::new("boxy"),
+                Some(&key.info.id),
+                MintRequest {
+                    module_id: &modules[1],
+                    agent_name: "agent.mod.two",
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a worker holding a claim mints for its sibling");
+        assert_eq!(minted.module_id, modules[1]);
+
+        // And the token it minted is still a WORKER confined to one
+        // module: the authority it passes on is no wider than its own.
+        let actor = Actor::delegated(&minted.agent_name, &minted.module_id);
+        let err = store
+            .mint_worker(
+                &actor,
+                Some(&key.info.id),
+                MintRequest {
+                    module_id: &modules[0],
+                    agent_name: "agent.sub.sub",
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("still one level deep");
+        assert_eq!(err.code, ErrorCode::Forbidden);
     })
     .await;
 }
