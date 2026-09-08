@@ -20,8 +20,6 @@ pub struct BoardViewProps {
     pub console: Console,
     /// Feature index.
     pub feature: usize,
-    /// Open drawer target, for card highlight.
-    pub selected: Option<(usize, usize)>,
 }
 
 /// The stage-pipeline board for one feature.
@@ -29,7 +27,6 @@ pub struct BoardViewProps {
 pub fn BoardView(props: &BoardViewProps) -> Element {
     let console = props.console;
     let fi = props.feature;
-    let selected = props.selected;
     let count = features()[fi].stages.len();
     // `scroll_view` is single-axis, and the board overflows on both:
     // wide in stages, tall in modules. So the axes are split across two
@@ -45,7 +42,7 @@ pub fn BoardView(props: &BoardViewProps) -> Element {
         scroll_view(horizontal = true, style = BoardScroll()) {
             view(style = LaneRow()) {
                 for si in 0..count {
-                    StageLane(console = console, feature = fi, stage = si, selected = selected)
+                    StageLane(console = console, feature = fi, stage = si)
                     if si + 1 < count {
                         GateMarker(feature = fi, stage = si)
                     }
@@ -64,8 +61,6 @@ pub struct StageLaneProps {
     pub feature: usize,
     /// Stage index.
     pub stage: usize,
-    /// Open drawer target, for card highlight.
-    pub selected: Option<(usize, usize)>,
 }
 
 /// One stage lane on the board.
@@ -84,7 +79,6 @@ pub fn StageLane(props: &StageLaneProps) -> Element {
     let fraction = stage.fraction();
     let concurrency = stage.concurrency_note();
     let module_count = stage.modules.len();
-    let selected = props.selected;
     let lane_arm = match status {
         Status::Running => StageBoxState::Active,
         Status::Blocked | Status::Queued => StageBoxState::Locked,
@@ -118,7 +112,6 @@ pub fn StageLane(props: &StageLaneProps) -> Element {
                         feature = fi,
                         stage = si,
                         module = mi,
-                        selected = selected == Some((si, mi)),
                     )
                 }
             }
@@ -217,6 +210,15 @@ stylesheet! {
                 opacity: 0.85,
             }
         }
+        // A stage unlocking is the single most consequential thing that
+        // happens on this board, and until now it happened between two
+        // frames with nothing to mark it. The lane lifting out of its
+        // locked wash is the announcement.
+        transitions {
+            border_color: 420ms EaseOut,
+            background: 420ms EaseOut,
+            opacity: 420ms EaseOut,
+        }
     }
 }
 
@@ -276,6 +278,13 @@ stylesheet! {
             #[default]
             no(t) { color: t.color.border_strong() }
             yes(t) { color: t.intent.success.fg() }
+        }
+        // The gate's colour is the whole of what it says, so it is
+        // worth a beat. Deliberately NOT a standing pulse: a marker
+        // that breathes forever is noise on a six-stage feature, and it
+        // would be asserting a condition it cannot clear (rule 21).
+        transitions {
+            color: 420ms EaseOut,
         }
     }
 }

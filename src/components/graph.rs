@@ -21,8 +21,6 @@ pub struct GraphViewProps {
     pub console: Console,
     /// Feature index.
     pub feature: usize,
-    /// Open drawer target, for row highlight.
-    pub selected: Option<(usize, usize)>,
 }
 
 /// The dependency-graph view for one feature.
@@ -30,7 +28,6 @@ pub struct GraphViewProps {
 pub fn GraphView(props: &GraphViewProps) -> Element {
     let console = props.console;
     let fi = props.feature;
-    let selected = props.selected;
     let feats = features();
     let f = &feats[fi];
     let agent = f.agent.to_string();
@@ -66,7 +63,6 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                             console = console,
                             feature = fi,
                             stage = si,
-                            selected = selected,
                         )
                     }
                     }
@@ -117,8 +113,6 @@ pub struct GraphStageProps {
     pub feature: usize,
     /// Stage index.
     pub stage: usize,
-    /// Open drawer target.
-    pub selected: Option<(usize, usize)>,
 }
 
 /// One stage node with its module subagent rows.
@@ -142,7 +136,6 @@ pub fn GraphStage(props: &GraphStageProps) -> Element {
     } else {
         StageNodeState::Idle
     };
-    let selected = props.selected;
     ui! {
         view(style = StageNode().state(arm)) {
             Stack(axis = StackAxis::Row, align = StackAlign::Center) {
@@ -162,7 +155,6 @@ pub fn GraphStage(props: &GraphStageProps) -> Element {
                         feature = fi,
                         stage = si,
                         module = mi,
-                        selected = selected == Some((si, mi)),
                     )
                 }
             }

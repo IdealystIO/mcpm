@@ -141,6 +141,11 @@ runtime_core::stylesheet! {
             flex_shrink: 0.0,
             cursor: runtime_core::Cursor::Pointer,
         }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
+        }
         state hovered(t) {
             border_color: t.color.text_muted(),
             background: t.color.surface_alt(),
@@ -248,6 +253,11 @@ runtime_core::stylesheet! {
             align_items: runtime_core::AlignItems::Center,
             justify_content: runtime_core::JustifyContent::Center,
             cursor: runtime_core::Cursor::Pointer,
+        }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
         }
         state hovered(t) {
             background: t.color.surface_alt(),

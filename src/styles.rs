@@ -34,12 +34,23 @@ pub fn status_dot(status: Status) -> DotTone {
     }
 }
 
+// The status dot and the task tick are the two shapes that repeat on
+// every screen, so they are where a change of state is most often
+// SEEN. Both carry a color transition: wherever the node survives the
+// change — a hover, a selection, a tick going green under a poll that
+// only touched one card — the color moves instead of snapping, and the
+// eye is drawn to the thing that actually changed rather than to the
+// whole list redrawing. Where the subtree IS rebuilt the transition is
+// simply inert, which is why it costs nothing to declare here.
 stylesheet! {
     pub Dot<IdeaThemeRef> {
         base(t) {
             width: 8,
             height: 8,
             border_radius: t.radius.pill(),
+        }
+        transitions {
+            background: 320ms EaseOut,
         }
         variant tone {
             #[default]
@@ -96,6 +107,9 @@ stylesheet! {
             height: 4,
             flex_grow: 1.0,
             border_radius: t.radius.sm(),
+        }
+        transitions {
+            background: 320ms EaseOut,
         }
         variant state {
             #[default]

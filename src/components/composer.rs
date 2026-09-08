@@ -1167,6 +1167,11 @@ stylesheet! {
                 background: t.intent.primary.soft_bg(),
             }
         }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
+        }
         state hovered(t) {
             background: t.intent.primary.soft_bg(),
         }
@@ -1179,6 +1184,11 @@ stylesheet! {
             border_radius: t.radius.pill(),
             cursor: Cursor::Pointer,
             opacity: 1.0,
+        }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
         }
         state hovered(t) {
             opacity: 0.72,

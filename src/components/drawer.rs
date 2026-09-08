@@ -381,12 +381,12 @@ fn panel_motion(
     presence(build)
         .present(present)
         .enter(PresenceAnim::new(
-            PresenceState::rest().translate_x(PANEL_SLIDE_PX),
+            PresenceState::rest().translate_x(PANEL_SLIDE_PX).opacity(0.0),
             crate::app::BACKDROP_IN_MS,
             Easing::EaseOut,
         ))
         .exit(PresenceAnim::new(
-            PresenceState::rest().translate_x(PANEL_SLIDE_PX),
+            PresenceState::rest().translate_x(PANEL_SLIDE_PX).opacity(0.0),
             crate::app::BACKDROP_OUT_MS,
             Easing::EaseIn,
         ))
@@ -623,6 +623,11 @@ stylesheet! {
             border_radius: t.radius.sm(),
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
+        }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
         }
         state hovered(t) {
             background: t.color.surface_alt(),

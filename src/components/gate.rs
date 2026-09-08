@@ -82,31 +82,6 @@ pub fn KeyGate(props: &KeyGateProps) -> Element {
         },
     );
 
-    // The way back out. Only while the host is still answering us: when
-    // it has refused the console there is nothing behind this screen to
-    // return to, and a Cancel that led to an empty board would be a
-    // worse dead end than no Cancel at all.
-    //
-    // Without this, opening the screen from the header with no key set
-    // trapped the reader — the only other control is disabled until
-    // they type something, so there was no way to change their mind.
-    let cancel = switch(
-        move || console.denied.get(),
-        move |denied: &bool| {
-            if *denied {
-                return ui! { view {} };
-            }
-            let on_cancel: Rc<dyn Fn()> = Rc::new(move || console.dismiss_key());
-            ui! {
-                Button(
-                    label = "Cancel",
-                    on_click = on_cancel,
-                    variant = variant::Ghost,
-                )
-            }
-        },
-    );
-
     ui! {
         view(style = GateBox()) {
             view(style = GateCard()) {
@@ -128,7 +103,6 @@ pub fn KeyGate(props: &KeyGateProps) -> Element {
                 view(style = ActionRow()) {
                     clear
                     Spacer()
-                    cancel
                     Button(
                         label = "Use this key",
                         on_click = save,

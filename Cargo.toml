@@ -58,6 +58,11 @@ dev-server = { version = "1.5.2", registry = "idealyst", optional = true }
 # than re-implementing chrome on bare primitives.
 idea-ui = { version = "1.5.2", registry = "idealyst" }
 idea-theme = { version = "1.5.2", registry = "idealyst" }
+# Navigation CHROME only — `AppShell` is what makes the left nav a
+# pinned sidebar on a wide viewport and an overlay drawer on a narrow
+# one. It does not navigate: the console's destinations still live on
+# `Console::pane`.
+idea-ui-nav = { version = "1.5.2", registry = "idealyst" }
 # Live data: the console calls the `api` crate's #[server] fns (RPC
 # stubs on this side; mcpm-web hosts the bodies) via the server SDK.
 api = { path = "crates/api" }

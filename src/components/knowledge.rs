@@ -1195,6 +1195,11 @@ stylesheet! {
             border_radius: t.radius.sm(),
             cursor: runtime_core::Cursor::Pointer,
         }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
+        }
         state hovered(t) {
             background: t.color.surface_alt(),
         }

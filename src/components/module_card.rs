@@ -24,8 +24,34 @@ pub struct ModuleCardProps {
     pub stage: usize,
     /// Module index within the stage.
     pub module: usize,
-    /// Whether this module's drawer is open (selection highlight).
-    pub selected: bool,
+}
+
+/// The card's pressable shell, shared by the board card and the graph
+/// row.
+///
+/// The style is a CLOSURE and not a value: selecting a module writes
+/// `Console::selected`, and reading it here means the highlight lands
+/// on this one node instead of rebuilding the board that contains it.
+/// That is what lets the border transition play at all — a rebuilt node
+/// has no previous colour to move from — and it is why the pane's
+/// `switch` no longer keys on the selection.
+fn module_pressable(
+    console: Console,
+    si: usize,
+    mi: usize,
+    status: Status,
+    inner: Element,
+) -> Element {
+    let selection = console.selected;
+    let dim = matches!(status, Status::Blocked | Status::Queued);
+    pressable(vec![inner], move || console.open_module(si, mi))
+        .with_style(move || {
+            let arm = accent_arm(status, selection.get() == Some((si, mi)));
+            StyleApplication::new(module_box_style())
+                .with("accent", arm.to_string())
+                .with("dim", if dim { "yes" } else { "no" }.to_string())
+        })
+        .into_element()
 }
 
 /// Accent arm for a module surface, from status + selection.
@@ -83,15 +109,7 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
         }
     };
 
-    let arm = accent_arm(status, props.selected);
-    let dim = matches!(status, Status::Blocked | Status::Queued);
-    pressable(vec![inner], move || console.open_module(si, mi))
-        .with_style(
-            StyleApplication::new(module_box_style())
-                .with("accent", arm.to_string())
-                .with("dim", if dim { "yes" } else { "no" }.to_string()),
-        )
-        .into_element()
+    module_pressable(console, si, mi, status, inner)
 }
 
 /// Props for [`ModuleRow`] — same shape as [`ModuleCardProps`], its own
@@ -106,8 +124,6 @@ pub struct ModuleRowProps {
     pub stage: usize,
     /// Module index within the stage.
     pub module: usize,
-    /// Whether this module's drawer is open (selection highlight).
-    pub selected: bool,
 }
 
 /// The compact dependency-graph row for one module.
@@ -131,15 +147,7 @@ pub fn ModuleRow(props: &ModuleRowProps) -> Element {
         }
     };
 
-    let arm = accent_arm(status, props.selected);
-    let dim = matches!(status, Status::Blocked | Status::Queued);
-    pressable(vec![inner], move || console.open_module(si, mi))
-        .with_style(
-            StyleApplication::new(module_box_style())
-                .with("accent", arm.to_string())
-                .with("dim", if dim { "yes" } else { "no" }.to_string()),
-        )
-        .into_element()
+    module_pressable(console, si, mi, status, inner)
 }
 
 stylesheet! {
@@ -160,6 +168,10 @@ stylesheet! {
             #[default]
             no(t) { opacity: 1.0 }
             yes(t) { opacity: 0.72 }
+        }
+        transitions {
+            border_color: 260ms EaseOut,
+            opacity: 260ms EaseOut,
         }
         state hovered(t) {
             border_color: t.color.border_strong(),

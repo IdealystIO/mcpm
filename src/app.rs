@@ -4,8 +4,9 @@
 //! store the MCP tools write) and re-renders whenever the data changes.
 
 use idea_ui::{dark_theme, install_idea_theme_reactive, light_theme, IdeaThemeRef};
-use runtime_core::{presence, raf_loop_scoped, spawn_then, stylesheet, switch, ui, Easing,
-    Element, FlexDirection, IntoElement, Position, PresenceAnim};
+use idea_ui_nav::AppShell;
+use runtime_core::{presence, raf_loop_scoped, spawn_then, stylesheet, switch, ui, Breakpoint,
+    Easing, Element, FlexDirection, IntoElement, Position, PresenceAnim};
 
 use crate::components::drawer::{Drawer, WantDrawer};
 use crate::components::gate::KeyGate;
@@ -45,6 +46,11 @@ const POLL_MICROS: u64 = 30_000_000;
 pub const BACKDROP_IN_MS: u32 = 180;
 /// Backdrop fade-out.
 pub const BACKDROP_OUT_MS: u32 = 140;
+
+/// The nav's width, in px. Owned here because `AppShell` bakes it into
+/// its panel and content-offset sheets — the rail reads the same
+/// constant rather than declaring a second one that could drift.
+pub const NAV_WIDTH: f32 = 232.0;
 
 pub fn app() -> Element {
     let console = use_console_live();
@@ -116,16 +122,31 @@ pub fn app() -> Element {
     // refusing us there is no data behind it to show, and a rail of
     // empty cards next to a "give me a key" card would only suggest
     // there is something to go back to.
+    //
+    // Refusal is the ONLY thing that reaches it. Changing a key while
+    // the host is still answering is a one-field edit and happens in
+    // the masthead's popover — see `Console::show_key`.
     let body = switch(
         move || (console.pane.get(), console.denied.get()),
         move |state: &(String, bool)| {
-            let (pane, denied) = state.clone();
-            if denied || pane == "key" {
+            let (_pane, denied) = state.clone();
+            if denied {
                 return ui! { KeyGate(console = console) };
             }
+            // `AppShell` is chrome, not navigation: the console's
+            // destinations still live on `Console::pane`. What it
+            // supplies is the one shape this layout had hand-rolled —
+            // the nav pinned in flow on a wide viewport and slid in
+            // over a scrim below `pin_at`, with the panel built ONCE so
+            // crossing the breakpoint never remounts the rail or
+            // restarts anything it had in flight.
             ui! {
-                view(style = BodyRow()) {
-                    Sidebar(console = console)
+                AppShell(
+                    sidebar = vec![ui! { Sidebar(console = console) }],
+                    is_open = console.nav_open,
+                    pin_at = Breakpoint::Lg,
+                    width = NAV_WIDTH,
+                ) {
                     MainPane(console = console)
                 }
             }
@@ -285,16 +306,6 @@ stylesheet! {
             flex_direction: FlexDirection::Column,
             background: t.color.background(),
             overflow: runtime_core::Overflow::Hidden,
-        }
-    }
-}
-
-stylesheet! {
-    pub BodyRow<IdeaThemeRef> {
-        base(t) {
-            flex_grow: 1.0,
-            min_height: 0,
-            flex_direction: FlexDirection::Row,
         }
     }
 }

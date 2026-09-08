@@ -13,6 +13,7 @@ pub mod header;
 pub mod knowledge;
 pub mod main_pane;
 pub mod module_card;
+pub mod overview;
 pub mod sidebar;
 pub mod tree;
 pub mod wants;

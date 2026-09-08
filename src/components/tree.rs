@@ -22,8 +22,6 @@ pub struct TreeViewProps {
     pub feature: usize,
     /// Snapshot of toggled tree keys.
     pub toggled: Vec<String>,
-    /// Open drawer target, for row highlight.
-    pub selected: Option<(usize, usize)>,
 }
 
 /// The hierarchy view for one feature.
@@ -32,7 +30,6 @@ pub fn TreeView(props: &TreeViewProps) -> Element {
     let console = props.console;
     let fi = props.feature;
     let toggled = props.toggled.clone();
-    let selected = props.selected;
     let feats = features();
     let f = &feats[fi];
     let stage_count = f.stages.len();
@@ -71,7 +68,6 @@ pub fn TreeView(props: &TreeViewProps) -> Element {
                     feature = fi,
                     stage = si,
                     toggled = toggled.clone(),
-                    selected = selected,
                 )
             }
         }
@@ -89,8 +85,6 @@ pub struct StageRowsProps {
     pub stage: usize,
     /// Snapshot of toggled tree keys.
     pub toggled: Vec<String>,
-    /// Open drawer target.
-    pub selected: Option<(usize, usize)>,
 }
 
 /// One stage's row plus (when open) its module subtrees.
@@ -105,7 +99,6 @@ pub fn StageRows(props: &StageRowsProps) -> Element {
     let open = !Console::is_toggled(&props.toggled, &key);
     let module_count = stage.modules.len();
     let toggled = props.toggled.clone();
-    let selected = props.selected;
 
     ui! {
         view(style = TreeGroup()) {
@@ -130,7 +123,6 @@ pub fn StageRows(props: &StageRowsProps) -> Element {
                         stage = si,
                         module = mi,
                         toggled = toggled.clone(),
-                        selected = selected,
                     )
                 }
             }
@@ -151,8 +143,6 @@ pub struct ModuleRowsProps {
     pub module: usize,
     /// Snapshot of toggled tree keys.
     pub toggled: Vec<String>,
-    /// Open drawer target.
-    pub selected: Option<(usize, usize)>,
 }
 
 /// One module's row plus (when open) its task rows.
@@ -189,9 +179,7 @@ pub fn ModuleRows(props: &ModuleRowsProps) -> Element {
                 tag = if m.status == Status::Violation { "rejected" } else { "" }.to_string(),
                 tag_status = Status::Violation,
                 toggle_key = key,
-                open_stage = si as i32,
-                open_module = mi as i32,
-                selected = props.selected == Some((si, mi)),
+                target = Some((si, mi)),
             )
             if open {
                 for (label, done, added) in tasks {
@@ -233,8 +221,6 @@ pub struct TreeRowProps {
     pub weight: usize,
     /// Strike the label (done tasks).
     pub strike: bool,
-    /// Highlight as the drawer's module.
-    pub selected: bool,
     /// Header row (project) gets the alt background.
     pub head: bool,
     /// Task fraction for the trailing bar; negative = no bar.
@@ -247,10 +233,16 @@ pub struct TreeRowProps {
     pub tag_status: Status,
     /// Tree key to toggle on press; empty = not toggleable.
     pub toggle_key: String,
-    /// Drawer stage index to open on press; negative = none.
-    pub open_stage: i32,
-    /// Drawer module index to open on press; negative = none.
-    pub open_module: i32,
+    /// The module this row stands for, as `(stage, module)`: what
+    /// pressing it opens, and what decides whether it draws as the
+    /// selected row.
+    ///
+    /// An `Option` and not the pair of `i32` sentinels it replaced:
+    /// those defaulted to `(0, 0)` rather than to the documented
+    /// "negative = none", so every row that did not set them named
+    /// module `(0, 0)` — harmless only because such rows were also
+    /// unclickable.
+    pub target: Option<(usize, usize)>,
 }
 
 /// One row of the hierarchy view.
@@ -314,32 +306,38 @@ pub fn TreeRow(props: &TreeRowProps) -> Element {
     };
 
     let toggle_key = props.toggle_key.clone();
-    let (os, om) = (props.open_stage, props.open_module);
+    let target = props.target;
+    let head = props.head;
     let clickable = !toggle_key.is_empty();
-    let arm = if props.head {
-        "head"
-    } else if props.selected {
-        "selected"
-    } else {
-        "plain"
+    // Reactive, so selecting a module repaints THIS row rather than
+    // rebuilding the tree around it — which is also what gives the
+    // highlight a previous colour to move from.
+    let selection = console.selected;
+    let arm = move || {
+        if head {
+            "head"
+        } else if target.is_some() && selection.get() == target {
+            "selected"
+        } else {
+            "plain"
+        }
     };
     if clickable {
         pressable(vec![inner], move || {
             console.toggle(&toggle_key);
-            if os >= 0 && om >= 0 {
-                console.open_module(os as usize, om as usize);
+            if let Some((si, mi)) = target {
+                console.open_module(si, mi);
             }
         })
-        .with_style(StyleApplication::new(tree_row_box_style()).with("bg", arm.to_string()))
+        .with_style(move || {
+            StyleApplication::new(tree_row_box_style()).with("bg", arm().to_string())
+        })
         .into_element()
     } else {
-        let style = TreeRowBox().bg(match arm {
-            "head" => TreeRowBoxBg::Head,
-            "selected" => TreeRowBoxBg::Selected,
-            _ => TreeRowBoxBg::Plain,
-        });
         ui! {
-            view(style = style) { inner }
+            view(style = move || {
+                StyleApplication::new(tree_row_box_style()).with("bg", arm().to_string())
+            }) { inner }
         }
     }
 }
@@ -406,6 +404,11 @@ stylesheet! {
             plain(t) { background: t.color.surface() }
             head(t) { background: t.color.surface_alt() }
             selected(t) { background: t.intent.primary.soft_bg() }
+        }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
         }
         state hovered(t) {
             background: t.color.surface_alt(),

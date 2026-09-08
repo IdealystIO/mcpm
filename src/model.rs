@@ -77,6 +77,10 @@ pub struct Stage {
 }
 
 pub struct EventItem {
+    /// Ledger sequence. The only orderable key an event carries — the
+    /// `time` string is a clock reading, so merging two features' feeds
+    /// on it would interleave them wrong across a day boundary.
+    pub seq: i64,
     pub time: String,
     pub kind: String,
     pub status: Status,
@@ -344,6 +348,115 @@ pub fn rail_features(selected: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Where an [`Attention`] row goes when it is opened.
+pub enum AttentionTarget {
+    /// A module drawer: `(feature, stage, module)`.
+    Module(usize, usize, usize),
+    /// The want pool screen.
+    Pool,
+}
+
+/// One row on the overview's attention list.
+///
+/// Every entry is a **current condition** — a claim still bouncing off
+/// a gate, a module still waiting on its manager, ideas still
+/// uncomposed — never the memory of one that has since cleared
+/// (UX_GUIDELINES rule 21). That is why each is derived from the
+/// module's own status rather than from the newest event of some kind:
+/// the row disappears by itself the moment the work moves.
+pub struct Attention {
+    /// Short kind word for the row's pill.
+    pub kind: &'static str,
+    /// Status whose tone colors the row.
+    pub status: Status,
+    /// What is stuck, in one line.
+    pub title: String,
+    /// Where it is stuck — the feature's name, or the pool's.
+    pub place: String,
+    /// What opening the row goes to.
+    pub target: AttentionTarget,
+}
+
+/// Everything across the project that has stopped and is waiting on a
+/// person, worst first: rejected claims, then blocked modules, then the
+/// uncomposed pool.
+///
+/// Ordered by how much it costs to leave alone. A rejected claim is an
+/// agent that tried and was refused — it is not coming back on its own.
+/// A blocked module has already escalated. Loose wants are only ever
+/// the tail: nothing is stalled on them.
+pub fn attention() -> Vec<Attention> {
+    let feats = features();
+    let mut rejected = Vec::new();
+    let mut blocked = Vec::new();
+    for (fi, f) in feats.iter().enumerate() {
+        for (si, stage) in f.stages.iter().enumerate() {
+            for (mi, m) in stage.modules.iter().enumerate() {
+                let row = |kind, status, title| Attention {
+                    kind,
+                    status,
+                    title,
+                    place: f.name.clone(),
+                    target: AttentionTarget::Module(fi, si, mi),
+                };
+                match m.status {
+                    Status::Violation => rejected.push(row(
+                        "gate",
+                        Status::Violation,
+                        format!("Claim on {} denied — {} is locked", m.name, stage.name),
+                    )),
+                    Status::Blocked => blocked.push(row(
+                        "blocked",
+                        Status::Blocked,
+                        format!("{} is blocked, waiting on the manager", m.name),
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+    rejected.append(&mut blocked);
+    let loose = want_counts().0;
+    if loose > 0 {
+        rejected.push(Attention {
+            kind: "triage",
+            status: Status::Planning,
+            title: format!("{loose} loose ideas have never been composed or declined"),
+            place: "Want pool".to_string(),
+            target: AttentionTarget::Pool,
+        });
+    }
+    rejected
+}
+
+/// The features still being worked, as indices into [`features`].
+pub fn in_play() -> Vec<usize> {
+    features()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.status != Status::Done)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The project-wide ledger: the newest events from every feature at
+/// once, as `(feature index, event index)` pairs.
+///
+/// Merged on `seq` and not on the displayed time, because the time is a
+/// clock reading — two features' feeds interleaved on it come out in
+/// the wrong order the moment the project has run past midnight.
+pub fn recent_events(limit: usize) -> Vec<(usize, usize)> {
+    let feats = features();
+    let mut all: Vec<(usize, usize, i64)> = feats
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, f)| f.events.iter().enumerate().map(move |(ei, e)| (fi, ei, e.seq)))
+        .collect();
+    all.sort_by(|a, b| b.2.cmp(&a.2));
+    all.truncate(limit);
+    all.into_iter().map(|(fi, ei, _)| (fi, ei)).collect()
+}
+
 /// The first feature still in play, for the console to land on.
 ///
 /// Without this the console opens on index 0, which on a mature project
@@ -522,6 +635,7 @@ fn map_feature(f: &api::FeatureDto) -> Feature {
             .map(|e| {
                 let (kind, status) = event_display(&e.kind);
                 EventItem {
+                    seq: e.seq,
                     time: e.time.clone(),
                     kind: kind.to_string(),
                     status,

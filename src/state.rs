@@ -11,9 +11,17 @@ use runtime_core::{signal, Signal};
 /// Copy-able handle set for the console's interactive state.
 #[derive(Clone, Copy)]
 pub struct Console {
-    /// Which top-level pane is showing: "feature" (the selected
-    /// feature's board) or "wants" (the project-wide idea pool).
+    /// Which top-level pane is showing: "overview" (the project home),
+    /// "feature" (the selected feature's board), "features", "wants",
+    /// "knowledge", or "key".
     pub pane: Signal<String>,
+    /// Whether the left nav is showing as a drawer.
+    ///
+    /// Only meaningful BELOW `AppShell`'s pin breakpoint: at desktop
+    /// widths the nav is pinned in flow and this is ignored, which is
+    /// why it defaults to closed — the first thing a phone should show
+    /// is the work, not the menu.
+    pub nav_open: Signal<bool>,
     /// Index into [`crate::model::features`] of the selected feature.
     pub feature: Signal<usize>,
     /// Active main-pane view tab id: "board" | "tree" | "feed" | "graph".
@@ -61,6 +69,15 @@ pub struct Console {
     /// one failure, so the gate screen disappears on its own the moment
     /// a good key lands.
     pub denied: Signal<bool>,
+    /// Whether the masthead's key popover is open. On `Console` and
+    /// not inside the component so a snapshot landing mid-paste cannot
+    /// close it — the same reason its draft lives here.
+    pub key_open: Signal<bool>,
+    /// Whether the feature switcher's popover is open. Also here, for
+    /// the same reason: the feature header rebuilds on every poll.
+    pub switcher_open: Signal<bool>,
+    /// The feature switcher's search buffer.
+    pub switcher_query: Signal<String>,
     /// The key-entry field's buffer. Lives here rather than in the gate
     /// component so a poll landing mid-paste cannot rebuild the input
     /// under the cursor — the same reason the capture composer's
@@ -141,7 +158,8 @@ pub fn use_console_live() -> Console {
 /// reactive scope.
 pub fn use_console() -> Console {
     Console {
-        pane: signal("feature".to_string()),
+        pane: signal("overview".to_string()),
+        nav_open: signal(false),
         feature: signal(0),
         view: signal("board".to_string()),
         selected: signal(None),
@@ -158,6 +176,9 @@ pub fn use_console() -> Console {
         pool_page: signal(0),
         api_key: signal(String::new()),
         denied: signal(false),
+        key_open: signal(false),
+        switcher_open: signal(false),
+        switcher_query: signal(String::new()),
         key_draft: signal(String::new()),
         feature_query: signal(String::new()),
         feature_status: signal("all".to_string()),
@@ -186,26 +207,63 @@ impl Default for Console {
 }
 
 impl Console {
+    /// Show the project home.
+    pub fn show_overview(&self) {
+        self.pane.set("overview".to_string());
+        self.close_drawer();
+    }
+
+    /// Open or close the nav drawer.
+    pub fn toggle_nav(&self) {
+        self.nav_open.update(|open| !open);
+    }
+
+    /// Open one module's drawer from anywhere in the console, including
+    /// a feature other than the selected one.
+    ///
+    /// The attention list on the home screen points across the whole
+    /// project, so following a row has to move the selection as well as
+    /// the drawer — `open_module` alone would open the drawer onto a
+    /// coordinate in a feature the reader is not looking at.
+    pub fn open_module_in(&self, feature: usize, stage: usize, module: usize) {
+        self.pane.set("feature".to_string());
+        self.feature.set(feature);
+        self.view.set("board".to_string());
+        self.open_module(stage, module);
+    }
+
     /// Select a feature in the sidebar (closes any open drawer).
     pub fn select_feature(&self, index: usize) {
         self.pane.set("feature".to_string());
         self.feature.set(index);
+        self.switcher_open.set(false);
         self.close_drawer();
     }
 
-    /// Leave the key screen without changing anything. Only reachable
-    /// while the host is still answering us — a refused console has
-    /// nothing to go back to.
-    pub fn dismiss_key(&self) {
-        self.pane.set("feature".to_string());
+    /// Open or close the feature switcher, clearing whatever was typed
+    /// into it last time — a stale query would hide the list the reader
+    /// just asked to see.
+    pub fn toggle_switcher(&self) {
+        self.switcher_query.set(String::new());
+        self.switcher_open.update(|open| !open);
     }
 
-    /// Show the key screen, seeding the field with the key in use so
+    /// Close the key popover without changing anything.
+    pub fn dismiss_key(&self) {
+        self.key_open.set(false);
+    }
+
+    /// Open the key popover, seeding the field with the key in use so
     /// rotating one is an edit rather than a retype.
+    ///
+    /// A popover and not a screen: changing a key is a one-field edit,
+    /// and replacing the whole body for it threw away whatever the
+    /// reader was looking at. The full-screen [`crate::components::gate::KeyGate`]
+    /// is still what a REFUSED console shows — there the body behind it
+    /// genuinely has nothing in it.
     pub fn show_key(&self) {
         self.key_draft.set(self.api_key.get());
-        self.pane.set("key".to_string());
-        self.close_drawer();
+        self.key_open.update(|open| !open);
     }
 
     /// Adopt the typed key and leave the gate. The poll picks it up on
@@ -214,7 +272,7 @@ impl Console {
     /// would then look accepted until the next failure.
     pub fn save_key(&self, key: String) {
         self.api_key.set(key.trim().to_string());
-        self.pane.set("feature".to_string());
+        self.key_open.set(false);
     }
 
     /// Show the want pool.

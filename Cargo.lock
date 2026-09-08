@@ -556,6 +556,7 @@ dependencies = [
  "host-mock",
  "idea-theme",
  "idea-ui",
+ "idea-ui-nav",
  "idealyst",
  "runtime-core",
  "runtime-scene",
@@ -1560,6 +1561,18 @@ dependencies = [
  "runtime-core",
  "runtime-vocabulary",
  "table",
+]
+
+[[package]]
+name = "idea-ui-nav"
+version = "1.5.2"
+source = "sparse+https://crates.idealyst.io/index/"
+checksum = "24c93cc172cdeb9e0f8812ddedbcaa78f26c7b7b2db37b03f2c6f45b9aeb62a5"
+dependencies = [
+ "idea-theme",
+ "idea-ui",
+ "runtime-core",
+ "runtime-vocabulary",
 ]
 
 [[package]]
