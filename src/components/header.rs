@@ -380,6 +380,10 @@ stylesheet! {
     pub HeaderBar<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
+            // The masthead is chrome: it sizes to its content and never
+            // pays for a taller body. Without this a pane that overflows
+            // the page column shrinks the header instead of scrolling.
+            flex_shrink: 0.0,
             align_items: AlignItems::Center,
             justify_content: JustifyContent::SpaceBetween,
             gap: t.spacing.xl(),

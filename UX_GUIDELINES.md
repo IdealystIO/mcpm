@@ -427,3 +427,44 @@ anywhere.
   editing layer on a measured one — a placeholder taller than the
   resting box that scrolls itself half out of view. Let it rest at its
   natural height and grow with what is typed.
+
+### 27. A parent must declare itself a flex container before its children can grow
+
+`flex_grow`, `flex_basis`, `flex_shrink`, `align_self` and `min_height`
+are flex **item** properties: they describe how a node behaves *inside*
+a flex container, and they do nothing to make its parent one. A node
+becomes a container only when its own rules carry a flex **container**
+property — `flex_direction`, `gap`, `justify_content`, `align_items`,
+`align_content`, `flex_wrap`. There is no ambient default to fall back
+on: the web backend used to stamp every node with a
+`display: flex; flex-direction: column` baseline and dropped it for
+per-node layout cost, so flex is now decided per node, from its own
+rules, at CSS-emit time.
+
+The failure is silent and it is always the same shape. A `flex_grow: 1.0`
+column under a parent that never became a flex container sizes to its
+**content** instead of to the space it was given. Nothing overflows,
+because the box simply got taller — so the `scroll_view` inside it never
+clamps, never shows a bar, and never scrolls. It compiles, it lints, it
+passes a mount test, and it looks correct until the data is taller than
+the window.
+
+- **Every ancestor between the viewport and a `scroll_view` must be a
+  flex container**, not just the ones you wrote. Check the whole chain —
+  a wrapper from a component library counts, and it may only have solved
+  this for the half of itself that its own tests cover.
+- **Where a chain crosses into a component you do not own, put a frame
+  of your own on your side of the boundary.** You cannot style someone
+  else's root, and a percentage height they set resolves against
+  whatever *you* hand them.
+- **Prefer `flex_basis: 0` to `height: 100%` for a slot that should take
+  the leftover space.** A `height: 100%` sibling in a column measures
+  against the whole parent rather than against what the other children
+  left, so it overflows by exactly the height of the chrome above it;
+  with the default `flex_basis: auto` the slot's base size is its
+  content, and an over-tall pane gets paid for by shrinking the chrome
+  instead of by scrolling. Pin chrome with `flex_shrink: 0.0` so it can
+  never be the thing that gives.
+
+The tell is a screen that stopped scrolling without anyone touching its
+scroller — look up the tree, not at the `scroll_view`.

@@ -147,7 +147,9 @@ pub fn app() -> Element {
                     pin_at = Breakpoint::Lg,
                     width = NAV_WIDTH,
                 ) {
-                    MainPane(console = console)
+                    view(style = ContentFrame()) {
+                        MainPane(console = console)
+                    }
                 }
             }
         },
@@ -173,7 +175,7 @@ pub fn app() -> Element {
     ui! {
         view(style = PageFrame()) {
             Header(console = console)
-            body
+            view(style = ShellSlot()) { body }
             drawer_host
             want_host
             knowledge_host
@@ -297,6 +299,67 @@ fn start_sync(console: Console, key: String) {
     });
 }
 
+// The two sheets below restore what `BodyRow` used to supply before
+// `AppShell` took over this slot. Both exist for one reason, and it is a
+// reason nothing here reports: the web backend dropped its global
+// `.ui-default { display: flex }` baseline for per-node layout cost, so
+// a node is a flex CONTAINER only when its own rules carry a
+// flex-container property (`flex_direction`, `gap`, `justify_content`,
+// `align_items`, …). `flex_grow`, `flex_basis` and `min_height` are flex
+// ITEM properties and promote nothing. A column of `flex_grow: 1.0`
+// views under a parent that never became `display: flex` therefore
+// sizes to its content instead of to the viewport — every `scroll_view`
+// below it grows to fit its rows rather than clamping, so nothing ever
+// overflows, so nothing ever scrolls. It builds, it lints, and it
+// renders a screen that looks right until the data is taller than the
+// window.
+
+// The shell's slot in the page column.
+//
+// `AppShell`'s own container is `height: 100%`, which resolves against
+// the WHOLE page rather than against what is left under the masthead —
+// so the shell needs a parent that is already the right size. This is
+// that parent: it takes the leftover height as a flex item, and hands
+// the shell a definite height to be 100% of.
+stylesheet! {
+    pub ShellSlot<IdeaThemeRef> {
+        base(_t) {
+            flex_grow: 1.0,
+            // `flex_basis: 0` and not the default `auto`: with `auto`
+            // this slot's base size is its CONTENT, so a pane taller
+            // than the window makes the page column overflow and the
+            // masthead is shrunk to pay for it. At zero the slot is
+            // purely the leftover height, which is the one thing a
+            // scrolling descendant can be measured against.
+            flex_basis: 0,
+            // Lets the scrolling descendants be shorter than their
+            // content — without it nothing scrolls at all (rule 23).
+            min_height: 0,
+            min_width: 0,
+            flex_direction: FlexDirection::Column,
+        }
+    }
+}
+
+// The flex context inside `AppShell`'s content wrapper.
+//
+// That wrapper sets `height: 100%` and `min_height: 0` and no
+// flex-container property, so it is a BLOCK, and `MainPane`'s
+// `flex_grow: 1.0` root is inert inside it. `AppShell` fixed exactly
+// this for its own sidebar panel — see the `flex_direction` on its
+// panel sheet and the regression test beside it — but not for the
+// content half, so the fix has to live on our side of the boundary.
+stylesheet! {
+    pub ContentFrame<IdeaThemeRef> {
+        base(_t) {
+            height: runtime_core::Length::Percent(100.0),
+            min_height: 0,
+            min_width: 0,
+            flex_direction: FlexDirection::Column,
+        }
+    }
+}
+
 stylesheet! {
     pub PageFrame<IdeaThemeRef> {
         base(t) {
@@ -307,5 +370,69 @@ stylesheet! {
             background: t.color.background(),
             overflow: runtime_core::Overflow::Hidden,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use runtime_core::{resolve_style, StyleApplication, Tokenized};
+
+    fn shrink(t: &Option<Tokenized<f32>>) -> Option<f32> {
+        match t {
+            Some(Tokenized::Literal(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    // Rule 27, pinned. A node is a flex CONTAINER only when its own
+    // rules carry a flex-container property — the web backend dropped
+    // its global `display: flex` baseline, and `flex_grow` /
+    // `flex_basis` / `min_height` are flex ITEM properties that promote
+    // nothing. `AppShell` sits between the viewport and every pane, and
+    // NEITHER its container nor its content wrapper declares one, so
+    // these two sheets are the only thing giving `MainPane`'s
+    // `flex_grow: 1.0` root a context to grow in.
+    //
+    // Delete the `flex_direction` from either and every screen silently
+    // stops scrolling: the pane sizes to its content, so nothing
+    // overflows, so no `scroll_view` below it ever clamps. It still
+    // builds, still lints, and still mounts — which is why this is a
+    // test and not a comment.
+    #[test]
+    fn regression_the_scroll_chain_declares_its_flex_containers() {
+        let harness = host_mock::Harness::with_registry(crate::register_scene_extensions);
+        harness.world.enter(|| {
+            idea_ui::install_idea_theme(idea_ui::light_theme());
+            for (name, sheet) in [
+                ("ShellSlot", super::shell_slot_style()),
+                ("ContentFrame", super::content_frame_style()),
+            ] {
+                let rules = resolve_style(&StyleApplication::new(sheet));
+                assert!(
+                    rules.flex_direction.is_some(),
+                    "{name} must declare itself a flex container, or the panes \
+                     below it size to their content and nothing scrolls",
+                );
+                assert!(
+                    rules.min_height.is_some(),
+                    "{name} must let its scrolling descendants shrink below \
+                     their own content (rule 23)",
+                );
+            }
+        });
+    }
+
+    // The masthead is chrome: it sizes to its content and is never the
+    // thing that gives. Without this a pane taller than the page column
+    // is paid for by squeezing the header rather than by scrolling.
+    #[test]
+    fn regression_the_masthead_does_not_pay_for_a_taller_body() {
+        let harness = host_mock::Harness::with_registry(crate::register_scene_extensions);
+        harness.world.enter(|| {
+            idea_ui::install_idea_theme(idea_ui::light_theme());
+            let sheet = crate::components::header::header_bar_style();
+            let rules = resolve_style(&StyleApplication::new(sheet));
+            assert_eq!(shrink(&rules.flex_shrink), Some(0.0), "the masthead must not shrink");
+        });
     }
 }
