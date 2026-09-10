@@ -1,12 +1,13 @@
 //! `control-center` — the MCP Project Console.
 //!
 //! A read-only window onto a single project's agent-driven work:
-//! Features plan into Stages (sequential, gate-enforced), Stages hold
-//! Modules (one worker subagent each, concurrent within a stage), and
-//! Modules carry Task checklists the agents check off over MCP. The
-//! console shows the board, the hierarchy, the event ledger, the
-//! dependency graph, and each module's drawer — including gate
-//! rejections when a subagent starts too early.
+//! Features plan into a GRAPH of Modules (each names the modules it
+//! depends on; the gate opens when every one is done), Modules carry
+//! Task checklists the agents check off over MCP, and both levels
+//! carry a document — the feature's whitepaper, the module's handoff.
+//! The console shows the graph, the whitepaper, the event ledger, and
+//! each module's drawer — including gate rejections when a subagent
+//! starts before its prerequisites are done.
 //!
 //! Built on idea-ui components over an installed light/dark IdeaTheme.
 //! The entry point is `src/main.rs`, one `idealyst::entry!` line whose
@@ -56,6 +57,9 @@ where
     // `InputOps` for table); every backend satisfies all of them, so a
     // new SDK here widens the bound rather than forcing a second seam.
     table::register(registry);
+    // The whitepaper and handoff documents. Its bounds (`StyleServices +
+    // TextOps`) are already inside the union above.
+    markdown::register(registry);
 }
 
 // Android entry: the generated Android wrapper's `attach` mounts

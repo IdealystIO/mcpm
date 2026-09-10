@@ -76,6 +76,10 @@ codeblock = { version = "1.5.2", registry = "idealyst" }
 # at realize. Registering it needs the crate in scope here — a transitive
 # dep is linked but not nameable.
 table = { version = "1.5.2", registry = "idealyst" }
+# The `markdown` SDK renders a feature's whitepaper and a module's
+# handoff. Like `table`, it is a scene-payload extension and needs a
+# handler registered in `register_scene_extensions`.
+markdown = { version = "1.5.2", registry = "idealyst" }
 server = { version = "1.5.2", registry = "idealyst" }
 # Where the console's API key survives a reload. `reactive` gives
 # `persisted_signal`, which hydrates and persists a signal race-correctly
