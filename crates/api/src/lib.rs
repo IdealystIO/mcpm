@@ -39,24 +39,19 @@ pub struct ProjectDto {
 pub struct FeatureDto {
     pub id: String,
     pub name: String,
+    pub description: String,
     /// planning | in_progress | done | shelved
     pub status: String,
     pub created_by: Option<String>,
-    pub stages: Vec<StageDto>,
+    /// Topological order: every module after all of its prerequisites,
+    /// ties by depth then name.
+    pub modules: Vec<ModuleDto>,
+    /// The plan as prose, current revision, when one was written.
+    pub whitepaper: Option<DocumentDto>,
     /// Ascending seq. Pre-formatted for display.
     pub events: Vec<EventDto>,
     /// The wants this feature was composed from, oldest link first.
     pub sources: Vec<WantSourceDto>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StageDto {
-    pub id: String,
-    pub name: String,
-    pub position: i32,
-    /// Derived server-side: locked | unlocked | done
-    pub status: String,
-    pub modules: Vec<ModuleDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,7 +63,34 @@ pub struct ModuleDto {
     pub status: String,
     pub claimed_by: Option<String>,
     pub summary: Option<String>,
+    /// Prerequisite module ids.
+    pub depends_on: Vec<String>,
+    /// Prerequisites not yet done. Empty means the gate is open.
+    pub waiting_on: Vec<String>,
+    /// Path prefixes this module writes to; empty = undeclared.
+    pub owns: Vec<String>,
+    /// Longest path from a root, 1-based. The graph's column.
+    pub depth: i32,
+    /// todo + unclaimed + every prerequisite done.
+    pub dispatchable: bool,
+    /// How to use what this module built, current revision.
+    pub handoff: Option<DocumentDto>,
     pub tasks: Vec<TaskDto>,
+}
+
+/// One current document revision: a feature's whitepaper or a
+/// module's handoff. Markdown in `body`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DocumentDto {
+    pub id: String,
+    /// whitepaper | handoff
+    pub kind: String,
+    pub revision: i32,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    /// "MMM D HH:MM"
+    pub written: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,7 +142,7 @@ pub struct WantDto {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MemoryDto {
     pub id: String,
-    /// project | feature | stage | module | task
+    /// project | feature | module | task
     pub level: String,
     pub subject_id: String,
     /// The node's name — or the project's, at project level.
@@ -413,40 +435,49 @@ pub async fn load_snapshot() -> Result<Snapshot, ServerError> {
             .get_events(Some(&rollup.id), 0, 500)
             .await
             .map_err(fail)?;
+        // Every current document of the feature in one read; the
+        // handoffs are matched to their modules below.
+        let documents = store.feature_documents(&rollup.id).await.map_err(fail)?;
+        let handoff_of = |module_id: &str| -> Option<DocumentDto> {
+            documents
+                .iter()
+                .find(|d| {
+                    d.kind == mcpm_core::DocumentKind::Handoff && d.subject_id == module_id
+                })
+                .map(document_dto)
+        };
         features.push(FeatureDto {
             id: tree.id,
             name: tree.name,
+            description: tree.description,
             status: tree.status,
             created_by: feature_creator(&store, &rollup.id).await,
-            stages: tree
-                .stages
+            whitepaper: tree.whitepaper.as_ref().map(document_dto),
+            modules: tree
+                .modules
                 .into_iter()
-                .map(|s| StageDto {
-                    id: s.id,
-                    name: s.name,
-                    position: s.position,
-                    status: s.status,
-                    modules: s
-                        .modules
+                .map(|m| ModuleDto {
+                    handoff: handoff_of(&m.id),
+                    id: m.id,
+                    name: m.name,
+                    description: m.description,
+                    status: m.status,
+                    claimed_by: m.claimed_by,
+                    summary: m.summary,
+                    depends_on: m.depends_on,
+                    waiting_on: m.waiting_on,
+                    owns: m.owns,
+                    depth: m.depth,
+                    dispatchable: m.dispatchable,
+                    tasks: m
+                        .tasks
                         .into_iter()
-                        .map(|m| ModuleDto {
-                            id: m.id,
-                            name: m.name,
-                            description: m.description,
-                            status: m.status,
-                            claimed_by: m.claimed_by,
-                            summary: m.summary,
-                            tasks: m
-                                .tasks
-                                .into_iter()
-                                .map(|t| TaskDto {
-                                    id: t.id,
-                                    name: t.name,
-                                    status: t.status,
-                                    origin: t.origin,
-                                    note: t.note,
-                                })
-                                .collect(),
+                        .map(|t| TaskDto {
+                            id: t.id,
+                            name: t.name,
+                            status: t.status,
+                            origin: t.origin,
+                            note: t.note,
                         })
                         .collect(),
                 })
@@ -780,6 +811,21 @@ fn fail(e: mcpm_core::McpmError) -> ServerError {
     ServerError::failed(e.to_string())
 }
 
+/// Core document → wire DTO. One mapper, so the whitepaper and the
+/// handoffs cannot disagree about what a revision is.
+#[cfg(feature = "server")]
+fn document_dto(d: &mcpm_core::DocumentView) -> DocumentDto {
+    DocumentDto {
+        id: d.id.clone(),
+        kind: d.kind.as_str().to_string(),
+        revision: d.revision,
+        title: d.title.clone(),
+        body: d.body.clone(),
+        author: d.author.clone(),
+        written: d.created_at.format("%b %-d %H:%M").to_string(),
+    }
+}
+
 #[cfg(feature = "server")]
 async fn feature_creator(store: &mcpm_core::Store, feature_id: &str) -> Option<String> {
     // The feature_planned event's agent is the planning manager.
@@ -800,11 +846,17 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
     let (title, body) = match e.kind.as_str() {
         "feature_planned" => (
             format!(
-                "Feature plan published: {} stages, {} modules",
-                p["stages"].as_u64().unwrap_or(0),
-                p["modules"].as_u64().unwrap_or(0)
+                "Feature plan published: {} modules, {} dependencies",
+                p["modules"].as_u64().unwrap_or(0),
+                // Plans from before the graph carried a stage count and
+                // no edge count; say what the row actually knows.
+                p["edges"].as_u64().unwrap_or(0)
             ),
-            String::new(),
+            if p["whitepaper"].as_bool().unwrap_or(false) {
+                "With a whitepaper.".to_string()
+            } else {
+                String::new()
+            },
         ),
         "plan_revised" => (
             "Plan revised".to_string(),
@@ -818,22 +870,29 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
                 })
                 .unwrap_or_default(),
         ),
-        "module_claimed" => (
-            format!("Module claimed: {}", s("module")),
-            format!("Stage '{}'.", s("stage")),
-        ),
+        "module_claimed" => (format!("Module claimed: {}", s("module")), String::new()),
         "premature_claim" => (
             format!("Start denied for {}", s("module")),
-            // Name the stage that is actually in the way. How the gate
-            // works, and who this event is for, are not the reader's to
-            // hold — they can see the stage order on the board.
-            p["blocking"]
-                .as_array()
-                .and_then(|b| b.first())
-                .and_then(|st| st.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|name| format!("Stage '{name}' is still open."))
-                .unwrap_or_else(|| "An earlier stage is still open.".to_string()),
+            // Name what is actually in the way. How the gate works, and
+            // who this event is for, are not the reader's to hold — they
+            // can see the edges on the graph. (Rows from before the
+            // graph carried stages here; their entries have `name` too.)
+            {
+                let names: Vec<String> = p["blocking"]
+                    .as_array()
+                    .map(|b| {
+                        b.iter()
+                            .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                            .map(|n| format!("'{n}'"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if names.is_empty() {
+                    "A prerequisite is still open.".to_string()
+                } else {
+                    format!("Waiting on {}.", names.join(", "))
+                }
+            },
         ),
         "task_done" => (format!("Task checked off: {}", s("task")), s("note")),
         "task_skipped" => (format!("Task skipped: {}", s("task")), s("note")),
@@ -841,13 +900,26 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
             format!("Worker added a task: {}", s("task")),
             String::new(),
         ),
-        "module_done" => (
-            format!("Module complete: {}", s("module")),
-            format!("Stage '{}'.", s("stage")),
+        "module_done" => (format!("Module complete: {}", s("module")), String::new()),
+        "module_unlocked" => (
+            format!("Ready: {}", s("module")),
+            format!("Released by {}.", s("unlocked_by")),
         ),
+        // History from before the graph.
         "stage_unlocked" => (
             format!("Stage unlocked: {}", s("stage")),
             format!("Opened by {}.", s("unlocked_by")),
+        ),
+        "document_written" => (
+            format!(
+                "{} written for {}",
+                match s("kind").as_str() {
+                    "whitepaper" => "Whitepaper",
+                    _ => "Handoff",
+                },
+                s("subject")
+            ),
+            format!("Revision {}.", p["revision"].as_i64().unwrap_or(1)),
         ),
         "blocker_reported" => (format!("Blocker on {}", s("module")), s("description")),
         "module_released" => (
@@ -856,7 +928,7 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
         ),
         "feature_done" => (
             "Feature closed".to_string(),
-            format!("'{}' completed all stages.", s("name")),
+            format!("'{}' completed every module.", s("name")),
         ),
         "wants_promoted" => (
             format!(
