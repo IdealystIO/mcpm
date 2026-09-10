@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
-    StageLocked,
+    /// A prerequisite the module names is not done. The gate.
+    PrereqsOpen,
     AlreadyClaimed,
     AlreadyDone,
     NotClaimedByYou,
@@ -17,7 +18,7 @@ pub enum ErrorCode {
     /// A state change that loses information needs its reason on the
     /// record: skipping a task, declining a want.
     SkipNeedsReason,
-    StagesIncomplete,
+    ModulesIncomplete,
     PlanConflict,
     PlanInvalid,
     /// A feature already absorbed this want; it cannot be declined or

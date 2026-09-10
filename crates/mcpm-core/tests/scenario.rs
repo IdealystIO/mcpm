@@ -1,9 +1,9 @@
-//! End-to-end replay of the architecture doc's worked scenario (§4):
-//! a feature with three stages — Data modelling → API → Clients (two
-//! modules) — including the premature-claim rejection at the gate, the
-//! double-path record (error to the worker AND event for the manager),
-//! stage unlocks, discovered tasks, blockers, memory search directions,
-//! and the completion guards.
+//! End-to-end replay of the architecture doc's worked scenario (§4) on
+//! the module GRAPH: Schema & store → Report endpoints → {App, MCP
+//! connector} — including the premature-claim rejection at the gate,
+//! the double-path record (error to the worker AND event for the
+//! manager), the per-module unlock, discovered tasks, blockers, memory
+//! search directions, documents, and the completion guards.
 //!
 //! Runs against a real Postgres: set DATABASE_URL (defaults to the
 //! devcontainer database published on host port 55432). Each run
@@ -47,44 +47,37 @@ where
         .expect("drop scratch database");
 }
 
+fn module(name: &str, tasks: &[&str], deps: &[&str]) -> PlanModule {
+    PlanModule {
+        name: name.into(),
+        description: String::new(),
+        tasks: tasks.iter().map(|t| t.to_string()).collect(),
+        depends_on: deps.iter().map(|d| d.to_string()).collect(),
+        owns: vec![],
+    }
+}
+
 fn plan() -> PlanFeature {
     PlanFeature {
         name: "Field reports".into(),
         description: "The worked example from the architecture doc.".into(),
-        stages: vec![
-            PlanStage {
-                name: "Data modelling".into(),
-                modules: vec![PlanModule {
-                    name: "Schema & store".into(),
-                    description: "Tables + migrations".into(),
-                    tasks: vec!["Design tables".into(), "Write migration".into()],
-                }],
-            },
-            PlanStage {
-                name: "API".into(),
-                modules: vec![PlanModule {
-                    name: "Report endpoints".into(),
-                    description: String::new(),
-                    tasks: vec!["CRUD endpoints".into(), "Contract tests".into()],
-                }],
-            },
-            PlanStage {
-                name: "Clients".into(),
-                modules: vec![
-                    PlanModule {
-                        name: "App".into(),
-                        description: String::new(),
-                        tasks: vec!["Report screen".into()],
-                    },
-                    PlanModule {
-                        name: "MCP connector".into(),
-                        description: String::new(),
-                        tasks: vec!["Expose report tool".into()],
-                    },
-                ],
-            },
+        modules: vec![
+            module("Schema & store", &["Design tables", "Write migration"], &[]),
+            module("Report endpoints", &["CRUD endpoints", "Contract tests"], &["Schema & store"]),
+            module("App", &["Report screen"], &["Report endpoints"]),
+            module("MCP connector", &["Expose report tool"], &["Report endpoints"]),
         ],
+        stages: vec![],
+        whitepaper: Some("# Field reports\n\nReports are filed per shift and read by the office.".into()),
     }
+}
+
+fn id_of(tree: &FeatureTree, name: &str) -> String {
+    tree.modules
+        .iter()
+        .find(|m| m.name == name)
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| panic!("module '{name}' in tree"))
 }
 
 #[tokio::test]
@@ -101,42 +94,74 @@ async fn the_worked_scenario() {
         assert!(ctx.features.is_empty());
         let tree = store.plan_feature(manager, plan()).await.unwrap();
         let fid = tree.id.clone();
-        assert_eq!(tree.stages.len(), 3);
-        assert_eq!(tree.stages[0].status, "unlocked");
-        assert_eq!(tree.stages[1].status, "locked");
-        assert_eq!(tree.stages[2].status, "locked");
+        assert_eq!(tree.modules.len(), 4);
+        // Topological order with depths: root first, the two leaves last.
+        let names: Vec<&str> = tree.modules.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["Schema & store", "Report endpoints", "App", "MCP connector"]);
+        let depths: Vec<i32> = tree.modules.iter().map(|m| m.depth).collect();
+        assert_eq!(depths, vec![1, 2, 3, 3]);
+        assert!(tree.modules[0].dispatchable);
+        assert!(!tree.modules[1].dispatchable);
+        assert_eq!(tree.modules[1].waiting_on, vec![tree.modules[0].id.clone()]);
+        assert!(tree.whitepaper.is_some(), "the plan's prose landed as revision 1");
+        assert_eq!(tree.whitepaper.as_ref().unwrap().revision, 1);
 
-        // Empty stages are rejected atomically.
+        // A plan with no modules is rejected atomically; so is a cycle.
         let bad = store
             .plan_feature(
                 manager,
-                PlanFeature {
-                    name: "Bad".into(),
-                    description: String::new(),
-                    stages: vec![PlanStage { name: "Empty".into(), modules: vec![] }],
-                },
+                PlanFeature { name: "Bad".into(), ..Default::default() },
             )
             .await
             .unwrap_err();
         assert_eq!(bad.code, ErrorCode::PlanInvalid);
+        let cyclic = store
+            .plan_feature(
+                manager,
+                PlanFeature {
+                    name: "Cyclic".into(),
+                    modules: vec![module("a", &[], &["b"]), module("b", &[], &["a"])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(cyclic.code, ErrorCode::PlanInvalid);
+        assert!(cyclic.message.contains("cycle"), "{}", cyclic.message);
+        // And an unordered pair of writers on one path.
+        let clash = store
+            .plan_feature(
+                manager,
+                PlanFeature {
+                    name: "Clash".into(),
+                    modules: vec![
+                        PlanModule { owns: vec!["src/store.rs".into()], ..module("a", &[], &[]) },
+                        PlanModule { owns: vec!["src".into()], ..module("b", &[], &[]) },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(clash.code, ErrorCode::PlanInvalid);
+        assert!(clash.message.contains("both own"), "{}", clash.message);
 
-        // ---- next_work: exactly stage 1's module --------------------
+        // ---- next_work: exactly the root ----------------------------
         let work = store.next_work(&fid).await.unwrap();
         assert_eq!(work.dispatchable.len(), 1);
         assert_eq!(work.dispatchable[0].module_name, "Schema & store");
         let m_schema = work.dispatchable[0].module_id.clone();
-        let stage3_modules: Vec<String> = tree.stages[2]
-            .modules
-            .iter()
-            .map(|m| m.id.clone())
-            .collect();
+        let m_api = id_of(&tree, "Report endpoints");
+        let m_app = id_of(&tree, "App");
+        let m_mcp = id_of(&tree, "MCP connector");
 
         // ---- The premature claim (the manager did a bad job) --------
         let eager = "agent.mod.connector";
         store.get_context(eager, "worker").await.unwrap();
-        let err = store.claim_module(eager, &stage3_modules[1]).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::StageLocked);
+        let err = store.claim_module(eager, &m_mcp).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PrereqsOpen);
         assert!(err.hint.contains("manager"), "hint tells the worker to report back");
+        assert!(err.message.contains("Report endpoints"), "names the open prerequisite");
         // The rejection took the second path too: it is on the ledger
         // even though the claim failed.
         let events = store.get_events(Some(&fid), 0, 100).await.unwrap();
@@ -145,12 +170,13 @@ async fn the_worked_scenario() {
             "premature_claim must be recorded for the manager's next poll"
         );
 
-        // ---- Stage 1 works ------------------------------------------
+        // ---- The root works ------------------------------------------
         let w1 = "agent.mod.schema";
         store.get_context(w1, "worker").await.unwrap();
         let briefing = store.claim_module(w1, &m_schema).await.unwrap();
         assert_eq!(briefing.module.tasks.len(), 2);
         assert!(briefing.upstream_summaries.is_empty());
+        assert!(briefing.whitepaper.is_some(), "the briefing carries the plan as prose");
 
         // A stranger cannot write to a claimed module.
         let stranger_err = store
@@ -160,7 +186,10 @@ async fn the_worked_scenario() {
         assert_eq!(stranger_err.code, ErrorCode::NotClaimedByYou);
 
         // Completing with open tasks is refused, with the list.
-        let open_err = store.complete_module(w1, &m_schema, "too early", &[]).await.unwrap_err();
+        let open_err = store
+            .complete_module(w1, &m_schema, "too early", &[], None)
+            .await
+            .unwrap_err();
         assert_eq!(open_err.code, ErrorCode::TasksOpen);
 
         // Skips need reasons.
@@ -184,7 +213,11 @@ async fn the_worked_scenario() {
             .await
             .unwrap();
         let tree_now = store.feature_tree(&fid).await.unwrap();
-        let discovered = tree_now.stages[0].modules[0]
+        let discovered = tree_now
+            .modules
+            .iter()
+            .find(|m| m.id == m_schema)
+            .unwrap()
             .tasks
             .iter()
             .find(|t| t.origin == "discovered")
@@ -193,6 +226,25 @@ async fn the_worked_scenario() {
             .complete_task(w1, &discovered.id, TaskOutcome::Done, None)
             .await
             .unwrap();
+
+        // The worker documents what it built as it goes.
+        let doc = store
+            .write_document(
+                w1,
+                DocumentKind::Handoff,
+                &m_schema,
+                "Schema",
+                "## reports\n\nOne row per filed report; `report_lines` hangs off it.",
+            )
+            .await
+            .unwrap();
+        assert_eq!(doc.revision, 1);
+        // A stranger may not.
+        let doc_err = store
+            .write_document(eager, DocumentKind::Handoff, &m_schema, "", "mine now")
+            .await
+            .unwrap_err();
+        assert_eq!(doc_err.code, ErrorCode::NotClaimedByYou);
 
         // Record a decision for downstream workers.
         store
@@ -207,30 +259,54 @@ async fn the_worked_scenario() {
             .await
             .unwrap();
 
+        // Completion can carry a handoff revision of its own.
         let ack = store
-            .complete_module(w1, &m_schema, "Schema landed: reports + report_lines tables.", &[])
+            .complete_module(
+                w1,
+                &m_schema,
+                "Schema landed: reports + report_lines tables.",
+                &[],
+                Some("## reports\n\nOne row per filed report. Use `db::reports::insert`."),
+            )
             .await
             .unwrap();
-        assert!(ack.message.contains("unlocked stage 'API'"), "ack: {}", ack.message);
+        assert!(ack.message.contains("released 'Report endpoints'"), "ack: {}", ack.message);
         let events = store.get_events(Some(&fid), 0, 100).await.unwrap();
-        assert!(events.iter().any(|e| e.kind == "stage_unlocked"));
+        let unlocked: Vec<&Event> = events.iter().filter(|e| e.kind == "module_unlocked").collect();
+        assert_eq!(unlocked.len(), 1);
+        assert_eq!(unlocked[0].subject_id.as_deref(), Some(m_api.as_str()));
+        let handoff = store
+            .read_document(DocumentKind::Handoff, &m_schema)
+            .await
+            .unwrap()
+            .expect("current handoff");
+        assert_eq!(handoff.revision, 2, "the completion appended a revision");
+        assert!(handoff.body.contains("db::reports::insert"));
 
-        // ---- Stage 2 ------------------------------------------------
+        // ---- The endpoints ------------------------------------------
         let work = store.next_work(&fid).await.unwrap();
         assert_eq!(work.dispatchable.len(), 1);
-        assert_eq!(work.dispatchable[0].stage_position, 2);
-        let m_api = work.dispatchable[0].module_id.clone();
+        assert_eq!(work.dispatchable[0].module_id, m_api);
+        assert_eq!(work.dispatchable[0].depends_on, vec![m_schema.clone()]);
 
         let w2 = "agent.mod.api";
         store.get_context(w2, "worker").await.unwrap();
         let briefing = store.claim_module(w2, &m_api).await.unwrap();
-        // The claim carries the upstream summary + the recorded decision.
+        // The claim carries the upstream summary, marked as a
+        // prerequisite, with the handoff beside it.
         assert_eq!(briefing.upstream_summaries.len(), 1);
+        assert!(briefing.upstream_summaries[0].prerequisite);
         assert!(briefing.upstream_summaries[0].summary.contains("Schema landed"));
+        assert!(briefing.upstream_summaries[0]
+            .handoff
+            .as_deref()
+            .unwrap_or_default()
+            .contains("db::reports::insert"));
+        assert_eq!(briefing.module.depth, 2);
 
         // Worker reads conventions upstream: `up` from its module finds
-        // nothing module-scoped of stage 1 (different module), but the
-        // feature-level search finds the schema decision via `down`.
+        // nothing module-scoped of the schema module (different module),
+        // but the feature-level search finds the decision via `down`.
         let found = store
             .search_memory(&MemoryQuery {
                 text: "currency".into(),
@@ -255,35 +331,63 @@ async fn the_worked_scenario() {
         assert!(status.events.iter().any(|e| e.kind == "blocker_reported"));
         // Same worker resumes its own blocked module via claim_module.
         store.claim_module(w2, &m_api).await.unwrap();
-        for task in store.feature_tree(&fid).await.unwrap().stages[1].modules[0].tasks.iter() {
+        for task in store
+            .feature_tree(&fid)
+            .await
+            .unwrap()
+            .modules
+            .iter()
+            .find(|m| m.id == m_api)
+            .unwrap()
+            .tasks
+            .iter()
+        {
             store
                 .complete_task(w2, &task.id, TaskOutcome::Done, None)
                 .await
                 .unwrap();
         }
-        store
-            .complete_module(w2, &m_api, "Endpoints live: GET/POST /reports with contract tests.", &[])
+        let ack = store
+            .complete_module(
+                w2,
+                &m_api,
+                "Endpoints live: GET/POST /reports with contract tests.",
+                &[],
+                None,
+            )
             .await
             .unwrap();
+        assert!(ack.message.contains("'App'") && ack.message.contains("'MCP connector'"), "{}", ack.message);
 
         // ---- Feature can't close early ------------------------------
         let close_err = store
             .complete_feature(manager, &fid, "premature")
             .await
             .unwrap_err();
-        assert_eq!(close_err.code, ErrorCode::StagesIncomplete);
+        assert_eq!(close_err.code, ErrorCode::ModulesIncomplete);
 
-        // ---- Stage 3: two modules, two concurrent workers -----------
+        // ---- The leaves: two modules, two concurrent workers --------
         let work = store.next_work(&fid).await.unwrap();
-        assert_eq!(work.dispatchable.len(), 2, "both Clients modules dispatch together");
+        assert_eq!(work.dispatchable.len(), 2, "both leaves dispatch together");
+        assert!(work.note.contains("none of them depends on another"));
 
         let w3 = "agent.mod.app";
         store.get_context(w3, "worker").await.unwrap();
-        for module_id in &stage3_modules {
+        for module_id in [&m_app, &m_mcp] {
             // Both claimed by different workers; the connector worker
             // finally gets its module — legally this time.
-            let worker = if module_id == &stage3_modules[0] { w3 } else { eager };
+            let worker = if module_id == &m_app { w3 } else { eager };
             let briefing = store.claim_module(worker, module_id).await.unwrap();
+            // Prerequisites first (schema, then endpoints); a completed
+            // sibling — App, once the connector claims after it — rides
+            // behind them, marked as not a prerequisite.
+            let chain: Vec<(&str, bool)> = briefing
+                .upstream_summaries
+                .iter()
+                .map(|u| (u.module_name.as_str(), u.prerequisite))
+                .collect();
+            assert_eq!(&chain[..2], &[("Schema & store", true), ("Report endpoints", true)]);
+            assert!(chain[2..].iter().all(|(_, p)| !p), "{chain:?}");
             // Two claims can't collide:
             let other = if worker == w3 { eager } else { w3 };
             let collide = store.claim_module(other, module_id).await.unwrap_err();
@@ -295,10 +399,14 @@ async fn the_worked_scenario() {
                     .unwrap();
             }
             store
-                .complete_module(worker, module_id, "Done.", &[])
+                .complete_module(worker, module_id, "Done.", &[], None)
                 .await
                 .unwrap();
         }
+        // A completed sibling reaches a module that did not depend on it,
+        // after the prerequisites.
+        let last = store.feature_tree(&fid).await.unwrap();
+        assert!(last.modules.iter().all(|m| m.status == "done"));
 
         // ---- Close --------------------------------------------------
         store
@@ -307,8 +415,15 @@ async fn the_worked_scenario() {
             .unwrap();
         let rollups = store.rollups().await.unwrap();
         assert_eq!(rollups[0].status, "done");
-        assert_eq!(rollups[0].stages_done, 3);
         assert_eq!(rollups[0].modules_done, 4);
+        assert_eq!(rollups[0].modules_ready, 0);
+
+        // Every current document of the feature: one whitepaper, one
+        // handoff (the schema's, at its second revision).
+        let docs = store.feature_documents(&fid).await.unwrap();
+        assert_eq!(docs.len(), 2, "{docs:?}");
+        assert!(docs.iter().any(|d| d.kind == DocumentKind::Whitepaper && d.revision == 1));
+        assert!(docs.iter().any(|d| d.kind == DocumentKind::Handoff && d.revision == 2));
 
         // Completion summaries are memories: a whole-project search
         // finds the feature summary without anyone writing docs.
@@ -347,6 +462,57 @@ async fn the_worked_scenario() {
     .await;
 }
 
+/// The deprecated stage ladder still plans, and lowers to exactly the
+/// edges the gate used to imply: each module waits on every module of
+/// the preceding stage.
+#[tokio::test]
+async fn a_stage_ladder_lowers_to_edges() {
+    with_scratch_store(|store| async move {
+        store.get_context("mgr", "manager").await.unwrap();
+        let tree = store
+            .plan_feature(
+                "mgr",
+                PlanFeature {
+                    name: "Ladder".into(),
+                    stages: vec![
+                        PlanStage {
+                            name: "One".into(),
+                            modules: vec![module("a", &[], &[]), module("b", &[], &[])],
+                        },
+                        PlanStage {
+                            name: "Two".into(),
+                            modules: vec![module("c", &[], &[])],
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let c = tree.modules.iter().find(|m| m.name == "c").unwrap();
+        let mut deps = c.depends_on.clone();
+        deps.sort();
+        let mut ab = vec![id_of(&tree, "a"), id_of(&tree, "b")];
+        ab.sort();
+        assert_eq!(deps, ab);
+        assert_eq!(c.depth, 2);
+        let both = store
+            .plan_feature(
+                "mgr",
+                PlanFeature {
+                    name: "Both".into(),
+                    modules: vec![module("x", &[], &[])],
+                    stages: vec![PlanStage { name: "S".into(), modules: vec![module("y", &[], &[])] }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(both.code, ErrorCode::PlanInvalid);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn revise_plan_guards_history() {
     with_scratch_store(|store| async move {
@@ -355,16 +521,42 @@ async fn revise_plan_guards_history() {
         store.get_context(manager, "manager").await.unwrap();
         let tree = store.plan_feature(manager, plan()).await.unwrap();
         let fid = tree.id.clone();
-        let m1 = tree.stages[0].modules[0].id.clone();
+        let m_schema = id_of(&tree, "Schema & store");
+        let m_api = id_of(&tree, "Report endpoints");
+        let m_app = id_of(&tree, "App");
 
-        // Claim stage 1's module, then try to remove it: refused.
+        // Claim the root, then try to remove it: refused.
         store.get_context("w", "worker").await.unwrap();
-        store.claim_module("w", &m1).await.unwrap();
+        store.claim_module("w", &m_schema).await.unwrap();
         let err = store
-            .revise_plan(manager, &fid, vec![PlanOp::Remove { id: m1.clone() }])
+            .revise_plan(manager, &fid, vec![PlanOp::Remove { id: m_schema.clone() }])
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PlanConflict);
+
+        // A prerequisite cannot be added to a module that has started.
+        let started = store
+            .revise_plan(
+                manager,
+                &fid,
+                vec![PlanOp::AddDependency { module_id: m_schema.clone(), depends_on: m_app.clone() }],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(started.code, ErrorCode::PlanConflict);
+
+        // A cycle is refused: App already waits (transitively) on the
+        // endpoints, so the endpoints cannot wait on App.
+        let cyc = store
+            .revise_plan(
+                manager,
+                &fid,
+                vec![PlanOp::AddDependency { module_id: m_api.clone(), depends_on: m_app.clone() }],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(cyc.code, ErrorCode::PlanInvalid);
+        assert!(cyc.message.contains("cycle"), "{}", cyc.message);
 
         // Atomicity: a batch whose second op fails writes nothing.
         let before = store.feature_tree(&fid).await.unwrap();
@@ -373,8 +565,14 @@ async fn revise_plan_guards_history() {
                 manager,
                 &fid,
                 vec![
-                    PlanOp::AddStage { name: "Polish".into(), after: None },
-                    PlanOp::Remove { id: m1.clone() },
+                    PlanOp::AddModule {
+                        name: "Polish".into(),
+                        description: String::new(),
+                        tasks: vec![],
+                        depends_on: vec![m_app.clone()],
+                        owns: vec![],
+                    },
+                    PlanOp::Remove { id: m_schema.clone() },
                 ],
             )
             .await
@@ -382,34 +580,100 @@ async fn revise_plan_guards_history() {
         assert_eq!(err.code, ErrorCode::PlanConflict);
         let after = store.feature_tree(&fid).await.unwrap();
         assert_eq!(
-            before.stages.len(),
-            after.stages.len(),
-            "failed batch must not leave the added stage behind"
+            before.modules.len(),
+            after.modules.len(),
+            "failed batch must not leave the added module behind"
         );
 
-        // A good revision: insert a stage after stage 1, rename a module.
-        let s1 = tree.stages[0].id.clone();
+        // A good revision: a hardening module behind both leaves, an
+        // owned path on the endpoints, and a rename.
         let revised = store
             .revise_plan(
                 manager,
                 &fid,
                 vec![
-                    PlanOp::AddStage { name: "Hardening".into(), after: Some(s1) },
                     PlanOp::AddModule {
-                        stage_id: store.feature_tree(&fid).await.unwrap().stages[0].id.clone(),
-                        name: "placeholder".into(),
-                        description: String::new(),
-                        tasks: vec![],
+                        name: "Hardening".into(),
+                        description: "Rate limits".into(),
+                        tasks: vec!["Limit writes".into()],
+                        depends_on: vec![m_app.clone(), id_of(&tree, "MCP connector")],
+                        owns: vec!["crates/api/src/limits.rs".into()],
+                    },
+                    PlanOp::UpdateModule {
+                        id: m_api.clone(),
+                        description: Some("The report endpoints.".into()),
+                        owns: Some(vec!["crates/api/src/reports.rs".into()]),
+                    },
+                    PlanOp::Rename { id: m_app.clone(), name: "Mobile app".into() },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(revised.modules.len(), 5);
+        let hardening = revised.modules.iter().find(|m| m.name == "Hardening").unwrap();
+        assert_eq!(hardening.depth, 4);
+        assert_eq!(hardening.depends_on.len(), 2);
+        assert!(revised.modules.iter().any(|m| m.name == "Mobile app"));
+        let api = revised.modules.iter().find(|m| m.id == m_api).unwrap();
+        assert_eq!(api.description, "The report endpoints.");
+
+        // An ownership clash introduced by a revision is refused where
+        // it lands. Hardening sharing the endpoints' file is fine — it
+        // is transitively downstream of them. The two leaves are
+        // siblings with no edge between them, so giving both the same
+        // path is two unordered writers, and the whole batch is refused.
+        let clash = store
+            .revise_plan(
+                manager,
+                &fid,
+                vec![
+                    PlanOp::UpdateModule {
+                        id: m_app.clone(),
+                        description: None,
+                        owns: Some(vec!["crates/app/src/reports.rs".into()]),
+                    },
+                    PlanOp::UpdateModule {
+                        id: id_of(&tree, "MCP connector"),
+                        description: None,
+                        owns: Some(vec!["crates/app".into()]),
+                    },
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(clash.code, ErrorCode::PlanInvalid, "{}", clash.message);
+        assert!(clash.message.contains("both own"), "{}", clash.message);
+        let unchanged = store.feature_tree(&fid).await.unwrap();
+        assert!(
+            unchanged.modules.iter().find(|m| m.id == m_app).unwrap().owns.is_empty(),
+            "the refused batch wrote nothing"
+        );
+        // An edge can go as long as the writers it ordered stay ordered
+        // some other way.
+        let loosened = store
+            .revise_plan(
+                manager,
+                &fid,
+                vec![
+                    PlanOp::AddDependency {
+                        module_id: hardening.id.clone(),
+                        depends_on: m_api.clone(),
+                    },
+                    PlanOp::UpdateModule {
+                        id: hardening.id.clone(),
+                        description: None,
+                        owns: Some(vec!["crates/api/src/reports.rs".into()]),
+                    },
+                    PlanOp::RemoveDependency {
+                        module_id: hardening.id.clone(),
+                        depends_on: m_app.clone(),
                     },
                 ],
             )
             .await;
-        // AddModule went to stage 1 which is in progress (not complete) — allowed.
-        let revised = revised.unwrap();
-        assert_eq!(revised.stages.len(), 4);
-        assert_eq!(revised.stages[1].name, "Hardening");
-        assert_eq!(revised.stages[1].position, 2);
-        assert_eq!(revised.stages[2].position, 3);
+        // Hardening -> endpoints keeps them ordered even after the App
+        // edge goes, so this whole batch is legal.
+        assert!(loosened.is_ok(), "{:?}", loosened.err());
     })
     .await;
 }
@@ -579,15 +843,8 @@ async fn wants_compose_into_features() {
                 "agent.composer",
                 PlanFeature {
                     name: "Reporting surface".into(),
-                    description: String::new(),
-                    stages: vec![PlanStage {
-                        name: "Build".into(),
-                        modules: vec![PlanModule {
-                            name: "Digest job".into(),
-                            description: String::new(),
-                            tasks: vec!["Schedule it".into()],
-                        }],
-                    }],
+                    modules: vec![module("Digest job", &["Schedule it"], &[])],
+                    ..Default::default()
                 },
             )
             .await
@@ -696,126 +953,10 @@ fn export_plan() -> PlanFeature {
     PlanFeature {
         name: "Export & share".into(),
         description: "Composed from the export wants.".into(),
-        stages: vec![
-            PlanStage {
-                name: "Renderer".into(),
-                modules: vec![PlanModule {
-                    name: "CSV writer".into(),
-                    description: String::new(),
-                    tasks: vec!["Column mapping".into()],
-                }],
-            },
-            PlanStage {
-                name: "Surface".into(),
-                modules: vec![PlanModule {
-                    name: "Download endpoint".into(),
-                    description: String::new(),
-                    tasks: vec!["Stream the file".into()],
-                }],
-            },
+        modules: vec![
+            module("CSV writer", &["Column mapping"], &[]),
+            module("Download endpoint", &["Stream the file"], &["CSV writer"]),
         ],
-    }
-}
-
-/// The tag registry and bulk capture: what the console's composer posts
-/// on every keystroke-ending Enter, and what an agent's `add_wants`
-/// does — same path, same guarantees.
-#[tokio::test]
-async fn tags_are_registered_as_wants_are_captured() {
-    with_scratch_store(|store| async move {
-        // A preset: a tag set up before any idea uses it.
-        let preset = store.create_tag("console", "Field Reports").await.expect("preset");
-        assert_eq!(preset.name, "field-reports", "normalized to a slug");
-        assert_eq!(preset.label, "Field Reports", "display text kept as typed");
-        assert_eq!(preset.uses, 0);
-        // Idempotent — "make sure this exists" is the caller's intent.
-        let again = store.create_tag("console", "#field-reports").await.expect("again");
-        assert_eq!(again.name, preset.name);
-        assert_eq!(store.list_tags().await.unwrap().len(), 1);
-
-        // Bulk capture, the shape a brain-dump has.
-        let captured = store
-            .add_wants(
-                "console",
-                vec![
-                    WantDraft {
-                        body: "exports are painful".into(),
-                        tags: vec!["ux".into(), "field-reports".into()],
-                    },
-                    WantDraft {
-                        body: "weekly digest by email".into(),
-                        tags: vec!["Ops".into()],
-                    },
-                    WantDraft { body: "dark mode contrast".into(), tags: vec![] },
-                ],
-            )
-            .await
-            .expect("capture");
-        assert_eq!(captured.len(), 3);
-        assert_eq!(captured[0].body, "exports are painful", "order is capture order");
-        assert_eq!(captured[2].body, "dark mode contrast");
-
-        // Tags used for the first time are registered on the way through,
-        // normalized, and counted.
-        let tags = store.list_tags().await.unwrap();
-        let by_name = |n: &str| tags.iter().find(|t| t.name == n).cloned_uses();
-        assert_eq!(by_name("field-reports"), 1);
-        assert_eq!(by_name("ux"), 1);
-        assert_eq!(by_name("ops"), 1, "'Ops' normalized to 'ops'");
-        assert_eq!(tags.len(), 3);
-
-        // Most-used first, so autocomplete offers the live vocabulary.
-        let more = vec![
-            WantDraft { body: "another export gripe".into(), tags: vec!["ux".into()] },
-            WantDraft { body: "and another".into(), tags: vec!["ux".into()] },
-        ];
-        store.add_wants("console", more).await.expect("more");
-        assert_eq!(store.list_tags().await.unwrap()[0].name, "ux");
-
-        // The batch is atomic: one empty body rejects the whole list.
-        let before = store.list_wants("", WantFilter::All, &[], 100).await.unwrap();
-        let rejected = store
-            .add_wants(
-                "console",
-                vec![
-                    WantDraft { body: "this one is fine".into(), tags: vec![] },
-                    WantDraft { body: "   ".into(), tags: vec![] },
-                ],
-            )
-            .await
-            .expect_err("empty body");
-        assert_eq!(rejected.code, ErrorCode::PlanInvalid);
-        let after = store.list_wants("", WantFilter::All, &[], 100).await.unwrap();
-        assert_eq!(after.wants.len(), before.wants.len(), "nothing was written");
-
-        // Filtering by a normalized tag finds what was captured under it.
-        let ux = store
-            .list_wants("", WantFilter::Open, &["ux".to_string()], 50)
-            .await
-            .unwrap();
-        assert_eq!(ux.wants.len(), 3);
-
-        // Every capture is on the ledger, and a first-use tag says so.
-        let events = store.get_events(None, 0, 200).await.unwrap();
-        assert_eq!(
-            events.iter().filter(|e| e.kind == "want_added").count(),
-            5
-        );
-        assert_eq!(
-            events.iter().filter(|e| e.kind == "tag_created").count(),
-            3,
-            "the preset plus the two first-use tags — never twice for the same tag"
-        );
-    })
-    .await;
-}
-
-/// Small helper so the assertions above read as counts.
-trait UsesExt {
-    fn cloned_uses(self) -> i64;
-}
-impl UsesExt for Option<&TagInfo> {
-    fn cloned_uses(self) -> i64 {
-        self.map(|t| t.uses).unwrap_or(-1)
+        ..Default::default()
     }
 }

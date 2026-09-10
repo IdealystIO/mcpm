@@ -1,6 +1,8 @@
-//! Short, prefixed, stable ids: `feat_…`, `stg_…`, `mod_…`, `tsk_…`,
-//! `mem_…`, `want_…`. Never positional, so reordering a stage or moving a module
-//! breaks no reference; the prefix lets tools dispatch on id shape.
+//! Short, prefixed, stable ids: `feat_…`, `mod_…`, `tsk_…`, `mem_…`,
+//! `doc_…`, `want_…`. Never positional, so re-wiring a module's
+//! prerequisites breaks no reference; the prefix lets tools dispatch on
+//! id shape. (`stg_…` was the stage prefix; stages were retired in
+//! migration 0012 and the prefix now resolves to nothing.)
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +18,6 @@ use serde::{Deserialize, Serialize};
 pub enum Level {
     Project,
     Feature,
-    Stage,
     Module,
     Task,
 }
@@ -33,7 +34,6 @@ impl Level {
         match self {
             Level::Project => "proj",
             Level::Feature => "feat",
-            Level::Stage => "stg",
             Level::Module => "mod",
             Level::Task => "tsk",
         }
@@ -43,7 +43,6 @@ impl Level {
         match self {
             Level::Project => "project",
             Level::Feature => "feature",
-            Level::Stage => "stage",
             Level::Module => "module",
             Level::Task => "task",
         }
@@ -53,7 +52,6 @@ impl Level {
         match s {
             "project" => Some(Level::Project),
             "feature" => Some(Level::Feature),
-            "stage" => Some(Level::Stage),
             "module" => Some(Level::Module),
             "task" => Some(Level::Task),
             _ => None,
@@ -81,13 +79,19 @@ pub fn new_want_id() -> String {
     format!("want_{}", &uuid[..8])
 }
 
+/// Mint a document id. Documents hang off a feature or a module but
+/// are not tree nodes themselves.
+pub fn new_document_id() -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    format!("doc_{}", &uuid[..8])
+}
+
 /// Recover the level from an id's prefix (for tools like `revise_plan`
 /// whose ops take any tree id).
 pub fn id_level(id: &str) -> Option<Level> {
     match id.split('_').next() {
         Some("proj") => Some(Level::Project),
         Some("feat") => Some(Level::Feature),
-        Some("stg") => Some(Level::Stage),
         Some("mod") => Some(Level::Module),
         Some("tsk") => Some(Level::Task),
         _ => None,

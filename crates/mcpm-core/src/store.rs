@@ -1,13 +1,19 @@
 //! The Postgres store. Every architecture-doc invariant is enforced
 //! here, inside a transaction, in exactly one place each:
 //!
-//! - **The stage gate** is checked only in [`Store::claim_module`], in
+//! - **The gate** — a module is claimable only when every prerequisite
+//!   it names is done — is checked only in [`Store::claim_module`], in
 //!   the same transaction that takes the claim — and a rejected claim
 //!   still COMMITS its `premature_claim` event, so the manager learns
 //!   about the mistake even if the worker never reports back.
+//! - **The graph is validated at plan time**: no cycles, no edge to a
+//!   module outside the feature, and two modules that declare
+//!   overlapping owned paths must be ordered by an edge. Checked in
+//!   [`validate_plan`] and again inside every `revise_plan` op.
 //! - **Completion is proven, not asserted**: `complete_module` refuses
-//!   while tasks are open; `complete_feature` refuses while stages are
-//!   unfinished; finishing a stage's last module emits `stage_unlocked`.
+//!   while tasks are open; `complete_feature` refuses while modules are
+//!   unfinished; finishing a module emits `module_unlocked` for every
+//!   dependent whose gate it opened.
 //! - **Everything leaves a trace**: every mutation appends an event and
 //!   every completion/blocker commits a memory.
 //! - **A delegated identity is confined to one module**, and that is
@@ -23,7 +29,9 @@ use tokio::sync::{broadcast, OnceCell};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{McpmError, ErrorCode};
-use crate::ids::{id_level, new_id, new_memory_id, new_want_id, normalize_tag, Level};
+use crate::ids::{
+    id_level, new_document_id, new_id, new_memory_id, new_want_id, normalize_tag, Level,
+};
 use crate::keys::{
     Actor, ApiKeyInfo, Delegation, IssuedKey, KeyIdentity, KeyRole, MintRequest, MintedWorker,
 };
@@ -243,9 +251,9 @@ impl Store {
                      promote_wants."
                 )
             } else if features.is_empty() {
-                "No features planned yet. Create one with plan_feature (stages in order, \
-                 modules per stage, tasks per module) — or capture loose ideas first with \
-                 add_want and compose them later."
+                "No features planned yet. Create one with plan_feature (modules, each naming \
+                 the modules it depends on, tasks per module) — or capture loose ideas first \
+                 with add_want and compose them later."
                     .to_string()
             } else {
                 "Poll your feature with feature_status, then dispatch every module next_work \
@@ -321,20 +329,18 @@ impl Store {
     async fn feature_rollups(&self) -> Result<Vec<FeatureRollup>> {
         let rows = sqlx::query(
             "SELECT f.id, f.name, f.status,
-               (SELECT COUNT(*) FROM stages s WHERE s.feature_id = f.id) AS stages_total,
-               (SELECT COUNT(*) FROM stages s WHERE s.feature_id = f.id
-                  AND EXISTS (SELECT 1 FROM modules m WHERE m.stage_id = s.id)
-                  AND NOT EXISTS (SELECT 1 FROM modules m
-                                  WHERE m.stage_id = s.id AND m.status <> 'done')) AS stages_done,
-               (SELECT COUNT(*) FROM modules m JOIN stages s ON s.id = m.stage_id
-                  WHERE s.feature_id = f.id) AS modules_total,
-               (SELECT COUNT(*) FROM modules m JOIN stages s ON s.id = m.stage_id
-                  WHERE s.feature_id = f.id AND m.status = 'done') AS modules_done,
+               (SELECT COUNT(*) FROM modules m WHERE m.feature_id = f.id) AS modules_total,
+               (SELECT COUNT(*) FROM modules m
+                  WHERE m.feature_id = f.id AND m.status = 'done') AS modules_done,
+               (SELECT COUNT(*) FROM modules m
+                  WHERE m.feature_id = f.id AND m.status = 'todo' AND m.claimed_by IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM module_deps d
+                                    JOIN modules p ON p.id = d.depends_on
+                                    WHERE d.module_id = m.id AND p.status <> 'done')) AS modules_ready,
                (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
-                  JOIN stages s ON s.id = m.stage_id WHERE s.feature_id = f.id) AS tasks_total,
+                  WHERE m.feature_id = f.id) AS tasks_total,
                (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
-                  JOIN stages s ON s.id = m.stage_id
-                  WHERE s.feature_id = f.id AND t.status IN ('done','skipped')) AS tasks_done
+                  WHERE m.feature_id = f.id AND t.status IN ('done','skipped')) AS tasks_done
              FROM features f ORDER BY f.created_at",
         )
         .fetch_all(&self.pool)
@@ -345,10 +351,9 @@ impl Store {
                 id: r.get("id"),
                 name: r.get("name"),
                 status: r.get("status"),
-                stages_done: r.get("stages_done"),
-                stages_total: r.get("stages_total"),
                 modules_done: r.get("modules_done"),
                 modules_total: r.get("modules_total"),
+                modules_ready: r.get("modules_ready"),
                 tasks_done: r.get("tasks_done"),
                 tasks_total: r.get("tasks_total"),
             })
@@ -362,10 +367,9 @@ impl Store {
                     (SELECT COUNT(*) FROM tasks t
                      WHERE t.module_id = m.id AND t.status = 'open') AS open_tasks
              FROM modules m
-             JOIN stages s ON s.id = m.stage_id
-             JOIN features f ON f.id = s.feature_id
+             JOIN features f ON f.id = m.feature_id
              WHERE m.claimed_by = $1 AND m.status IN ('in_progress', 'blocked')
-             ORDER BY f.created_at, s.position",
+             ORDER BY f.created_at, m.name",
         )
         .bind(agent)
         .fetch_all(&self.pool)
@@ -386,12 +390,12 @@ impl Store {
     // Planning
     // -----------------------------------------------------------------
 
-    /// Create the feature and its entire tree in one transaction — a
+    /// Create the feature and its entire graph in one transaction — a
     /// half-written plan is never visible to workers.
     pub async fn plan_feature(&self, agent: &str, plan: PlanFeature) -> Result<FeatureTree> {
-        validate_plan(&plan)?;
+        let modules = validate_plan(&plan)?;
         let mut tx = self.pool.begin().await?;
-        let feature_id = insert_plan(&mut tx, agent, &plan).await?;
+        let feature_id = insert_plan(&mut tx, agent, &plan, &modules).await?;
         tx.commit().await?;
         self.feature_tree(&feature_id).await
     }
@@ -429,7 +433,7 @@ impl Store {
         self.feature_tree(feature_id).await
     }
 
-    /// Close the feature. Refuses while any stage is unfinished.
+    /// Close the feature. Refuses while any module is unfinished.
     pub async fn complete_feature(&self, agent: &str, feature_id: &str, summary: &str) -> Result<Ack> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT id, name, status FROM features WHERE id = $1 FOR UPDATE")
@@ -448,11 +452,10 @@ impl Store {
             ));
         }
         let remaining = sqlx::query(
-            "SELECT s.id AS stage_id, s.name AS stage_name, s.position,
-                    m.id AS module_id, m.name AS module_name, m.status
-             FROM stages s JOIN modules m ON m.stage_id = s.id
-             WHERE s.feature_id = $1 AND m.status <> 'done'
-             ORDER BY s.position, m.name",
+            "SELECT m.id AS module_id, m.name AS module_name, m.status
+             FROM modules m
+             WHERE m.feature_id = $1 AND m.status <> 'done'
+             ORDER BY m.name",
         )
         .bind(feature_id)
         .fetch_all(&mut *tx)
@@ -462,8 +465,6 @@ impl Store {
                 .iter()
                 .map(|r| {
                     json!({
-                        "stage": r.get::<String, _>("stage_name"),
-                        "stage_position": r.get::<i32, _>("position"),
                         "module_id": r.get::<String, _>("module_id"),
                         "module": r.get::<String, _>("module_name"),
                         "status": r.get::<String, _>("status"),
@@ -471,7 +472,7 @@ impl Store {
                 })
                 .collect();
             return Err(McpmError::new(
-                ErrorCode::StagesIncomplete,
+                ErrorCode::ModulesIncomplete,
                 format!(
                     "Feature '{}' still has {} unfinished module(s).",
                     name,
@@ -516,69 +517,67 @@ impl Store {
     // Dispatch
     // -----------------------------------------------------------------
 
-    /// The dispatch decision, computed server-side: every module that is
-    /// todo + unclaimed + in the lowest unfinished stage.
+    /// The dispatch decision, computed server-side: the ready frontier —
+    /// every module that is todo + unclaimed + every prerequisite done.
+    ///
+    /// A ready set is an antichain by construction: two ready modules
+    /// cannot depend on each other, because an edge between them would
+    /// make the dependent not ready. So "they can run concurrently" is a
+    /// fact about the graph, not a hope about the plan.
     pub async fn next_work(&self, feature_id: &str) -> Result<NextWork> {
         let tree = self.feature_tree(feature_id).await?;
         let mut dispatchable = Vec::new();
         let mut in_flight = Vec::new();
         let mut blocked = Vec::new();
-        for stage in &tree.stages {
-            for module in &stage.modules {
-                if module.dispatchable {
-                    let mem_count: i64 = sqlx::query(
-                        "SELECT COUNT(*) AS n FROM memories
-                         WHERE (level = 'feature' AND subject_id = $1)
-                            OR (level = 'stage' AND subject_id = $2)",
-                    )
-                    .bind(feature_id)
-                    .bind(&stage.id)
-                    .fetch_one(&self.pool)
-                    .await?
-                    .get("n");
-                    dispatchable.push(WorkItem {
-                        module_id: module.id.clone(),
-                        module_name: module.name.clone(),
-                        description: module.description.clone(),
-                        stage_id: stage.id.clone(),
-                        stage_name: stage.name.clone(),
-                        stage_position: stage.position,
-                        tasks: module
-                            .tasks
-                            .iter()
-                            .map(|t| TaskView {
-                                id: t.id.clone(),
-                                name: t.name.clone(),
-                                status: t.status.clone(),
-                                origin: t.origin.clone(),
-                                note: t.note.clone(),
-                            })
-                            .collect(),
-                        relevant_memories: mem_count,
-                    });
-                } else if module.status == "in_progress" {
-                    in_flight.push(ClaimRef {
-                        module_id: module.id.clone(),
-                        module_name: module.name.clone(),
-                        feature_id: tree.id.clone(),
-                        feature_name: tree.name.clone(),
-                        open_tasks: module.tasks.iter().filter(|t| t.status == "open").count()
-                            as i64,
-                    });
-                } else if module.status == "blocked" {
-                    blocked.push(format!(
-                        "{} ({}) — blocked, claimed by {}",
-                        module.name,
-                        module.id,
-                        module.claimed_by.as_deref().unwrap_or("nobody")
-                    ));
-                }
+        let mem_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memories WHERE level = 'feature' AND subject_id = $1",
+        )
+        .bind(feature_id)
+        .fetch_one(&self.pool)
+        .await?;
+        for module in &tree.modules {
+            if module.dispatchable {
+                dispatchable.push(WorkItem {
+                    module_id: module.id.clone(),
+                    module_name: module.name.clone(),
+                    description: module.description.clone(),
+                    depends_on: module.depends_on.clone(),
+                    owns: module.owns.clone(),
+                    depth: module.depth,
+                    tasks: module
+                        .tasks
+                        .iter()
+                        .map(|t| TaskView {
+                            id: t.id.clone(),
+                            name: t.name.clone(),
+                            status: t.status.clone(),
+                            origin: t.origin.clone(),
+                            note: t.note.clone(),
+                        })
+                        .collect(),
+                    relevant_memories: mem_count,
+                });
+            } else if module.status == "in_progress" {
+                in_flight.push(ClaimRef {
+                    module_id: module.id.clone(),
+                    module_name: module.name.clone(),
+                    feature_id: tree.id.clone(),
+                    feature_name: tree.name.clone(),
+                    open_tasks: module.tasks.iter().filter(|t| t.status == "open").count() as i64,
+                });
+            } else if module.status == "blocked" {
+                blocked.push(format!(
+                    "{} ({}) — blocked, claimed by {}",
+                    module.name,
+                    module.id,
+                    module.claimed_by.as_deref().unwrap_or("nobody")
+                ));
             }
         }
         let note = if !dispatchable.is_empty() {
             format!(
                 "Dispatch one worker per module below ({} ready). They can run concurrently — \
-                 they are all in the same unlocked stage.",
+                 none of them depends on another; every prerequisite each one names is done.",
                 dispatchable.len()
             )
         } else if tree.status == "done" {
@@ -639,11 +638,9 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT m.id, m.name, m.description, m.status, m.claimed_by, m.summary,
-                    s.id AS stage_id, s.name AS stage_name, s.position,
                     f.id AS feature_id, f.name AS feature_name
              FROM modules m
-             JOIN stages s ON s.id = m.stage_id
-             JOIN features f ON f.id = s.feature_id
+             JOIN features f ON f.id = m.feature_id
              WHERE m.id = $1
              FOR UPDATE OF m",
         )
@@ -655,73 +652,60 @@ impl Store {
         let module_name: String = row.get("name");
         let status: String = row.get("status");
         let claimed_by: Option<String> = row.get("claimed_by");
-        let stage_id: String = row.get("stage_id");
-        let stage_name: String = row.get("stage_name");
-        let position: i32 = row.get("position");
         let feature_id: String = row.get("feature_id");
         let feature_name: String = row.get("feature_name");
 
         // --- The gate -------------------------------------------------
+        // Every prerequisite this module names, that is not done. The
+        // whole rule, in one query, inside the claiming transaction.
         let blocking = sqlx::query(
-            "SELECT s.id AS stage_id, s.name AS stage_name, s.position,
-                    m.id AS module_id, m.name AS module_name, m.status, m.claimed_by
-             FROM stages s JOIN modules m ON m.stage_id = s.id
-             WHERE s.feature_id = $1 AND s.position < $2 AND m.status <> 'done'
-             ORDER BY s.position, m.name",
+            "SELECT p.id AS module_id, p.name AS module_name, p.status, p.claimed_by
+             FROM module_deps d JOIN modules p ON p.id = d.depends_on
+             WHERE d.module_id = $1 AND p.status <> 'done'
+             ORDER BY p.name",
         )
-        .bind(&feature_id)
-        .bind(position)
+        .bind(module_id)
         .fetch_all(&mut *tx)
         .await?;
         if !blocking.is_empty() {
-            let mut stages: Vec<serde_json::Value> = Vec::new();
-            for r in &blocking {
-                let sid: String = r.get("stage_id");
-                let entry = json!({
-                    "id": r.get::<String, _>("module_id"),
-                    "name": r.get::<String, _>("module_name"),
-                    "status": r.get::<String, _>("status"),
-                    "claimed_by": r.get::<Option<String>, _>("claimed_by"),
-                });
-                match stages.iter_mut().find(|s| s["stage"] == json!(sid)) {
-                    Some(stage) => stage["open_modules"]
-                        .as_array_mut()
-                        .expect("open_modules is an array")
-                        .push(entry),
-                    None => stages.push(json!({
-                        "stage": sid,
-                        "name": r.get::<String, _>("stage_name"),
-                        "position": r.get::<i32, _>("position"),
-                        "open_modules": [entry],
-                    })),
-                }
-            }
-            let first_blocking = stages[0]["name"].as_str().unwrap_or("?").to_string();
+            let open: Vec<serde_json::Value> = blocking
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.get::<String, _>("module_id"),
+                        "name": r.get::<String, _>("module_name"),
+                        "status": r.get::<String, _>("status"),
+                        "claimed_by": r.get::<Option<String>, _>("claimed_by"),
+                    })
+                })
+                .collect();
+            let names: Vec<String> = blocking
+                .iter()
+                .map(|r| r.get::<String, _>("module_name"))
+                .collect();
             record_event(
                 &mut tx,
                 "premature_claim",
                 Some(&feature_id),
                 Some(module_id),
                 Some(agent),
-                json!({
-                    "module": module_name,
-                    "stage_position": position,
-                    "blocking": stages,
-                }),
+                json!({ "module": module_name, "blocking": open }),
             )
             .await?;
             // Commit so the rejection itself is on the record.
             tx.commit().await?;
             return Err(McpmError::new(
-                ErrorCode::StageLocked,
+                ErrorCode::PrereqsOpen,
                 format!(
-                    "Module '{module_name}' ({module_id}) is in stage {position} of \
-                     '{feature_name}', but stage '{first_blocking}' is incomplete."
+                    "Module '{module_name}' ({module_id}) of '{feature_name}' is waiting on {} \
+                     prerequisite(s) that are not done: {}.",
+                    names.len(),
+                    names.join(", ")
                 ),
-                json!({ "blocking": stages }),
-                "Do not begin work on this module. Report STAGE_LOCKED to your manager agent \
-                 and end your turn. The manager should re-dispatch you after the earlier \
-                 stages complete; this attempt has already been recorded as a \
+                json!({ "blocking": open }),
+                "Do not begin work on this module. Report PREREQS_OPEN to your manager agent \
+                 and end your turn. The manager should re-dispatch you after the listed \
+                 prerequisites complete; this attempt has already been recorded as a \
                  premature_claim event.",
             ));
         }
@@ -764,13 +748,21 @@ impl Store {
             Some(&feature_id),
             Some(module_id),
             Some(agent),
-            json!({ "module": module_name, "stage": stage_name }),
+            json!({ "module": module_name }),
         )
         .await?;
         tx.commit().await?;
 
         // --- The briefing --------------------------------------------
-        let tasks = self.tasks_of(module_id).await?;
+        // The module as the tree sees it now: prerequisites, owned
+        // paths, depth. One assembly, so the briefing cannot disagree
+        // with feature_status about the same module.
+        let tree = self.feature_tree(&feature_id).await?;
+        let module = tree
+            .modules
+            .into_iter()
+            .find(|m| m.id == module_id)
+            .ok_or_else(|| McpmError::internal("claimed module vanished from its feature"))?;
         // Everything filed above this module, project conventions
         // included — `up` terminates at the project shelf, so a worker
         // is briefed with the standing rules and not just the ones
@@ -793,41 +785,51 @@ impl Store {
             .into_iter()
             .map(|h| h.memory)
             .collect();
+        // Completed modules of the feature, prerequisites first. The
+        // recursive walk collects the whole ancestor chain; `dist` is
+        // the LONGEST path from the claimed module, so ordering by it
+        // descending puts the roots of the chain first — a topological
+        // order over the ancestors. Non-prerequisite siblings follow: a
+        // gotcha filed as a module summary should still reach a module
+        // that merely happens to share the feature.
         let upstream = sqlx::query(
-            "SELECT m.id, m.name, s.position, m.summary
-             FROM modules m JOIN stages s ON s.id = m.stage_id
-             WHERE s.feature_id = $1 AND s.position < $2
-               AND m.status = 'done' AND m.summary IS NOT NULL
-             ORDER BY s.position, m.name",
+            "WITH RECURSIVE pre AS (
+                 SELECT depends_on AS id, 1 AS dist FROM module_deps WHERE module_id = $1
+                 UNION
+                 SELECT d.depends_on, pre.dist + 1
+                 FROM module_deps d JOIN pre ON d.module_id = pre.id
+             ),
+             chain AS (SELECT id, MAX(dist) AS dist FROM pre GROUP BY id)
+             SELECT m.id, m.name, m.summary, (chain.id IS NOT NULL) AS prerequisite,
+                    (SELECT body FROM documents doc
+                      WHERE doc.level = 'module' AND doc.subject_id = m.id
+                        AND doc.kind = 'handoff'
+                      ORDER BY doc.revision DESC LIMIT 1) AS handoff
+             FROM modules m LEFT JOIN chain ON chain.id = m.id
+             WHERE m.feature_id = $2 AND m.status = 'done' AND m.id <> $1
+             ORDER BY (chain.id IS NULL), chain.dist DESC NULLS LAST, m.name",
         )
+        .bind(module_id)
         .bind(&feature_id)
-        .bind(position)
         .fetch_all(&self.pool)
         .await?;
+        let whitepaper = self
+            .current_document(DocumentKind::Whitepaper, &feature_id)
+            .await?;
         Ok(Briefing {
-            module: ModuleView {
-                id: module_id.to_string(),
-                name: module_name,
-                description: row.get("description"),
-                status: "in_progress".into(),
-                claimed_by: Some(agent.to_string()),
-                summary: row.get("summary"),
-                dispatchable: false,
-                tasks,
-            },
-            stage_id,
-            stage_name,
-            stage_position: position,
+            module,
             feature_id,
             feature_name,
+            whitepaper,
             ancestor_memories,
             upstream_summaries: upstream
                 .into_iter()
                 .map(|r| UpstreamSummary {
                     module_id: r.get("id"),
                     module_name: r.get("name"),
-                    stage_position: r.get("position"),
+                    prerequisite: r.get("prerequisite"),
                     summary: r.get::<Option<String>, _>("summary").unwrap_or_default(),
+                    handoff: r.get("handoff"),
                 })
                 .collect(),
             guidance: CLAIM_GUIDANCE.to_string(),
@@ -855,9 +857,8 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT t.id, t.name, t.status, m.id AS module_id, m.name AS module_name,
-                    m.claimed_by, s.feature_id
+                    m.claimed_by, m.feature_id
              FROM tasks t JOIN modules m ON m.id = t.module_id
-             JOIN stages s ON s.id = m.stage_id
              WHERE t.id = $1 FOR UPDATE OF t",
         )
         .bind(task_id)
@@ -911,8 +912,8 @@ impl Store {
         let agent: &str = &actor.name;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, s.feature_id
-             FROM modules m JOIN stages s ON s.id = m.stage_id
+            "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, m.feature_id
+             FROM modules m
              WHERE m.id = $1 FOR UPDATE OF m",
         )
         .bind(module_id)
@@ -961,36 +962,41 @@ impl Store {
     }
 
     /// The exit interview: refuses while tasks are open, commits the
-    /// summary as a module-scope memory, and unlocks the next stage
-    /// when this was the last module standing.
-    /// Finish a module. `used` names the memories the work actually
-    /// leaned on.
+    /// summary as a module-scope memory, and emits `module_unlocked` for
+    /// every dependent whose gate this completion opened.
     ///
-    /// The exit doors are the best place to attest: the agent has just
-    /// finished and knows what helped, and — unlike at search time —
-    /// the OUTCOME is known. A touch recorded here rode work that
-    /// succeeded, which is the closest thing to accuracy evidence
-    /// available without asking anyone to grade anything.
+    /// `used` names the memories the work actually leaned on. The exit
+    /// doors are the best place to attest: the agent has just finished
+    /// and knows what helped, and — unlike at search time — the OUTCOME
+    /// is known. A touch recorded here rode work that succeeded, which
+    /// is the closest thing to accuracy evidence available without
+    /// asking anyone to grade anything.
+    ///
+    /// `handoff`, when given, is written as the module's handoff
+    /// document in the same transaction: how to use what was built, for
+    /// the agent that continues from here. The summary is the paragraph
+    /// every later briefing carries; the handoff is the page it links.
     pub async fn complete_module(
         &self,
         actor: impl Into<Actor>,
         module_id: &str,
         summary: &str,
         used: &[String],
+        handoff: Option<&str>,
     ) -> Result<Ack> {
         let actor = actor.into();
         let agent: &str = &actor.name;
         if summary.trim().is_empty() {
             return Err(plan_invalid(
                 "complete_module requires a non-empty summary — it becomes the memory the \
-                 next stage's workers read.",
+                 workers downstream of you read.",
             ));
         }
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by,
-                    s.id AS stage_id, s.name AS stage_name, s.position, s.feature_id
-             FROM modules m JOIN stages s ON s.id = m.stage_id
+                    m.feature_id
+             FROM modules m
              WHERE m.id = $1 FOR UPDATE OF m",
         )
         .bind(module_id)
@@ -1008,9 +1014,6 @@ impl Store {
         }
         require_claim(&row, &actor, "complete it")?;
         let module_name: String = row.get("module_name");
-        let stage_id: String = row.get("stage_id");
-        let stage_name: String = row.get("stage_name");
-        let position: i32 = row.get("position");
         let feature_id: String = row.get("feature_id");
 
         let open = sqlx::query(
@@ -1064,65 +1067,97 @@ impl Store {
             Some(&feature_id),
             Some(module_id),
             Some(agent),
-            json!({ "module": module_name, "stage": stage_name }),
+            json!({ "module": module_name }),
         )
         .await?;
         // Attested use, inside the same transaction as the completion —
         // so a touch recorded here is one that rode work that finished.
         attest_used(&mut tx, agent, used, "carried this module").await?;
-
-        // Stage completion → unlock the next stage.
-        let stage_open: i64 = sqlx::query(
-            "SELECT COUNT(*) AS n FROM modules WHERE stage_id = $1 AND status <> 'done'",
-        )
-        .bind(&stage_id)
-        .fetch_one(&mut *tx)
-        .await?
-        .get("n");
-        let mut unlocked: Option<String> = None;
-        if stage_open == 0 {
-            let next = sqlx::query(
-                "SELECT id, name, position FROM stages
-                 WHERE feature_id = $1 AND position > $2 ORDER BY position LIMIT 1",
+        if let Some(body) = handoff.map(str::trim).filter(|b| !b.is_empty()) {
+            let (doc_id, revision) =
+                insert_document(&mut tx, DocumentKind::Handoff, module_id, "", body, agent).await?;
+            record_event(
+                &mut tx,
+                "document_written",
+                Some(&feature_id),
+                Some(module_id),
+                Some(agent),
+                json!({
+                    "kind": "handoff",
+                    "subject": module_name,
+                    "document_id": doc_id,
+                    "revision": revision,
+                }),
             )
-            .bind(&feature_id)
-            .bind(position)
-            .fetch_optional(&mut *tx)
             .await?;
-            if let Some(next) = next {
-                let next_name: String = next.get("name");
-                record_event(
-                    &mut tx,
-                    "stage_unlocked",
-                    Some(&feature_id),
-                    Some(&next.get::<String, _>("id")),
-                    Some(agent),
-                    json!({
-                        "stage": next_name,
-                        "position": next.get::<i32, _>("position"),
-                        "unlocked_by": format!("stage '{stage_name}' completing"),
-                    }),
-                )
-                .await?;
-                unlocked = Some(next_name);
-            }
         }
+
+        // The unlock: every dependent whose prerequisites are now ALL
+        // done. Computed here, inside the completing transaction, so
+        // the event and the state it announces commit together.
+        let released = sqlx::query(
+            "SELECT c.id, c.name
+             FROM module_deps d JOIN modules c ON c.id = d.module_id
+             WHERE d.depends_on = $1 AND c.status = 'todo' AND c.claimed_by IS NULL
+               AND NOT EXISTS (SELECT 1 FROM module_deps d2
+                               JOIN modules p ON p.id = d2.depends_on
+                               WHERE d2.module_id = c.id AND p.status <> 'done')
+             ORDER BY c.name",
+        )
+        .bind(module_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut unlocked: Vec<String> = Vec::new();
+        for r in &released {
+            let id: String = r.get("id");
+            let name: String = r.get("name");
+            record_event(
+                &mut tx,
+                "module_unlocked",
+                Some(&feature_id),
+                Some(&id),
+                Some(agent),
+                json!({
+                    "module": name,
+                    "module_id": id,
+                    "unlocked_by": format!("'{module_name}' completing"),
+                }),
+            )
+            .await?;
+            unlocked.push(name);
+        }
+        let open_in_feature: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM modules WHERE feature_id = $1 AND status <> 'done'",
+        )
+        .bind(&feature_id)
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
-        let message = match &unlocked {
-            Some(next) => format!(
-                "Module '{module_name}' complete — that closed stage '{stage_name}' and \
-                 unlocked stage '{next}'. Your summary is on the record for downstream workers."
-            ),
-            None if stage_open == 0 => format!(
-                "Module '{module_name}' complete — that closed stage '{stage_name}', the last \
-                 stage of the feature. The manager can now complete_feature."
-            ),
-            None => format!(
-                "Module '{module_name}' complete. Stage '{stage_name}' has other modules still \
-                 in flight."
-            ),
+        let message = if !unlocked.is_empty() {
+            format!(
+                "Module '{module_name}' complete — that released {}. Your summary is on the \
+                 record for downstream workers.",
+                unlocked
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if open_in_feature == 0 {
+            format!(
+                "Module '{module_name}' complete — the last module of the feature. The manager \
+                 can now complete_feature."
+            )
+        } else {
+            format!(
+                "Module '{module_name}' complete. Nothing new became ready: the feature's \
+                 remaining modules are in flight or waiting on other prerequisites."
+            )
         };
-        Ok(Ack::with(message, json!({ "stage_unlocked": unlocked })))
+        Ok(Ack::with(
+            message,
+            json!({ "unlocked": unlocked, "open_in_feature": open_in_feature }),
+        ))
     }
 
     /// Flag the module blocked; keeps the claim, records the blocker as
@@ -1146,8 +1181,8 @@ impl Store {
         let agent: &str = &actor.name;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, s.feature_id
-             FROM modules m JOIN stages s ON s.id = m.stage_id
+            "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, m.feature_id
+             FROM modules m
              WHERE m.id = $1 FOR UPDATE OF m",
         )
         .bind(module_id)
@@ -1200,8 +1235,8 @@ impl Store {
         let agent: &str = &actor.name;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, s.feature_id
-             FROM modules m JOIN stages s ON s.id = m.stage_id
+            "SELECT m.id AS module_id, m.name AS module_name, m.status, m.claimed_by, m.feature_id
+             FROM modules m
              WHERE m.id = $1 FOR UPDATE OF m",
         )
         .bind(module_id)
@@ -1232,6 +1267,154 @@ impl Store {
             "Module '{module_name}' released back to the pool with its task states intact. \
              The next claimant inherits the checklist and everything committed to memory."
         )))
+    }
+
+    // -----------------------------------------------------------------
+    // Documents
+    // -----------------------------------------------------------------
+
+    /// Write a new revision of a document.
+    ///
+    /// A whitepaper is the feature's; any undelegated agent may revise
+    /// it (a delegated identity is confined to one module and a plan is
+    /// not a module). A handoff is the claim holder's, checked through
+    /// the same `require_claim` every other module write goes through.
+    /// Revisions are append-only; nothing here updates a row.
+    pub async fn write_document(
+        &self,
+        actor: impl Into<Actor>,
+        kind: DocumentKind,
+        subject_id: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<DocumentView> {
+        let actor = actor.into();
+        let agent: &str = &actor.name;
+        if body.trim().is_empty() {
+            return Err(plan_invalid(
+                "write_document needs a body — an empty revision would hide the previous one.",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let (feature_id, subject_name) = match kind {
+            DocumentKind::Whitepaper => {
+                if actor.is_delegated() {
+                    return Err(McpmError::new(
+                        ErrorCode::Forbidden,
+                        "A delegated identity is confined to its module; the whitepaper belongs \
+                         to the feature.",
+                        json!({ "subject_id": subject_id }),
+                        "Put what you learned in your module's handoff, or ask the agent that \
+                         minted you to revise the whitepaper.",
+                    ));
+                }
+                let row = sqlx::query("SELECT id, name FROM features WHERE id = $1 FOR UPDATE")
+                    .bind(subject_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or_else(|| McpmError::not_found("feature", subject_id))?;
+                (row.get::<String, _>("id"), row.get::<String, _>("name"))
+            }
+            DocumentKind::Handoff => {
+                let row = sqlx::query(
+                    "SELECT m.id AS module_id, m.name AS module_name, m.claimed_by, m.feature_id
+                     FROM modules m WHERE m.id = $1 FOR UPDATE OF m",
+                )
+                .bind(subject_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| McpmError::not_found("module", subject_id))?;
+                require_claim(&row, &actor, "write its handoff")?;
+                (row.get::<String, _>("feature_id"), row.get::<String, _>("module_name"))
+            }
+        };
+        let (id, revision) = insert_document(&mut tx, kind, subject_id, title, body, agent).await?;
+        record_event(
+            &mut tx,
+            "document_written",
+            Some(&feature_id),
+            Some(subject_id),
+            Some(agent),
+            json!({
+                "kind": kind.as_str(),
+                "subject": subject_name,
+                "document_id": id,
+                "revision": revision,
+                "title": title,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        self.document_by_id(&id)
+            .await?
+            .ok_or_else(|| McpmError::internal("document vanished mid-write"))
+    }
+
+    /// The current revision of one document, if any was ever written.
+    pub async fn read_document(
+        &self,
+        kind: DocumentKind,
+        subject_id: &str,
+    ) -> Result<Option<DocumentView>> {
+        self.current_document(kind, subject_id).await
+    }
+
+    /// Every current document of one feature: its whitepaper and each
+    /// module's handoff, for the console and for a manager reading what
+    /// the crew wrote down.
+    pub async fn feature_documents(&self, feature_id: &str) -> Result<Vec<DocumentView>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {DOCUMENT_FIELDS} FROM documents doc
+             {DOCUMENT_JOINS}
+             WHERE (doc.level = 'feature' AND doc.subject_id = $1)
+                OR (doc.level = 'module' AND m.feature_id = $1)
+             ORDER BY doc.level, doc.subject_id, doc.kind, doc.revision DESC"
+        ))
+        .bind(feature_id)
+        .fetch_all(&self.pool)
+        .await?;
+        // Newest revision per (subject, kind): the rows arrive revision-
+        // descending within each group, so the first of each group wins.
+        let mut out: Vec<DocumentView> = Vec::new();
+        for r in rows.iter() {
+            let doc = map_document(r);
+            if !out
+                .iter()
+                .any(|d| d.subject_id == doc.subject_id && d.kind == doc.kind)
+            {
+                out.push(doc);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn current_document(
+        &self,
+        kind: DocumentKind,
+        subject_id: &str,
+    ) -> Result<Option<DocumentView>> {
+        let row = sqlx::query(&format!(
+            "SELECT {DOCUMENT_FIELDS} FROM documents doc
+             {DOCUMENT_JOINS}
+             WHERE doc.level = $1 AND doc.subject_id = $2 AND doc.kind = $3
+             ORDER BY doc.revision DESC LIMIT 1"
+        ))
+        .bind(kind.level().as_str())
+        .bind(subject_id)
+        .bind(kind.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(map_document))
+    }
+
+    async fn document_by_id(&self, id: &str) -> Result<Option<DocumentView>> {
+        let row = sqlx::query(&format!(
+            "SELECT {DOCUMENT_FIELDS} FROM documents doc {DOCUMENT_JOINS} WHERE doc.id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(map_document))
     }
 
     // -----------------------------------------------------------------
@@ -2184,9 +2367,10 @@ impl Store {
             }
             _ => {}
         }
-        if let Some(plan) = &req.plan {
-            validate_plan(plan)?;
-        }
+        let lowered = match &req.plan {
+            Some(plan) => Some(validate_plan(plan)?),
+            None => None,
+        };
 
         // Resolve every want first: a promotion that would drop one is
         // refused whole, before anything is written.
@@ -2222,7 +2406,10 @@ impl Store {
 
         let mut tx = self.pool.begin().await?;
         let feature_id = match (&req.plan, &req.feature_id) {
-            (Some(plan), _) => insert_plan(&mut tx, agent, plan).await?,
+            (Some(plan), _) => {
+                let modules = lowered.as_deref().expect("validated above");
+                insert_plan(&mut tx, agent, plan, modules).await?
+            }
             (_, Some(existing)) => {
                 let known: Option<String> = sqlx::query_scalar("SELECT id FROM features WHERE id = $1")
                     .bind(existing)
@@ -2437,7 +2624,8 @@ impl Store {
     // Tree assembly + helpers
     // -----------------------------------------------------------------
 
-    /// Full tree with derived stage statuses and dispatchability.
+    /// The full graph with every derived fact: what each module waits
+    /// on, its depth, and whether it is dispatchable right now.
     pub async fn feature_tree(&self, feature_id: &str) -> Result<FeatureTree> {
         let feature = sqlx::query("SELECT id, name, description, status, summary FROM features WHERE id = $1")
             .bind(feature_id)
@@ -2445,16 +2633,17 @@ impl Store {
             .await?
             .ok_or_else(|| McpmError::not_found("feature", feature_id))?;
 
-        let stage_rows = sqlx::query(
-            "SELECT id, name, position FROM stages WHERE feature_id = $1 ORDER BY position",
+        let module_rows = sqlx::query(
+            "SELECT id, name, description, status, claimed_by, summary, owns
+             FROM modules WHERE feature_id = $1 ORDER BY name",
         )
         .bind(feature_id)
         .fetch_all(&self.pool)
         .await?;
-        let module_rows = sqlx::query(
-            "SELECT m.id, m.stage_id, m.name, m.description, m.status, m.claimed_by, m.summary
-             FROM modules m JOIN stages s ON s.id = m.stage_id
-             WHERE s.feature_id = $1 ORDER BY s.position, m.name",
+        let edge_rows = sqlx::query(
+            "SELECT d.module_id, d.depends_on
+             FROM module_deps d JOIN modules m ON m.id = d.module_id
+             WHERE m.feature_id = $1 ORDER BY d.module_id, d.depends_on",
         )
         .bind(feature_id)
         .fetch_all(&self.pool)
@@ -2462,77 +2651,93 @@ impl Store {
         let task_rows = sqlx::query(
             "SELECT t.id, t.module_id, t.name, t.status, t.origin, t.note
              FROM tasks t JOIN modules m ON m.id = t.module_id
-             JOIN stages s ON s.id = m.stage_id
-             WHERE s.feature_id = $1 ORDER BY t.position, t.created_at",
+             WHERE m.feature_id = $1 ORDER BY t.position, t.created_at",
         )
         .bind(feature_id)
         .fetch_all(&self.pool)
         .await?;
 
-        // Lowest stage position holding any unfinished module = the
-        // unlocked frontier. Everything before is done; after, locked.
-        let lowest_open: Option<i32> = stage_rows
+        let edges: Vec<(String, String)> = edge_rows
             .iter()
-            .filter(|s| {
-                let sid: String = s.get("id");
-                module_rows.iter().any(|m| {
-                    m.get::<String, _>("stage_id") == sid && m.get::<String, _>("status") != "done"
-                })
-            })
-            .map(|s| s.get::<i32, _>("position"))
-            .min();
-
-        let stages = stage_rows
+            .map(|r| (r.get("module_id"), r.get("depends_on")))
+            .collect();
+        let nodes: Vec<GraphNode> = module_rows
             .iter()
-            .map(|s| {
-                let sid: String = s.get("id");
-                let position: i32 = s.get("position");
-                let status = match lowest_open {
-                    None => "done",
-                    Some(open) if position < open => "done",
-                    Some(open) if position == open => "unlocked",
-                    Some(_) => "locked",
-                };
-                let modules = module_rows
-                    .iter()
-                    .filter(|m| m.get::<String, _>("stage_id") == sid)
-                    .map(|m| {
-                        let mid: String = m.get("id");
-                        let mstatus: String = m.get("status");
-                        let claimed: Option<String> = m.get("claimed_by");
-                        ModuleView {
-                            dispatchable: mstatus == "todo"
-                                && claimed.is_none()
-                                && status == "unlocked",
-                            id: mid.clone(),
-                            name: m.get("name"),
-                            description: m.get("description"),
-                            status: mstatus,
-                            claimed_by: claimed,
-                            summary: m.get("summary"),
-                            tasks: task_rows
-                                .iter()
-                                .filter(|t| t.get::<String, _>("module_id") == mid)
-                                .map(|t| TaskView {
-                                    id: t.get("id"),
-                                    name: t.get("name"),
-                                    status: t.get("status"),
-                                    origin: t.get("origin"),
-                                    note: t.get("note"),
-                                })
-                                .collect(),
-                        }
-                    })
-                    .collect();
-                StageView {
-                    id: sid,
-                    name: s.get("name"),
-                    position,
-                    status: status.to_string(),
-                    modules,
+            .map(|m| {
+                let id: String = m.get("id");
+                GraphNode {
+                    deps: edges
+                        .iter()
+                        .filter(|(from, _)| *from == id)
+                        .map(|(_, to)| to.clone())
+                        .collect(),
+                    key: m.get("name"),
+                    id,
                 }
             })
             .collect();
+        // A stored graph is acyclic by construction (every writer checks),
+        // so an Err here is corruption, not a plan error.
+        let order = topo_order(&nodes).map_err(|cycle| {
+            McpmError::internal(format!(
+                "feature {feature_id} holds a dependency cycle: {}",
+                cycle.join(" -> ")
+            ))
+        })?;
+        let status_of = |id: &str| -> String {
+            module_rows
+                .iter()
+                .find(|m| m.get::<String, _>("id") == id)
+                .map(|m| m.get("status"))
+                .unwrap_or_default()
+        };
+
+        let mut modules: Vec<ModuleView> = Vec::with_capacity(order.len());
+        for (mid, depth) in order {
+            let m = module_rows
+                .iter()
+                .find(|m| m.get::<String, _>("id") == mid)
+                .expect("topo_order returns only known ids");
+            let mstatus: String = m.get("status");
+            let claimed: Option<String> = m.get("claimed_by");
+            let depends_on: Vec<String> = edges
+                .iter()
+                .filter(|(from, _)| *from == mid)
+                .map(|(_, to)| to.clone())
+                .collect();
+            let waiting_on: Vec<String> = depends_on
+                .iter()
+                .filter(|d| status_of(d) != "done")
+                .cloned()
+                .collect();
+            modules.push(ModuleView {
+                dispatchable: mstatus == "todo" && claimed.is_none() && waiting_on.is_empty(),
+                id: mid.clone(),
+                name: m.get("name"),
+                description: m.get("description"),
+                status: mstatus,
+                claimed_by: claimed,
+                summary: m.get("summary"),
+                depends_on,
+                waiting_on,
+                owns: m.get("owns"),
+                depth,
+                tasks: task_rows
+                    .iter()
+                    .filter(|t| t.get::<String, _>("module_id") == mid)
+                    .map(|t| TaskView {
+                        id: t.get("id"),
+                        name: t.get("name"),
+                        status: t.get("status"),
+                        origin: t.get("origin"),
+                        note: t.get("note"),
+                    })
+                    .collect(),
+            });
+        }
+        let whitepaper = self
+            .current_document(DocumentKind::Whitepaper, feature_id)
+            .await?;
 
         Ok(FeatureTree {
             id: feature.get("id"),
@@ -2540,28 +2745,9 @@ impl Store {
             description: feature.get("description"),
             status: feature.get("status"),
             summary: feature.get("summary"),
-            stages,
+            modules,
+            whitepaper,
         })
-    }
-
-    async fn tasks_of(&self, module_id: &str) -> Result<Vec<TaskView>> {
-        let rows = sqlx::query(
-            "SELECT id, name, status, origin, note FROM tasks
-             WHERE module_id = $1 ORDER BY position, created_at",
-        )
-        .bind(module_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|t| TaskView {
-                id: t.get("id"),
-                name: t.get("name"),
-                status: t.get("status"),
-                origin: t.get("origin"),
-                note: t.get("note"),
-            })
-            .collect())
     }
 
     async fn subject_name(&self, level: Level, id: &str) -> Result<Option<String>> {
@@ -2579,7 +2765,6 @@ impl Store {
         let table = match level {
             Level::Project => unreachable!("handled above"),
             Level::Feature => "features",
-            Level::Stage => "stages",
             Level::Module => "modules",
             Level::Task => "tasks",
         };
@@ -2600,13 +2785,10 @@ impl Store {
         let sql = match level {
             Level::Project => unreachable!("handled above"),
             Level::Feature => "SELECT id AS feature_id FROM features WHERE id = $1",
-            Level::Stage => "SELECT feature_id FROM stages WHERE id = $1",
-            Level::Module => {
-                "SELECT s.feature_id FROM modules m JOIN stages s ON s.id = m.stage_id WHERE m.id = $1"
-            }
+            Level::Module => "SELECT feature_id FROM modules WHERE id = $1",
             Level::Task => {
-                "SELECT s.feature_id FROM tasks t JOIN modules m ON m.id = t.module_id
-                 JOIN stages s ON s.id = m.stage_id WHERE t.id = $1"
+                "SELECT m.feature_id FROM tasks t JOIN modules m ON m.id = t.module_id
+                 WHERE t.id = $1"
             }
         };
         let row = sqlx::query(sql).bind(id).fetch_optional(&self.pool).await?;
@@ -2616,8 +2798,8 @@ impl Store {
     /// Resolve the anchor + direction into per-level subject id sets.
     async fn subject_sets(&self, scope: &MemoryScope, dir: SearchDirection) -> Result<SubjectSets> {
         let mut sets = SubjectSets::default();
-        // The anchor's ancestor chain (feature, stage?, module?, task?).
-        // A project anchor has no ancestor chain: it IS the top. `here`
+        // The anchor's ancestor chain (feature, module?, task?). A
+        // project anchor has no ancestor chain: it IS the top. `here`
         // and `up` both mean the project's own shelf; `down` means
         // everything, which the caller handles by leaving the sets
         // empty and unscoping the query.
@@ -2625,39 +2807,22 @@ impl Store {
             sets.project = true;
             return Ok(sets);
         }
-        let (feature, stage, module, task): (Option<String>, Option<String>, Option<String>, Option<String>) =
+        let (feature, module, task): (Option<String>, Option<String>, Option<String>) =
             match scope.level {
                 Level::Project => unreachable!("handled above"),
-                Level::Feature => (Some(scope.id.clone()), None, None, None),
-                Level::Stage => {
-                    let r = sqlx::query("SELECT feature_id FROM stages WHERE id = $1")
+                Level::Feature => (Some(scope.id.clone()), None, None),
+                Level::Module => {
+                    let r = sqlx::query("SELECT feature_id FROM modules WHERE id = $1")
                         .bind(&scope.id)
                         .fetch_optional(&self.pool)
                         .await?
-                        .ok_or_else(|| McpmError::not_found("stage", &scope.id))?;
-                    (Some(r.get("feature_id")), Some(scope.id.clone()), None, None)
-                }
-                Level::Module => {
-                    let r = sqlx::query(
-                        "SELECT s.id AS stage_id, s.feature_id
-                         FROM modules m JOIN stages s ON s.id = m.stage_id WHERE m.id = $1",
-                    )
-                    .bind(&scope.id)
-                    .fetch_optional(&self.pool)
-                    .await?
-                    .ok_or_else(|| McpmError::not_found("module", &scope.id))?;
-                    (
-                        Some(r.get("feature_id")),
-                        Some(r.get("stage_id")),
-                        Some(scope.id.clone()),
-                        None,
-                    )
+                        .ok_or_else(|| McpmError::not_found("module", &scope.id))?;
+                    (Some(r.get("feature_id")), Some(scope.id.clone()), None)
                 }
                 Level::Task => {
                     let r = sqlx::query(
-                        "SELECT m.id AS module_id, s.id AS stage_id, s.feature_id
-                         FROM tasks t JOIN modules m ON m.id = t.module_id
-                         JOIN stages s ON s.id = m.stage_id WHERE t.id = $1",
+                        "SELECT m.id AS module_id, m.feature_id
+                         FROM tasks t JOIN modules m ON m.id = t.module_id WHERE t.id = $1",
                     )
                     .bind(&scope.id)
                     .fetch_optional(&self.pool)
@@ -2665,7 +2830,6 @@ impl Store {
                     .ok_or_else(|| McpmError::not_found("task", &scope.id))?;
                     (
                         Some(r.get("feature_id")),
-                        Some(r.get("stage_id")),
                         Some(r.get("module_id")),
                         Some(scope.id.clone()),
                     )
@@ -2676,13 +2840,11 @@ impl Store {
         match scope.level {
             Level::Project => unreachable!("handled above"),
             Level::Feature => sets.features.extend(feature.clone()),
-            Level::Stage => sets.stages.extend(stage.clone()),
             Level::Module => sets.modules.extend(module.clone()),
             Level::Task => sets.tasks.extend(task.clone()),
         }
         if dir == SearchDirection::Up {
             sets.features.extend(feature.clone());
-            sets.stages.extend(stage.clone());
             sets.modules.extend(module.clone());
             sets.tasks.extend(task.clone());
             // The chain now terminates at the project, so a worker
@@ -2699,30 +2861,10 @@ impl Store {
                 Level::Project => unreachable!("handled above"),
                 Level::Feature => {
                     let rows = sqlx::query(
-                        "SELECT s.id AS stage_id, m.id AS module_id, t.id AS task_id
-                         FROM stages s
-                         LEFT JOIN modules m ON m.stage_id = s.id
-                         LEFT JOIN tasks t ON t.module_id = m.id
-                         WHERE s.feature_id = $1",
-                    )
-                    .bind(&scope.id)
-                    .fetch_all(&self.pool)
-                    .await?;
-                    for r in rows {
-                        sets.stages.push(r.get("stage_id"));
-                        if let Some(m) = r.get::<Option<String>, _>("module_id") {
-                            sets.modules.push(m);
-                        }
-                        if let Some(t) = r.get::<Option<String>, _>("task_id") {
-                            sets.tasks.push(t);
-                        }
-                    }
-                }
-                Level::Stage => {
-                    let rows = sqlx::query(
                         "SELECT m.id AS module_id, t.id AS task_id
-                         FROM modules m LEFT JOIN tasks t ON t.module_id = m.id
-                         WHERE m.stage_id = $1",
+                         FROM modules m
+                         LEFT JOIN tasks t ON t.module_id = m.id
+                         WHERE m.feature_id = $1",
                     )
                     .bind(&scope.id)
                     .fetch_all(&self.pool)
@@ -3053,8 +3195,8 @@ impl Store {
             None => key_id.map(str::to_string),
         };
         let row = sqlx::query(
-            "SELECT m.id, m.name AS module_name, m.status, s.feature_id
-             FROM modules m JOIN stages s ON s.id = m.stage_id
+            "SELECT m.id, m.name AS module_name, m.status, m.feature_id
+             FROM modules m
              WHERE m.id = $1 FOR UPDATE OF m",
         )
         .bind(module_id)
@@ -3092,8 +3234,8 @@ impl Store {
         if let Some(id) = key_id {
             if minter_key_role(&mut tx, id).await? == Some(KeyRole::Worker) {
                 let held: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM modules m JOIN stages s ON s.id = m.stage_id
-                     WHERE s.feature_id = $1 AND m.claimed_by = $2
+                    "SELECT count(*) FROM modules m
+                     WHERE m.feature_id = $1 AND m.claimed_by = $2
                        AND m.status IN ('in_progress', 'blocked')",
                 )
                 .bind(&feature_id)
@@ -3324,6 +3466,8 @@ impl Store {
 struct SubjectSets {
     project: bool,
     features: Vec<String>,
+    /// Always empty since migration 0012 retired stages; kept so the
+    /// ranking SQL's parameter numbering stays stable.
     stages: Vec<String>,
     modules: Vec<String>,
     tasks: Vec<String>,
@@ -3335,6 +3479,317 @@ impl SubjectSets {
             set.sort();
             set.dedup();
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The module graph, as pure functions
+// ---------------------------------------------------------------------
+
+/// One module and the ids (or names, at plan time) it depends on.
+/// `key` breaks ordering ties — the module's name at runtime, so two
+/// modules at one depth list in a stable, human order rather than by
+/// the random half of their ids.
+#[derive(Clone, Debug)]
+struct GraphNode {
+    id: String,
+    key: String,
+    deps: Vec<String>,
+}
+
+/// Topological order with depths: every node after all of its
+/// prerequisites, ties by depth then key. `depth` is the longest path
+/// from a root, 1-based. `Err` carries one cycle as a path of ids.
+///
+/// Kahn's algorithm over a set small enough (a feature holds tens of
+/// modules) that the quadratic lookups below cost nothing measurable.
+fn topo_order(nodes: &[GraphNode]) -> std::result::Result<Vec<(String, i32)>, Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let known: BTreeSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut indegree: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for n in nodes {
+        let deps: Vec<&str> = n
+            .deps
+            .iter()
+            .map(String::as_str)
+            .filter(|d| known.contains(d))
+            .collect();
+        indegree.insert(n.id.as_str(), deps.len());
+        for d in deps {
+            dependents.entry(d).or_default().push(n.id.as_str());
+        }
+    }
+    let key_of: BTreeMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.key.as_str()))
+        .collect();
+    let mut depth: BTreeMap<&str, i32> = BTreeMap::new();
+    let mut ready: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut out: Vec<(String, i32)> = Vec::with_capacity(nodes.len());
+    while !ready.is_empty() {
+        // Deterministic: among the ready, shallowest first, then by key.
+        ready.sort_by(|a, b| {
+            depth
+                .get(a)
+                .unwrap_or(&1)
+                .cmp(depth.get(b).unwrap_or(&1))
+                .then_with(|| key_of[a].cmp(key_of[b]))
+                .then_with(|| a.cmp(b))
+        });
+        let id = ready.remove(0);
+        let d = *depth.get(id).unwrap_or(&1);
+        out.push((id.to_string(), d));
+        if let Some(children) = dependents.get(id) {
+            for child in children {
+                let e = depth.entry(child).or_insert(1);
+                *e = (*e).max(d + 1);
+                let left = indegree.get_mut(child).expect("child is a known node");
+                *left -= 1;
+                if *left == 0 {
+                    ready.push(child);
+                }
+            }
+        }
+    }
+    if out.len() == nodes.len() {
+        return Ok(out);
+    }
+    // Something never reached indegree 0: walk the leftovers to name
+    // one cycle, so the refusal says which modules to look at.
+    let stuck: BTreeSet<&str> = indegree
+        .iter()
+        .filter(|(_, d)| **d > 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let start = *stuck.iter().next().expect("stuck set is non-empty");
+    let mut path: Vec<&str> = vec![start];
+    let mut cur = start;
+    loop {
+        let node = nodes.iter().find(|n| n.id == cur).expect("known");
+        let next = node
+            .deps
+            .iter()
+            .map(String::as_str)
+            .find(|d| stuck.contains(d))
+            .expect("a stuck node has a stuck prerequisite");
+        if let Some(pos) = path.iter().position(|p| *p == next) {
+            let mut cycle: Vec<String> = path[pos..].iter().map(|s| s.to_string()).collect();
+            cycle.push(next.to_string());
+            return Err(cycle);
+        }
+        path.push(next);
+        cur = next;
+    }
+}
+
+/// Whether two owned paths collide: equal, or one is a directory prefix
+/// of the other. Segment-aware, so `crates/api` covers `crates/api/x.rs`
+/// and does not cover `crates/api2`.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let a = a.trim().trim_end_matches('/');
+    let b = b.trim().trim_end_matches('/');
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// Two modules whose owned paths overlap must be ordered — one must be
+/// reachable from the other through the graph — or they are two writers
+/// on one file with nothing stopping them running at once. Returns every
+/// unordered overlapping pair as `(a, b, a's path, b's path)`.
+fn ownership_conflicts(nodes: &[GraphNode], owns: &[(String, Vec<String>)]) -> Vec<(String, String, String, String)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // Transitive prerequisites of each node.
+    let by_id: BTreeMap<&str, &GraphNode> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let ancestors = |start: &str| -> BTreeSet<String> {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut stack: Vec<&str> = vec![start];
+        while let Some(cur) = stack.pop() {
+            if let Some(n) = by_id.get(cur) {
+                for d in &n.deps {
+                    if seen.insert(d.clone()) {
+                        stack.push(d.as_str());
+                    }
+                }
+            }
+        }
+        seen
+    };
+    let mut out = Vec::new();
+    for (i, (a, a_paths)) in owns.iter().enumerate() {
+        for (b, b_paths) in owns.iter().skip(i + 1) {
+            let clash = a_paths
+                .iter()
+                .flat_map(|ap| b_paths.iter().map(move |bp| (ap, bp)))
+                .find(|(ap, bp)| paths_overlap(ap, bp));
+            if let Some((ap, bp)) = clash {
+                let ordered = ancestors(a).contains(b) || ancestors(b).contains(a);
+                if !ordered {
+                    out.push((a.clone(), b.clone(), ap.clone(), bp.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Re-run the ownership rule over a stored feature, inside a revision's
+/// transaction. Every op that adds a module, adds or drops an edge, or
+/// changes owned paths ends here.
+async fn check_ownership(tx: &mut Tx<'_>, feature_id: &str) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT m.id, m.name, m.owns,
+                COALESCE(array_agg(d.depends_on) FILTER (WHERE d.depends_on IS NOT NULL), '{}')
+                    AS deps
+         FROM modules m LEFT JOIN module_deps d ON d.module_id = m.id
+         WHERE m.feature_id = $1 GROUP BY m.id, m.name, m.owns",
+    )
+    .bind(feature_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let nodes: Vec<GraphNode> = rows
+        .iter()
+        .map(|r| GraphNode {
+            id: r.get("id"),
+            key: r.get("name"),
+            deps: r.get("deps"),
+        })
+        .collect();
+    let owns: Vec<(String, Vec<String>)> = rows
+        .iter()
+        .map(|r| (r.get("id"), r.get("owns")))
+        .collect();
+    let names: std::collections::BTreeMap<String, String> = rows
+        .iter()
+        .map(|r| (r.get("id"), r.get("name")))
+        .collect();
+    let conflicts = ownership_conflicts(&nodes, &owns);
+    if let Some((a, b, ap, bp)) = conflicts.first() {
+        return Err(plan_invalid(format!(
+            "Modules '{}' ({a}) and '{}' ({b}) both own '{ap}' / '{bp}' and neither depends on \
+             the other — two writers on one path with nothing ordering them. Add an edge \
+             between them (add_dependency) or narrow what one of them owns.",
+            names.get(a).cloned().unwrap_or_default(),
+            names.get(b).cloned().unwrap_or_default(),
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `from` can reach `to` through prerequisite edges — the cycle
+/// check for `add_dependency`. Adding `module -> dep` closes a cycle
+/// exactly when `dep` already reaches `module`.
+async fn reaches(tx: &mut Tx<'_>, from: &str, to: &str) -> Result<bool> {
+    let hit: Option<i32> = sqlx::query_scalar(
+        "WITH RECURSIVE r AS (
+             SELECT depends_on AS id FROM module_deps WHERE module_id = $1
+             UNION
+             SELECT d.depends_on FROM module_deps d JOIN r ON d.module_id = r.id
+         )
+         SELECT 1 FROM r WHERE id = $2 LIMIT 1",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(hit.is_some())
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    fn node(id: &str, deps: &[&str]) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            key: id.into(),
+            deps: deps.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_ladder_lowers_to_depths() {
+        let order = topo_order(&[
+            node("c", &["b"]),
+            node("a", &[]),
+            node("b", &["a"]),
+        ])
+        .unwrap();
+        assert_eq!(
+            order,
+            vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]
+        );
+    }
+
+    #[test]
+    fn depth_is_the_longest_path() {
+        // d waits on a (depth 1) and on c (depth 3, via b): the longest
+        // path wins, so d is depth 4 however short its other edge is.
+        let order = topo_order(&[
+            node("a", &[]),
+            node("b", &["a"]),
+            node("c", &["b"]),
+            node("d", &["a", "c"]),
+            node("e", &["a"]),
+        ])
+        .unwrap();
+        let depth = |id: &str| order.iter().find(|(i, _)| i == id).unwrap().1;
+        assert_eq!(depth("d"), 4);
+        assert_eq!(depth("e"), 2);
+        // Ready set after a is {b, e}, both depth 2: ties break by key.
+        let ids: Vec<&str> = order.iter().map(|(i, _)| i.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "e", "c", "d"]);
+    }
+
+    #[test]
+    fn a_cycle_is_named() {
+        let err = topo_order(&[
+            node("a", &["c"]),
+            node("b", &["a"]),
+            node("c", &["b"]),
+            node("d", &[]),
+        ])
+        .unwrap_err();
+        assert_eq!(err.len(), 4, "a closed path: {err:?}");
+        assert_eq!(err.first(), err.last());
+    }
+
+    #[test]
+    fn unknown_prerequisites_are_ignored_by_ordering() {
+        // Validation refuses them; ordering must not hang on them.
+        let order = topo_order(&[node("a", &["ghost"])]).unwrap();
+        assert_eq!(order, vec![("a".into(), 1)]);
+    }
+
+    #[test]
+    fn overlap_is_segment_aware() {
+        assert!(paths_overlap("crates/api", "crates/api/src/lib.rs"));
+        assert!(paths_overlap("crates/api/", "crates/api"));
+        assert!(!paths_overlap("crates/api", "crates/api2"));
+        assert!(!paths_overlap("", "crates/api"));
+    }
+
+    #[test]
+    fn overlapping_owners_must_be_ordered() {
+        let nodes = vec![node("a", &[]), node("b", &["a"]), node("c", &[])];
+        let owns = vec![
+            ("a".to_string(), vec!["src/store.rs".to_string()]),
+            ("b".to_string(), vec!["src/store.rs".to_string()]),
+            ("c".to_string(), vec!["src".to_string()]),
+        ];
+        let conflicts = ownership_conflicts(&nodes, &owns);
+        // a/b are ordered; c overlaps both and is ordered with neither.
+        let pairs: Vec<(String, String)> = conflicts
+            .iter()
+            .map(|(a, b, _, _)| (a.clone(), b.clone()))
+            .collect();
+        assert_eq!(pairs, vec![("a".into(), "c".into()), ("b".into(), "c".into())]);
     }
 }
 
@@ -3542,8 +3997,65 @@ fn plan_conflict(message: impl Into<String>) -> McpmError {
         message,
         serde_json::Value::Null,
         "Plan forward, not backward: completed or claimed work is history. Add new \
-         stages/modules/tasks instead of rewriting finished ones.",
+         modules/tasks instead of rewriting finished ones.",
     )
+}
+
+/// One revision of a document, appended. Returns `(id, revision)`.
+async fn insert_document(
+    tx: &mut Tx<'_>,
+    kind: DocumentKind,
+    subject_id: &str,
+    title: &str,
+    body: &str,
+    author: &str,
+) -> Result<(String, i32)> {
+    let id = new_document_id();
+    let revision: i32 = sqlx::query_scalar(
+        "INSERT INTO documents (id, level, subject_id, kind, revision, title, body, author)
+         VALUES ($1, $2, $3, $4,
+                 (SELECT COALESCE(MAX(revision), 0) + 1 FROM documents
+                   WHERE level = $2 AND subject_id = $3 AND kind = $4),
+                 $5, $6, $7)
+         RETURNING revision",
+    )
+    .bind(&id)
+    .bind(kind.level().as_str())
+    .bind(subject_id)
+    .bind(kind.as_str())
+    .bind(title.trim())
+    .bind(body)
+    .bind(author)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((id, revision))
+}
+
+/// The projection every document read shares. Assumes the row is
+/// aliased `doc` and [`DOCUMENT_JOINS`] is in scope.
+const DOCUMENT_FIELDS: &str = "
+    doc.id, doc.level, doc.subject_id, doc.kind, doc.revision, doc.title, doc.body,
+    doc.author, doc.created_at,
+    COALESCE(f.name, m.name, doc.subject_id) AS subject_name";
+
+const DOCUMENT_JOINS: &str = "
+    LEFT JOIN features f ON doc.level = 'feature' AND f.id = doc.subject_id
+    LEFT JOIN modules m  ON doc.level = 'module'  AND m.id = doc.subject_id";
+
+fn map_document(r: &sqlx::postgres::PgRow) -> DocumentView {
+    DocumentView {
+        id: r.get("id"),
+        level: r.get("level"),
+        subject_id: r.get("subject_id"),
+        subject_name: r.get("subject_name"),
+        kind: DocumentKind::parse(r.get::<String, _>("kind").as_str())
+            .unwrap_or(DocumentKind::Handoff),
+        revision: r.get("revision"),
+        title: r.get("title"),
+        body: r.get("body"),
+        author: r.get("author"),
+        created_at: r.get("created_at"),
+    }
 }
 
 fn unique_to_plan_invalid(what: &str) -> impl Fn(sqlx::Error) -> McpmError + '_ {
@@ -3562,83 +4074,26 @@ async fn apply_plan_op(
     op: PlanOp,
 ) -> std::result::Result<String, McpmError> {
     match op {
-        PlanOp::AddStage { name, after } => {
-            let position: i32 = match &after {
-                None => sqlx::query("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM stages WHERE feature_id = $1")
-                    .bind(feature_id)
-                    .fetch_one(&mut **tx)
-                    .await?
-                    .get("p"),
-                Some(after_id) => {
-                    let row = sqlx::query("SELECT position FROM stages WHERE id = $1 AND feature_id = $2")
-                        .bind(after_id)
-                        .bind(feature_id)
-                        .fetch_optional(&mut **tx)
-                        .await?
-                        .ok_or_else(|| McpmError::not_found("stage", after_id))?;
-                    let after_pos: i32 = row.get("position");
-                    sqlx::query("UPDATE stages SET position = position + 1 WHERE feature_id = $1 AND position > $2")
-                        .bind(feature_id)
-                        .bind(after_pos)
-                        .execute(&mut **tx)
-                        .await?;
-                    after_pos + 1
-                }
-            };
-            let id = new_id(Level::Stage);
-            sqlx::query("INSERT INTO stages (id, feature_id, name, position) VALUES ($1, $2, $3, $4)")
-                .bind(&id)
-                .bind(feature_id)
-                .bind(&name)
-                .bind(position)
-                .execute(&mut **tx)
-                .await
-                .map_err(unique_to_plan_invalid("duplicate stage name in this feature"))?;
-            Ok(format!("add_stage '{name}' ({id}) at position {position}"))
-        }
-        PlanOp::AddModule { stage_id, name, description, tasks } => {
-            let stage = sqlx::query("SELECT position FROM stages WHERE id = $1 AND feature_id = $2")
-                .bind(&stage_id)
-                .bind(feature_id)
-                .fetch_optional(&mut **tx)
-                .await?
-                .ok_or_else(|| McpmError::not_found("stage", &stage_id))?;
-            let position: i32 = stage.get("position");
-            // Adding to a completed stage would retroactively re-lock
-            // later stages that already started — that rewrites history.
-            let stage_done: i64 = sqlx::query(
-                "SELECT COUNT(*) AS n FROM modules WHERE stage_id = $1 AND status <> 'done'",
-            )
-            .bind(&stage_id)
-            .fetch_one(&mut **tx)
-            .await?
-            .get("n");
-            if stage_done == 0 {
-                let later_started: i64 = sqlx::query(
-                    "SELECT COUNT(*) AS n FROM modules m JOIN stages s ON s.id = m.stage_id
-                     WHERE s.feature_id = $1 AND s.position > $2 AND m.status <> 'todo'",
-                )
-                .bind(feature_id)
-                .bind(position)
-                .fetch_one(&mut **tx)
-                .await?
-                .get("n");
-                if later_started > 0 {
-                    return Err(plan_conflict(format!(
-                        "Stage {position} is complete and later stages have already started — \
-                         adding a module there would retroactively close an open gate."
-                    )));
-                }
-            }
+        PlanOp::AddModule { name, description, tasks, depends_on, owns } => {
             let id = new_id(Level::Module);
-            sqlx::query("INSERT INTO modules (id, stage_id, name, description) VALUES ($1, $2, $3, $4)")
-                .bind(&id)
-                .bind(&stage_id)
-                .bind(&name)
-                .bind(&description)
-                .execute(&mut **tx)
-                .await
-                .map_err(unique_to_plan_invalid("duplicate module name in one stage"))?;
+            sqlx::query(
+                "INSERT INTO modules (id, feature_id, name, description, owns)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&id)
+            .bind(feature_id)
+            .bind(&name)
+            .bind(&description)
+            .bind(&owns)
+            .execute(&mut **tx)
+            .await
+            .map_err(unique_to_plan_invalid("duplicate module name in this feature"))?;
+            // A brand-new node has only outgoing edges, so it cannot
+            // close a cycle; each prerequisite still has to be a module
+            // of THIS feature.
+            for dep in &depends_on {
+                add_edge(tx, feature_id, &id, dep, false).await?;
+            }
             for (ti, task) in tasks.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO tasks (id, module_id, name, origin, position, created_by)
@@ -3652,12 +4107,84 @@ async fn apply_plan_op(
                 .execute(&mut **tx)
                 .await?;
             }
-            Ok(format!("add_module '{name}' ({id}) to stage {position}"))
+            check_ownership(tx, feature_id).await?;
+            Ok(format!(
+                "add_module '{name}' ({id}) depending on [{}]",
+                depends_on.join(", ")
+            ))
+        }
+        PlanOp::AddDependency { module_id, depends_on } => {
+            // The dependent must still be todo: a prerequisite added to a
+            // module that has started rewrites the decision that let it
+            // start. A prerequisite that is already done is always
+            // satisfied and always allowed.
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM modules WHERE id = $1 AND feature_id = $2",
+            )
+            .bind(&module_id)
+            .bind(feature_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            match status.as_deref() {
+                None => return Err(McpmError::not_found("module", &module_id)),
+                Some("todo") => {}
+                Some(other) => {
+                    return Err(plan_conflict(format!(
+                        "Module {module_id} is {other} — it was allowed to start without this \
+                         prerequisite, and adding one now rewrites that. Add the work as a new \
+                         module that depends on both instead."
+                    )))
+                }
+            }
+            add_edge(tx, feature_id, &module_id, &depends_on, true).await?;
+            check_ownership(tx, feature_id).await?;
+            Ok(format!("add_dependency {module_id} -> {depends_on}"))
+        }
+        PlanOp::RemoveDependency { module_id, depends_on } => {
+            let n = sqlx::query(
+                "DELETE FROM module_deps d USING modules m
+                 WHERE d.module_id = m.id AND m.feature_id = $1
+                   AND d.module_id = $2 AND d.depends_on = $3",
+            )
+            .bind(feature_id)
+            .bind(&module_id)
+            .bind(&depends_on)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            if n == 0 {
+                return Err(plan_invalid(format!(
+                    "No edge {module_id} -> {depends_on} in this feature."
+                )));
+            }
+            check_ownership(tx, feature_id).await?;
+            Ok(format!("remove_dependency {module_id} -> {depends_on}"))
+        }
+        PlanOp::UpdateModule { id, description, owns } => {
+            let n = sqlx::query(
+                "UPDATE modules SET description = COALESCE($3, description),
+                                    owns = COALESCE($4, owns)
+                 WHERE id = $1 AND feature_id = $2",
+            )
+            .bind(&id)
+            .bind(feature_id)
+            .bind(&description)
+            .bind(&owns)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            if n == 0 {
+                return Err(McpmError::not_found("module", &id));
+            }
+            if owns.is_some() {
+                check_ownership(tx, feature_id).await?;
+            }
+            Ok(format!("update_module {id}"))
         }
         PlanOp::AddTask { module_id, name, note } => {
             let module = sqlx::query(
-                "SELECT m.status FROM modules m JOIN stages s ON s.id = m.stage_id
-                 WHERE m.id = $1 AND s.feature_id = $2",
+                "SELECT m.status FROM modules m
+                 WHERE m.id = $1 AND m.feature_id = $2",
             )
             .bind(&module_id)
             .bind(feature_id)
@@ -3696,13 +4223,12 @@ async fn apply_plan_op(
                     ))
                 }
                 Level::Feature => ("features", "id = $2"),
-                Level::Stage => ("stages", "id = $2 AND feature_id = $3"),
-                Level::Module => ("modules", "id = $2"),
+                Level::Module => ("modules", "id = $2 AND feature_id = $3"),
                 Level::Task => ("tasks", "id = $2"),
             };
             let sql = format!("UPDATE {table} SET name = $1 WHERE {guard}");
             let mut q = sqlx::query(&sql).bind(&name).bind(&id);
-            if level == Level::Stage {
+            if level == Level::Module {
                 q = q.bind(feature_id);
             }
             let n = q
@@ -3725,47 +4251,28 @@ async fn apply_plan_op(
                 Level::Feature => Err(plan_invalid(
                     "revise_plan cannot remove the feature itself — shelve it instead.",
                 )),
-                Level::Stage => {
-                    let touched: i64 = sqlx::query(
-                        "SELECT COUNT(*) AS n FROM modules m
-                         WHERE m.stage_id = $1 AND m.status <> 'todo'",
+                Level::Module => {
+                    let row = sqlx::query(
+                        "SELECT status FROM modules WHERE id = $1 AND feature_id = $2",
                     )
                     .bind(&id)
-                    .fetch_one(&mut **tx)
+                    .bind(feature_id)
+                    .fetch_optional(&mut **tx)
                     .await?
-                    .get("n");
-                    if touched > 0 {
-                        return Err(plan_conflict(
-                            "The stage holds claimed or completed modules — that work is history.",
-                        ));
-                    }
-                    let n = sqlx::query("DELETE FROM stages WHERE id = $1 AND feature_id = $2")
-                        .bind(&id)
-                        .bind(feature_id)
-                        .execute(&mut **tx)
-                        .await?
-                        .rows_affected();
-                    if n == 0 {
-                        return Err(McpmError::not_found("stage", &id));
-                    }
-                    Ok(format!("remove stage {id}"))
-                }
-                Level::Module => {
-                    let row = sqlx::query("SELECT status FROM modules WHERE id = $1")
-                        .bind(&id)
-                        .fetch_optional(&mut **tx)
-                        .await?
-                        .ok_or_else(|| McpmError::not_found("module", &id))?;
+                    .ok_or_else(|| McpmError::not_found("module", &id))?;
                     if row.get::<String, _>("status") != "todo" {
                         return Err(plan_conflict(
                             "The module has been claimed, blocked, or completed — that work is \
                              history.",
                         ));
                     }
+                    // Edges cascade with the row; a dependent simply
+                    // loses this prerequisite, which only loosens.
                     sqlx::query("DELETE FROM modules WHERE id = $1")
                         .bind(&id)
                         .execute(&mut **tx)
                         .await?;
+                    check_ownership(tx, feature_id).await?;
                     Ok(format!("remove module {id}"))
                 }
                 Level::Task => {
@@ -3790,31 +4297,179 @@ async fn apply_plan_op(
     }
 }
 
-/// Plan shape rules, checked before anything is written.
-fn validate_plan(plan: &PlanFeature) -> Result<()> {
-    if plan.name.trim().is_empty() {
-        return Err(plan_invalid("The feature needs a non-empty name."));
+/// Insert one edge inside a revision. `cycle_check` is skipped for a
+/// node that was created in this same op (it has no incoming edges yet
+/// and cannot close anything).
+async fn add_edge(
+    tx: &mut Tx<'_>,
+    feature_id: &str,
+    module_id: &str,
+    depends_on: &str,
+    cycle_check: bool,
+) -> Result<()> {
+    if module_id == depends_on {
+        return Err(plan_invalid(format!("Module {module_id} cannot depend on itself.")));
     }
-    if plan.stages.is_empty() {
-        return Err(plan_invalid("A feature needs at least one stage."));
+    let same_feature: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM modules WHERE id = $1 AND feature_id = $2",
+    )
+    .bind(depends_on)
+    .bind(feature_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if same_feature.is_none() {
+        return Err(plan_invalid(format!(
+            "'{depends_on}' is not a module of this feature — a prerequisite must be. \
+             Cross-feature ordering is a manager's dispatch decision, not an edge."
+        )));
     }
+    if cycle_check && reaches(tx, depends_on, module_id).await? {
+        return Err(plan_invalid(format!(
+            "Adding {module_id} -> {depends_on} would close a cycle: {depends_on} already \
+             depends on {module_id}."
+        )));
+    }
+    sqlx::query(
+        "INSERT INTO module_deps (module_id, depends_on) VALUES ($1, $2)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(module_id)
+    .bind(depends_on)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The plan's modules in one shape, whichever shape arrived.
+///
+/// `stages` lowers to edges: every module of stage N depends on every
+/// module of stage N-1. Transitivity carries the rest, and the gate it
+/// produces is identical to the old stage gate — which is what lets a
+/// prompt written against stages keep working while the docs move.
+fn lower_plan(plan: &PlanFeature) -> Result<Vec<PlanModule>> {
+    if !plan.modules.is_empty() && !plan.stages.is_empty() {
+        return Err(plan_invalid(
+            "Give `modules` (each naming what it depends_on) or the deprecated `stages` \
+             ladder — not both.",
+        ));
+    }
+    if !plan.modules.is_empty() {
+        return Ok(plan
+            .modules
+            .iter()
+            .map(|m| PlanModule {
+                name: m.name.clone(),
+                description: m.description.clone(),
+                tasks: m.tasks.clone(),
+                depends_on: m.depends_on.clone(),
+                owns: m.owns.clone(),
+            })
+            .collect());
+    }
+    let mut out = Vec::new();
+    let mut previous: Vec<String> = Vec::new();
     for stage in &plan.stages {
         if stage.modules.is_empty() {
             return Err(plan_invalid(format!(
-                "Stage '{}' has no modules — every stage needs at least one, because a \
-                 stage with nothing to do can never complete.",
+                "Stage '{}' has no modules — a stage with nothing to do can never complete.",
                 stage.name
             )));
         }
+        let mut names = Vec::new();
+        for m in &stage.modules {
+            let mut deps = previous.clone();
+            deps.extend(m.depends_on.iter().cloned());
+            out.push(PlanModule {
+                name: m.name.clone(),
+                description: m.description.clone(),
+                tasks: m.tasks.clone(),
+                depends_on: deps,
+                owns: m.owns.clone(),
+            });
+            names.push(m.name.clone());
+        }
+        previous = names;
     }
-    Ok(())
+    Ok(out)
+}
+
+/// Plan shape rules, checked before anything is written. Returns the
+/// lowered module list the insert will use.
+fn validate_plan(plan: &PlanFeature) -> Result<Vec<PlanModule>> {
+    if plan.name.trim().is_empty() {
+        return Err(plan_invalid("The feature needs a non-empty name."));
+    }
+    let modules = lower_plan(plan)?;
+    if modules.is_empty() {
+        return Err(plan_invalid("A feature needs at least one module."));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for m in &modules {
+        if m.name.trim().is_empty() {
+            return Err(plan_invalid("Every module needs a non-empty name."));
+        }
+        if !seen.insert(m.name.as_str()) {
+            return Err(plan_invalid(format!(
+                "Module name '{}' appears twice — names are unique within a feature, and \
+                 depends_on refers to them.",
+                m.name
+            )));
+        }
+    }
+    for m in &modules {
+        for d in &m.depends_on {
+            if d == &m.name {
+                return Err(plan_invalid(format!("Module '{}' depends on itself.", m.name)));
+            }
+            if !seen.contains(d.as_str()) {
+                return Err(plan_invalid(format!(
+                    "Module '{}' depends on '{d}', which is not a module of this plan. \
+                     depends_on names modules by their `name` in this same plan.",
+                    m.name
+                )));
+            }
+        }
+    }
+    let nodes: Vec<GraphNode> = modules
+        .iter()
+        .map(|m| GraphNode {
+            id: m.name.clone(),
+            key: m.name.clone(),
+            deps: m.depends_on.clone(),
+        })
+        .collect();
+    if let Err(cycle) = topo_order(&nodes) {
+        return Err(plan_invalid(format!(
+            "The plan has a dependency cycle: {}. A module cannot wait on something that \
+             waits on it.",
+            cycle.join(" -> ")
+        )));
+    }
+    let owns: Vec<(String, Vec<String>)> = modules
+        .iter()
+        .map(|m| (m.name.clone(), m.owns.clone()))
+        .collect();
+    if let Some((a, b, ap, bp)) = ownership_conflicts(&nodes, &owns).first() {
+        return Err(plan_invalid(format!(
+            "Modules '{a}' and '{b}' both own '{ap}' / '{bp}' and neither depends on the \
+             other — two writers on one path with nothing ordering them. Add a depends_on \
+             between them, merge them, or narrow what one of them owns."
+        )));
+    }
+    Ok(modules)
 }
 
 /// Write a whole validated plan inside a caller-owned transaction and
 /// record `feature_planned`. Shared by [`Store::plan_feature`] and
 /// [`Store::promote_wants`], so composing a feature out of wants is as
-/// atomic as planning one directly.
-async fn insert_plan(tx: &mut Tx<'_>, agent: &str, plan: &PlanFeature) -> Result<String> {
+/// atomic as planning one directly. `modules` is what [`validate_plan`]
+/// returned for this plan.
+async fn insert_plan(
+    tx: &mut Tx<'_>,
+    agent: &str,
+    plan: &PlanFeature,
+    modules: &[PlanModule],
+) -> Result<String> {
     let feature_id = new_id(Level::Feature);
     sqlx::query(
         "INSERT INTO features (id, name, description, status, created_by)
@@ -3828,45 +4483,57 @@ async fn insert_plan(tx: &mut Tx<'_>, agent: &str, plan: &PlanFeature) -> Result
     .await
     .map_err(unique_to_plan_invalid("a feature with that name already exists"))?;
 
-    let (mut n_modules, mut n_tasks) = (0usize, 0usize);
-    for (si, stage) in plan.stages.iter().enumerate() {
-        let stage_id = new_id(Level::Stage);
-        sqlx::query("INSERT INTO stages (id, feature_id, name, position) VALUES ($1, $2, $3, $4)")
-            .bind(&stage_id)
-            .bind(&feature_id)
-            .bind(&stage.name)
-            .bind((si + 1) as i32)
-            .execute(&mut **tx)
-            .await
-            .map_err(unique_to_plan_invalid("duplicate stage name in this feature"))?;
-        for module in &stage.modules {
-            let module_id = new_id(Level::Module);
+    // Every module first, so edges can name ids that exist.
+    let mut ids: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+    let mut n_tasks = 0usize;
+    for module in modules {
+        let module_id = new_id(Level::Module);
+        sqlx::query(
+            "INSERT INTO modules (id, feature_id, name, description, owns)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&module_id)
+        .bind(&feature_id)
+        .bind(&module.name)
+        .bind(&module.description)
+        .bind(&module.owns)
+        .execute(&mut **tx)
+        .await
+        .map_err(unique_to_plan_invalid("duplicate module name in this feature"))?;
+        for (ti, task) in module.tasks.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO modules (id, stage_id, name, description) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO tasks (id, module_id, name, origin, position, created_by)
+                 VALUES ($1, $2, $3, 'planned', $4, $5)",
             )
+            .bind(new_id(Level::Task))
             .bind(&module_id)
-            .bind(&stage_id)
-            .bind(&module.name)
-            .bind(&module.description)
+            .bind(task)
+            .bind(ti as i32)
+            .bind(agent)
             .execute(&mut **tx)
-            .await
-            .map_err(unique_to_plan_invalid("duplicate module name in one stage"))?;
-            n_modules += 1;
-            for (ti, task) in module.tasks.iter().enumerate() {
-                sqlx::query(
-                    "INSERT INTO tasks (id, module_id, name, origin, position, created_by)
-                     VALUES ($1, $2, $3, 'planned', $4, $5)",
-                )
-                .bind(new_id(Level::Task))
-                .bind(&module_id)
-                .bind(task)
-                .bind(ti as i32)
-                .bind(agent)
-                .execute(&mut **tx)
-                .await?;
-                n_tasks += 1;
-            }
+            .await?;
+            n_tasks += 1;
         }
+        ids.insert(module.name.as_str(), module_id);
+    }
+    let mut n_edges = 0usize;
+    for module in modules {
+        let from = &ids[module.name.as_str()];
+        for dep in &module.depends_on {
+            let to = &ids[dep.as_str()];
+            sqlx::query(
+                "INSERT INTO module_deps (module_id, depends_on) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(from)
+            .bind(to)
+            .execute(&mut **tx)
+            .await?;
+            n_edges += 1;
+        }
+    }
+    if let Some(body) = plan.whitepaper.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        insert_document(tx, DocumentKind::Whitepaper, &feature_id, &plan.name, body, agent).await?;
     }
 
     record_event(
@@ -3877,9 +4544,10 @@ async fn insert_plan(tx: &mut Tx<'_>, agent: &str, plan: &PlanFeature) -> Result
         Some(agent),
         json!({
             "name": plan.name,
-            "stages": plan.stages.len(),
-            "modules": n_modules,
+            "modules": modules.len(),
+            "edges": n_edges,
             "tasks": n_tasks,
+            "whitepaper": plan.whitepaper.is_some(),
         }),
     )
     .await?;
@@ -4006,7 +4674,7 @@ const MEMORY_CTES: &str = "
 const MEMORY_FIELDS: &str = "
     mem.id, mem.level, mem.subject_id, mem.kind, mem.content, mem.tags,
     mem.author, mem.created_at,
-    COALESCE(p.name, f.name, s.name, m.name, t.name, mem.subject_id) AS subject_name,
+    COALESCE(p.name, f.name, m.name, t.name, mem.subject_id) AS subject_name,
     COALESCE(sig.touches, 0)  AS touches,
     COALESCE(sig.confirms, 0) AS confirms,
     COALESCE(sig.disputes, 0) AS disputes,
@@ -4047,7 +4715,6 @@ const MEMORY_JOINS: &str = "
     LEFT JOIN mach ON mach.id = mem.id
     LEFT JOIN project p  ON mem.level = 'project' AND p.id = 1
     LEFT JOIN features f ON mem.level = 'feature' AND f.id = mem.subject_id
-    LEFT JOIN stages s   ON mem.level = 'stage'   AND s.id = mem.subject_id
     LEFT JOIN modules m  ON mem.level = 'module'  AND m.id = mem.subject_id
     LEFT JOIN tasks t    ON mem.level = 'task'    AND t.id = mem.subject_id";
 

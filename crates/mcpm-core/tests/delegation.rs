@@ -54,38 +54,42 @@ where
         .expect("drop scratch database");
 }
 
-/// One stage, two modules — the shape that makes sibling subagents
+/// Two independent modules — the shape that makes sibling subagents
 /// possible in the first place.
 fn plan() -> PlanFeature {
     PlanFeature {
         name: "Delegation".into(),
-        description: "Two concurrent modules in one stage.".into(),
-        stages: vec![PlanStage {
-            name: "Build".into(),
-            modules: vec![
-                PlanModule {
-                    name: "Schema".into(),
-                    description: "Tables".into(),
-                    tasks: vec!["Write migration".into()],
-                },
-                PlanModule {
-                    name: "API".into(),
-                    description: "Endpoints".into(),
-                    tasks: vec!["Write handler".into()],
-                },
-            ],
-        }],
+        description: "Two concurrent modules with no edge between them.".into(),
+        modules: vec![
+            PlanModule {
+                name: "Schema".into(),
+                description: "Tables".into(),
+                tasks: vec!["Write migration".into()],
+                ..Default::default()
+            },
+            PlanModule {
+                name: "API".into(),
+                description: "Endpoints".into(),
+                tasks: vec!["Write handler".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
     }
 }
 
-/// Plan the feature and return `(feature_id, [module ids])`.
+/// Plan the feature and return `(feature_id, [module ids])`, in plan
+/// order (Schema, API) whatever order the tree lists them in.
 async fn seed(store: &Store) -> (String, Vec<String>) {
     let tree = store.plan_feature("laptop", plan()).await.expect("plan");
-    let modules = tree.stages[0]
-        .modules
-        .iter()
-        .map(|m| m.id.clone())
-        .collect();
+    let by_name = |name: &str| {
+        tree.modules
+            .iter()
+            .find(|m| m.name == name)
+            .map(|m| m.id.clone())
+            .expect("planned module")
+    };
+    let modules = vec![by_name("Schema"), by_name("API")];
     (tree.id, modules)
 }
 
@@ -135,7 +139,7 @@ async fn a_minted_identity_signs_its_own_work() {
             .await
             .expect("task");
         store
-            .complete_module(&actor, &modules[0], "Tables landed.", &[])
+            .complete_module(&actor, &modules[0], "Tables landed.", &[], None)
             .await
             .expect("complete");
 
@@ -287,7 +291,7 @@ async fn siblings_cannot_complete_each_others_modules() {
         // the strictly stronger guard: it does not even depend on who
         // holds the claim.
         let err = store
-            .complete_module(&actors[0], &modules[1], "not mine", &[])
+            .complete_module(&actors[0], &modules[1], "not mine", &[], None)
             .await
             .expect_err("a sibling's module is not completable");
         assert_eq!(err.code, ErrorCode::Forbidden);
@@ -295,7 +299,7 @@ async fn siblings_cannot_complete_each_others_modules() {
         // The claim guard still binds two identities inside one scope:
         // an undelegated actor on the same key cannot take over either.
         let err = store
-            .complete_module("laptop", &modules[0], "the machine speaking", &[])
+            .complete_module("laptop", &modules[0], "the machine speaking", &[], None)
             .await
             .expect_err("the key's own identity does not hold this claim");
         assert_eq!(err.code, ErrorCode::NotClaimedByYou);
@@ -443,7 +447,7 @@ async fn a_token_dies_with_its_module() {
             .await
             .expect("task");
         store
-            .complete_module(&actor, &modules[0], "Tables landed.", &[])
+            .complete_module(&actor, &modules[0], "Tables landed.", &[], None)
             .await
             .expect("complete");
         let err = store
@@ -873,7 +877,7 @@ async fn a_manager_can_give_each_box_an_identity_of_its_own() {
         // Which is what makes mutual exclusion between boxes work.
         store.claim_module(&Actor::new("box.branch-a"), &modules[0]).await.expect("A claims");
         let err = store
-            .complete_module(&Actor::new("box.branch-b"), &modules[0], "not mine", &[])
+            .complete_module(&Actor::new("box.branch-b"), &modules[0], "not mine", &[], None)
             .await
             .expect_err("one box cannot finish another's module");
         assert_eq!(err.code, ErrorCode::NotClaimedByYou);

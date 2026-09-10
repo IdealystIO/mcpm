@@ -38,15 +38,12 @@ async fn a_committed_event_reaches_the_watcher() {
         // cheapest one that goes through the real store.
         let plan = PlanFeature {
             name: "Watcher".into(),
-            description: String::new(),
-            stages: vec![PlanStage {
-                name: "One".into(),
-                modules: vec![PlanModule {
-                    name: "M".into(),
-                    description: "d".into(),
-                    tasks: vec![],
-                }],
+            modules: vec![PlanModule {
+                name: "M".into(),
+                description: "d".into(),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         store.get_context("agent.test", "manager").await.expect("register");
         store.plan_feature("agent.test", plan).await.expect("plan");
@@ -97,15 +94,12 @@ async fn many_subscribers_share_one_listener() {
         store.get_context("agent.test", "manager").await.expect("register");
         let plan = PlanFeature {
             name: "Fanout".into(),
-            description: String::new(),
-            stages: vec![PlanStage {
-                name: "One".into(),
-                modules: vec![PlanModule {
-                    name: "M".into(),
-                    description: "d".into(),
-                    tasks: vec![],
-                }],
+            modules: vec![PlanModule {
+                name: "M".into(),
+                description: "d".into(),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         store.plan_feature("agent.test", plan).await.expect("plan");
 

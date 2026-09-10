@@ -109,20 +109,18 @@ async fn reading_upward_from_a_module_reaches_the_project_shelf() {
                 "planner",
                 PlanFeature {
                     name: "Exports".into(),
-                    description: String::new(),
-                    stages: vec![PlanStage {
-                        name: "Build".into(),
-                        modules: vec![PlanModule {
-                            name: "CSV".into(),
-                            description: "d".into(),
-                            tasks: vec!["t".into()],
-                        }],
+                    modules: vec![PlanModule {
+                        name: "CSV".into(),
+                        description: "d".into(),
+                        tasks: vec!["t".into()],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 },
             )
             .await
             .expect("plan");
-        let module_id = tree.stages[0].modules[0].id.clone();
+        let module_id = tree.modules[0].id.clone();
 
         store
             .commit_memory(

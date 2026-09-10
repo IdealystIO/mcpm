@@ -426,20 +426,18 @@ async fn a_worker_is_briefed_on_dead_ends_but_not_on_plain_replacements() {
                 "planner",
                 PlanFeature {
                     name: "Exports".into(),
-                    description: String::new(),
-                    stages: vec![PlanStage {
-                        name: "Build".into(),
-                        modules: vec![PlanModule {
-                            name: "CSV".into(),
-                            description: "d".into(),
-                            tasks: vec!["t".into()],
-                        }],
+                    modules: vec![PlanModule {
+                        name: "CSV".into(),
+                        description: "d".into(),
+                        tasks: vec!["t".into()],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 },
             )
             .await
             .expect("plan");
-        let module_id = tree.stages[0].modules[0].id.clone();
+        let module_id = tree.modules[0].id.clone();
 
         // A dead end: tried, and wrong.
         let dead = commit(&store, "planner", "Stream exports through the CSV crate.", &[]).await;
@@ -595,20 +593,17 @@ async fn finishing_work_records_what_it_leaned_on() {
                 "planner",
                 PlanFeature {
                     name: "Exports".into(),
-                    description: String::new(),
-                    stages: vec![PlanStage {
-                        name: "Build".into(),
-                        modules: vec![PlanModule {
-                            name: "CSV".into(),
-                            description: "d".into(),
-                            tasks: vec![],
-                        }],
+                    modules: vec![PlanModule {
+                        name: "CSV".into(),
+                        description: "d".into(),
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 },
             )
             .await
             .expect("plan");
-        let module_id = tree.stages[0].modules[0].id.clone();
+        let module_id = tree.modules[0].id.clone();
         let leaned_on = commit(&store, "planner", "Exports stream rather than buffer.", &[]).await;
 
         store.get_context("worker", "worker").await.expect("register");
@@ -621,6 +616,7 @@ async fn finishing_work_records_what_it_leaned_on() {
                 // One real id and one that does not resolve: the work is
                 // finished, and a typo must not fail the completion.
                 &[leaned_on.id.clone(), "mem_deadbeef".into()],
+                None,
             )
             .await
             .expect("a bad reference must not cost the completion");

@@ -12,48 +12,68 @@ use crate::ids::Level;
 // Inputs
 // ---------------------------------------------------------------------
 
-/// `plan_feature`: the whole tree, created atomically.
-#[derive(Debug, Deserialize, Serialize)]
+/// `plan_feature`: the whole graph, created atomically.
+///
+/// A feature is a set of modules and the edges between them. `modules`
+/// is the shape; `stages` is the old ladder, still accepted and lowered
+/// to edges (each module depends on every module of the preceding
+/// stage) so prompts written against it keep working. Giving both is
+/// refused.
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PlanFeature {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub modules: Vec<PlanModule>,
+    /// DEPRECATED: the stage ladder, lowered to edges on the way in.
+    #[serde(default)]
     pub stages: Vec<PlanStage>,
+    /// The plan as prose — what the manager would say to a new hire.
+    /// Stored as the feature's whitepaper document, revision 1.
+    #[serde(default)]
+    pub whitepaper: Option<String>,
 }
 
+/// One rung of the deprecated stage ladder.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PlanStage {
     pub name: String,
     pub modules: Vec<PlanModule>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PlanModule {
     pub name: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub tasks: Vec<String>,
+    /// Prerequisites, by module NAME within this plan (ids do not exist
+    /// yet). Every one must be done before this module can be claimed.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Path prefixes this module will write to. Optional; two modules
+    /// that overlap must be ordered by an edge or the plan is refused.
+    #[serde(default)]
+    pub owns: Vec<String>,
 }
 
 /// `revise_plan` batch operations, applied atomically or not at all.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PlanOp {
-    /// Append a stage at the end of the pipeline (or after `after`, a
-    /// stage id).
-    AddStage {
-        name: String,
-        #[serde(default)]
-        after: Option<String>,
-    },
     AddModule {
-        stage_id: String,
         name: String,
         #[serde(default)]
         description: String,
         #[serde(default)]
         tasks: Vec<String>,
+        /// Prerequisites by module ID (the feature already exists).
+        #[serde(default)]
+        depends_on: Vec<String>,
+        #[serde(default)]
+        owns: Vec<String>,
     },
     AddTask {
         module_id: String,
@@ -61,11 +81,83 @@ pub enum PlanOp {
         #[serde(default)]
         note: Option<String>,
     },
+    /// `module_id` waits on `depends_on`. Refused when the dependent has
+    /// already started (that rewrites the decision that let it start),
+    /// when it would close a cycle, or when it crosses features.
+    AddDependency { module_id: String, depends_on: String },
+    /// Drop an edge. Only ever loosens; the ownership overlap check runs
+    /// again because the edge may have been what ordered two writers.
+    RemoveDependency { module_id: String, depends_on: String },
+    /// Change a module's description and/or owned paths. Names go
+    /// through `rename`.
+    UpdateModule {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        owns: Option<Vec<String>>,
+    },
     /// Rename any tree node by id.
     Rename { id: String, name: String },
-    /// Remove a stage/module/task. Refused when the subtree holds
-    /// completed or in-progress work.
+    /// Remove a module/task. Refused when it holds completed or
+    /// in-progress work. Removing a module drops its edges; a dependent
+    /// simply loses that prerequisite.
     Remove { id: String },
+}
+
+/// Which long-form document is meant.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentKind {
+    /// The feature's plan as prose. Feature scope, written by the
+    /// planner, revised as the plan moves.
+    Whitepaper,
+    /// How to use what a module built — the component, the function,
+    /// its parameters, where it lives. Module scope, written by the
+    /// claim holder for whoever continues the work.
+    Handoff,
+}
+
+impl DocumentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocumentKind::Whitepaper => "whitepaper",
+            DocumentKind::Handoff => "handoff",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<DocumentKind> {
+        match s {
+            "whitepaper" => Some(DocumentKind::Whitepaper),
+            "handoff" => Some(DocumentKind::Handoff),
+            _ => None,
+        }
+    }
+
+    /// The scope level a kind lives at.
+    pub fn level(self) -> Level {
+        match self {
+            DocumentKind::Whitepaper => Level::Feature,
+            DocumentKind::Handoff => Level::Module,
+        }
+    }
+}
+
+/// One revision of a document. `revision` counts from 1 per subject
+/// and kind; the newest is the current one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DocumentView {
+    pub id: String,
+    pub level: String,
+    pub subject_id: String,
+    pub subject_name: String,
+    pub kind: DocumentKind,
+    pub revision: i32,
+    pub title: String,
+    /// Markdown.
+    pub body: String,
+    pub author: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// `complete_task` outcome.
@@ -513,15 +605,15 @@ pub struct FeatureRollup {
     pub id: String,
     pub name: String,
     pub status: String,
-    pub stages_done: i64,
-    pub stages_total: i64,
     pub modules_done: i64,
     pub modules_total: i64,
+    /// Modules whose prerequisites are all done and nobody holds.
+    pub modules_ready: i64,
     pub tasks_done: i64,
     pub tasks_total: i64,
 }
 
-/// Full tree for one feature.
+/// Full graph for one feature.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FeatureTree {
     pub id: String,
@@ -529,17 +621,11 @@ pub struct FeatureTree {
     pub description: String,
     pub status: String,
     pub summary: Option<String>,
-    pub stages: Vec<StageView>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StageView {
-    pub id: String,
-    pub name: String,
-    pub position: i32,
-    /// Derived: `locked` | `unlocked` | `done`.
-    pub status: String,
+    /// Topological order: every module after all of its prerequisites,
+    /// ties broken by depth then name.
     pub modules: Vec<ModuleView>,
+    /// The current whitepaper, when one was written.
+    pub whitepaper: Option<DocumentView>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -550,7 +636,15 @@ pub struct ModuleView {
     pub status: String,
     pub claimed_by: Option<String>,
     pub summary: Option<String>,
-    /// Derived: todo + unclaimed + stage unlocked.
+    /// Prerequisite module ids.
+    pub depends_on: Vec<String>,
+    /// Prerequisites not yet done — empty means the gate is open.
+    pub waiting_on: Vec<String>,
+    /// Path prefixes this module writes to; empty = undeclared.
+    pub owns: Vec<String>,
+    /// Longest path from a root, 1-based. Derived; a display hint.
+    pub depth: i32,
+    /// Derived: todo + unclaimed + every prerequisite done.
     pub dispatchable: bool,
     pub tasks: Vec<TaskView>,
 }
@@ -612,9 +706,10 @@ pub struct WorkItem {
     pub module_id: String,
     pub module_name: String,
     pub description: String,
-    pub stage_id: String,
-    pub stage_name: String,
-    pub stage_position: i32,
+    /// Prerequisite module ids — all done, or this would not be here.
+    pub depends_on: Vec<String>,
+    pub owns: Vec<String>,
+    pub depth: i32,
     pub tasks: Vec<TaskView>,
     /// How many memories a worker would find searching `up` from here.
     pub relevant_memories: i64,
@@ -636,15 +731,16 @@ pub struct NextWork {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Briefing {
     pub module: ModuleView,
-    pub stage_id: String,
-    pub stage_name: String,
-    pub stage_position: i32,
     pub feature_id: String,
     pub feature_name: String,
-    /// Memories at the module's ancestors (stage + feature scope) —
+    /// The feature's plan as prose, when the planner wrote one.
+    pub whitepaper: Option<DocumentView>,
+    /// Memories at the module's ancestors (feature + project scope) —
     /// conventions and interface decisions recorded upstream.
     pub ancestor_memories: Vec<Memory>,
-    /// Completed-module summaries from earlier stages of this feature.
+    /// Completed modules of this feature: transitive prerequisites
+    /// first (`prerequisite: true`, in topological order), then the
+    /// rest. Each carries its summary and its handoff document.
     pub upstream_summaries: Vec<UpstreamSummary>,
     /// How to work the checklist, said at the one moment the worker is
     /// setting its habits for this module. `complete_module` refuses
@@ -659,8 +755,12 @@ pub struct Briefing {
 pub struct UpstreamSummary {
     pub module_id: String,
     pub module_name: String,
-    pub stage_position: i32,
+    /// Whether this module is on the claimed module's prerequisite
+    /// chain. False for a completed sibling the plan did not order.
+    pub prerequisite: bool,
     pub summary: String,
+    /// The module's current handoff document, when its worker wrote one.
+    pub handoff: Option<String>,
 }
 
 /// One memory (commit + search result).
