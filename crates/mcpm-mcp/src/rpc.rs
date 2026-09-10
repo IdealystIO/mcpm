@@ -21,10 +21,9 @@
 //! one key — holds more than one agent.
 
 use mcpm_core::{
-    Actor, Delegation, EdgeKind, ErrorCode, KeyIdentity, KeyRole, McpmError, MemoryKind, MemoryQuery,
-    MemoryScope, MintRequest, PlanFeature,
-    PlanOp, PromoteWants, SearchDirection, Store, Supersede, TaskOutcome, WantDraft, WantEdit,
-    WantFilter, WantState,
+    Actor, Delegation, DocumentKind, EdgeKind, ErrorCode, KeyIdentity, KeyRole, McpmError,
+    MemoryKind, MemoryQuery, MemoryScope, MintRequest, PlanFeature, PlanOp, PromoteWants,
+    SearchDirection, Store, Supersede, TaskOutcome, WantDraft, WantEdit, WantFilter, WantState,
 };
 use serde_json::{json, Value};
 
@@ -38,26 +37,31 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     to register your identity — every other tool requires it. Managers \
     plan features and dispatch what next_work returns; workers claim one \
     module, work its checklist, and exit through complete_module, \
-    report_blocker, or release_module. Workers are dispatched, not \
+    report_blocker, or release_module. A feature is a GRAPH of modules: \
+    each names the modules it depends_on, and a module is claimable once \
+    every one of them is done. next_work returns the ready frontier, and \
+    everything in it can run at once. Workers are dispatched, not \
     self-directing: a worker's module ids arrive from its manager in its \
-    launch prompt, in stage order, so a worker box started without them \
-    has nothing to claim — the board and next_work are readable by any \
-    agent, but nothing assigns a worker its own module. Stage order is \
-    enforced by the server: a STAGE_LOCKED rejection means stop and \
-    report to your \
+    launch prompt, so a worker box started without them has nothing to \
+    claim — the board and next_work are readable by any agent, but \
+    nothing assigns a worker its own module. The gate is enforced by the \
+    server: a PREREQS_OPEN rejection means stop and report to your \
     manager. Loose ideas live in the want pool (add_want / list_wants); \
     features are composed out of GROUPS of wants with promote_wants, \
-    never one want to one feature. Ids are prefixed by kind: feat_ stg_ mod_ \
-    tsk_ want_. Subagents that share one machine's key each get their own \
-    identity from mint_worker: mint one per module and put \
-    the token in the subagent's prompt, and the subagent passes \
-    delegation_token on get_context and on every write. WORKERS MAY MINT \
-    TOO, which is how a box dispatched a whole feature runs a stage wide \
-    rather than one module at a time: claim your own module first, then \
-    mint for the siblings in that same stage and spawn one subagent \
-    each. A worker may only mint inside a feature it already holds a \
-    live claim in, and that authority lapses by itself when it completes \
-    its last module there. Delegation stays one level deep — a delegated \
+    never one want to one feature. Ids are prefixed by kind: feat_ mod_ \
+    tsk_ doc_ want_. Long-form knowledge lives in documents: a feature's \
+    whitepaper (the plan as prose) and each module's handoff (how to use \
+    what it built), both carried in the claim briefing and written with \
+    write_document or complete_module's handoff. Subagents that share \
+    one machine's key each get their own identity from mint_worker: mint \
+    one per module and put the token in the subagent's prompt, and the \
+    subagent passes delegation_token on get_context and on every write. \
+    WORKERS MAY MINT TOO, which is how a box dispatched a whole feature \
+    runs the ready frontier wide rather than one module at a time: claim \
+    your own module first, then mint for the other dispatchable modules \
+    and spawn one subagent each. A worker may only mint inside a feature \
+    it already holds a live claim in, and that authority lapses by itself \
+    when it completes its last module there. Delegation stays one level deep — a delegated \
     identity cannot mint another. A worker that \
     runs on its OWN box is a different case: give it a key of its own \
     with issue_worker_key, because a delegation token is honoured \
@@ -322,7 +326,36 @@ async fn call_tool(
             let module_id = str_arg(args, "module_id")?;
             let summary = str_arg(args, "summary")?;
             let used: Vec<String> = json_field(args, "used_memories")?.unwrap_or_default();
-            to_value(store.complete_module(&actor, &module_id, &summary, &used).await?)
+            let handoff = opt_str_arg(args, "handoff");
+            to_value(
+                store
+                    .complete_module(&actor, &module_id, &summary, &used, handoff.as_deref())
+                    .await?,
+            )
+        }
+        "write_document" => {
+            let kind: DocumentKind = parse_field(args, "kind")?;
+            let subject_id = str_arg(args, "subject_id")?;
+            let title = opt_str_arg(args, "title").unwrap_or_default();
+            let body = str_arg(args, "body")?;
+            to_value(
+                store
+                    .write_document(&actor, kind, &subject_id, &title, &body)
+                    .await?,
+            )
+        }
+        "read_document" => {
+            let kind: DocumentKind = parse_field(args, "kind")?;
+            let subject_id = str_arg(args, "subject_id")?;
+            match store.read_document(kind, &subject_id).await? {
+                Some(doc) => to_value(doc),
+                None => Err(McpmError::new(
+                    ErrorCode::NotFound,
+                    format!("No {} has been written for {subject_id} yet.", kind.as_str()),
+                    json!({ "kind": kind.as_str(), "subject_id": subject_id }),
+                    "Nothing to read. If you are the one who should write it, write_document.",
+                )),
+            }
         }
         "report_blocker" => {
             let module_id = str_arg(args, "module_id")?;

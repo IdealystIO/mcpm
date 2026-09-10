@@ -12,7 +12,8 @@ pub fn prompt_defs() -> Value {
         {
             "name": "manager_briefing",
             "description": "System briefing for a manager agent that owns one feature end to \
-                end: plan, dispatch stage by stage, watch the ledger, close.",
+                end: plan the module graph, dispatch the ready frontier, watch the ledger, \
+                close.",
             "arguments": [
                 { "name": "feature_id", "description": "Feature to resume (omit when planning a new one).", "required": false }
             ]
@@ -55,14 +56,13 @@ async fn manager_briefing(store: &Store, args: &Value) -> Result<Value, McpmErro
     let mut board = String::new();
     for f in &rollups {
         board.push_str(&format!(
-            "- {} ({}): {} — stages {}/{}, modules {}/{}, tasks {}/{}\n",
+            "- {} ({}): {} — modules {}/{} ({} ready), tasks {}/{}\n",
             f.name,
             f.id,
             f.status,
-            f.stages_done,
-            f.stages_total,
             f.modules_done,
             f.modules_total,
+            f.modules_ready,
             f.tasks_done,
             f.tasks_total
         ));
@@ -76,15 +76,19 @@ async fn manager_briefing(store: &Store, args: &Value) -> Result<Value, McpmErro
     };
     let text = format!(
         "You are a MANAGER agent on the mcpm project-management MCP server. You own ONE \
-feature end to end. The server is the gatekeeper — it enforces stage order, exclusive \
+feature end to end. The server is the gatekeeper — it enforces prerequisites, exclusive \
 claims, and checklist-proven completion — and you bring the loop.\n\n\
 {resume}Current board:\n{board}\n\
 Your loop:\n\
 1. get_context(agent_name, role='manager') — register; resume any feature already in \
 flight rather than replanning it.\n\
-2. plan_feature — one atomic call creates the whole Stage → Module → Task tree. Stages \
-run strictly in order; modules within a stage run concurrently, one worker subagent \
-each; tasks are each module's checklist.\n\
+2. plan_feature — one atomic call creates the whole module graph. Each module names \
+the modules it depends_on and, ideally, the paths it owns; a module is claimable once \
+its prerequisites are done, so modules with no path between them run concurrently, one \
+worker each. Two modules that will edit the same file are not concurrent work: put an \
+edge between them or merge them, and declare `owns` so the server refuses the plan if \
+you forget. Write the `whitepaper` — the plan as prose — every worker reads it on \
+claim. Tasks are each module's checklist.\n\
 3. Dispatch loop, until done: call next_work(feature_id) and spawn ONE worker subagent \
 per dispatchable module (give each the worker_briefing prompt with its module_id). \
 Give each worker an identity, or they do not have one — how depends on where it runs:\n\
@@ -99,20 +103,23 @@ sharing a key are one identity and mutual exclusion between them does not hold. 
 you must also scope such a box to a single module, mint_worker(..., \
 for_key_id=<that box's key_id>) binds the token to its key instead of yours.\n\
    - You can also hand a box a WHOLE FEATURE rather than one module at a time, and \
-let it fan each stage out itself. A worker key may now mint, but only inside a \
-feature it already holds a claim in, so a box claims one module of the stage and \
-mints for its siblings. Give it the module ids in stage order and say plainly that \
-it may keep going — a box that finishes what it was listed and correctly declines to \
-self-direct then sits idle, indistinguishable from working. You still poll \
-feature_status; the difference is one dispatch instead of one per stage.\n\
-Never compute stage gating yourself — next_work \
+let it run the ready frontier itself. A worker key may now mint, but only inside a \
+feature it already holds a claim in, so a box claims one ready module and mints for \
+the others next_work returned. Give it the module ids and say plainly that it may \
+keep going — treat next_work as its dispatch until it returns nothing — because a box \
+that finishes what it was listed and correctly declines to self-direct then sits idle, \
+indistinguishable from working. You still poll feature_status; the difference is one \
+dispatch instead of one per wave.\n\
+Never compute the gate yourself — next_work \
 already did. When workers return, poll \
 feature_status(feature_id, events_since=<cursor>) and read the new events: completions, \
-blockers, premature claims, discovered tasks, stage_unlocked. Dispatch the next wave.\n\
-4. On blocker_reported or premature_claim: fix the plan (revise_plan), re-dispatch, or \
-escalate to the human. A premature_claim event means YOUR dispatch was early.\n\
-5. When every stage is done: complete_feature(feature_id, summary). The summary becomes \
-a feature-scope memory.\n\n\
+blockers, premature claims, discovered tasks, module_unlocked. Dispatch the next wave.\n\
+4. On blocker_reported or premature_claim: fix the plan (revise_plan — add_dependency, \
+add_module, update_module, remove), re-dispatch, or escalate to the human. A \
+premature_claim event means YOUR dispatch was early.\n\
+5. When every module is done: complete_feature(feature_id, summary). The summary becomes \
+a feature-scope memory. Keep the whitepaper true as the plan moves: write_document \
+(kind='whitepaper') appends a revision.\n\n\
 Record what the crew learns with commit_memory, at the narrowest scope it is actually \
 true at: kind='convention' or 'decision' at scope={{level:'project'}} for anything that \
 outlives this feature, at feature scope for what is only true here. Workers read both \
@@ -166,9 +173,10 @@ than planning a duplicate.\n\
 4. Propose the grouping to the human BEFORE writing it, in one short paragraph per \
 feature: which wants, what the feature is, and what you had to assume. Loose ideas are \
 ambiguous by nature — the assumptions are the part worth checking.\n\
-5. On approval, call promote_wants once per feature, with `plan` (the full Stage → \
-Module → Task tree) and a `rationale` on every want saying how you read it into that \
-plan. The links, the plan, and a feature-scope origin memory commit together.\n\
+5. On approval, call promote_wants once per feature, with `plan` (the module graph: \
+each module with its depends_on, owns and tasks, plus the whitepaper) and a \
+`rationale` on every want saying how you read it into that plan. The links, the plan, \
+and a feature-scope origin memory commit together.\n\
 6. A want that should not happen: update_want(state='declined', reason=...). Never \
 silently drop one — an idea with no verdict gets re-proposed forever.\n\n\
 Then hand the feature to a manager agent (manager_briefing) to dispatch.",
@@ -216,9 +224,11 @@ ONE module: {module_id}.{carry}\n\n\
 Your loop:\n\
 1. get_context(agent_name='{agent_name}'{pass}, role='worker') then \
 claim_module('{module_id}'{pass}). \
-The claim IS your briefing: it returns your checklist, the memories recorded above your \
-module, and the completed-module summaries from earlier stages.\n\
-   - If claim_module returns STAGE_LOCKED: STOP. Do no work. Report the error to your \
+The claim IS your briefing: it returns your checklist, the feature's whitepaper, the \
+memories recorded above your module, and the completed modules of the feature — your \
+prerequisites first, each with its summary and its handoff document (how to use what \
+it built). Read the handoffs before you read the code they describe.\n\
+   - If claim_module returns PREREQS_OPEN: STOP. Do no work. Report the error to your \
 manager and end your turn — the server has already recorded the premature_claim event.\n\
 2. Before writing code, search_memory(scope={{level:'module', id:'{module_id}'}}, \
 direction='up') for conventions and interfaces decided upstream — that walk ends at \
@@ -232,10 +242,14 @@ work the plan missed, add_task it — it is recorded as discovered.\n\
 4. commit_memory anything the next agent will need, with the kind that fits \
 (decision, gotcha, reference). Module scope for what is true of your module; \
 scope={{level:'project'}} for something you learned that will bite anyone here, not \
-just the next worker on this feature.\n\
+just the next worker on this feature. And as soon as you have built something another \
+module will call — a component, a function, an endpoint — write_document(kind='handoff', \
+subject_id='{module_id}', body=...) saying how to use it: where it lives, its \
+parameters, the call, what it refuses. The reader has none of your context; the \
+handoff is what spares them re-reading your code.\n\
 5. Exit through exactly ONE door:\n\
-   - complete_module(module_id, summary{pass}) — all tasks resolved; your summary is what \
-downstream workers read.\n\
+   - complete_module(module_id, summary{pass}, handoff=...) — all tasks resolved; your \
+summary is the paragraph downstream workers read, the handoff is the page it links.\n\
    - report_blocker(module_id, description{pass}) — you cannot proceed; keep the claim, stop.\n\
    - release_module(module_id, reason{pass}) — you must abandon; task states survive you.\n\
 Never exit silently."

@@ -21,7 +21,7 @@
 //! Both share the Postgres store, whose transactions make claims and
 //! gates race-safe across connections however the caller arrived.
 //!
-//! Domain rejections (STAGE_LOCKED, TASKS_OPEN, FORBIDDEN, …) are
+//! Domain rejections (PREREQS_OPEN, TASKS_OPEN, FORBIDDEN, …) are
 //! returned as MCP *tool results* flagged `isError` — a gated claim is a
 //! domain answer, not a transport fault — carrying the full error
 //! envelope (code, message, data, hint) as JSON text.

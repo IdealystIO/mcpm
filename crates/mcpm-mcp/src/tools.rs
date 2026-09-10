@@ -1,19 +1,62 @@
-//! The 28 tool definitions (architecture doc §5). Descriptions are the
+//! The 30 tool definitions (architecture doc §5). Descriptions are the
 //! agent UX: they say what the tool does, who calls it, and what the
 //! caller should do with the answer.
 
 use serde_json::{json, Value};
 
-/// Every tool, in one array. Split across two `json!` literals purely
+/// Every tool, in one array. Split across three `json!` literals purely
 /// to stay under the macro recursion limit.
 pub fn tool_defs() -> Value {
     let mut tools: Vec<Value> = tree_tools().as_array().cloned().unwrap_or_default();
+    tools.extend(document_tools().as_array().cloned().unwrap_or_default());
     tools.extend(want_tools().as_array().cloned().unwrap_or_default());
     Value::Array(tools)
 }
 
-/// The Feature → Stage → Module → Task surface.
+/// The shape of a plan, shared by `plan_feature` and `promote_wants` so
+/// the two cannot drift.
+fn plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string", "description": "One paragraph: what the feature is and the decisions that shape it. Put the long form in `whitepaper`." },
+            "whitepaper": { "type": "string", "description": "Markdown. The plan as prose — what you would tell a new hire: the problem, the model, the decisions and why, what is out of scope. Stored as the feature's whitepaper (revision 1) and carried into every worker's claim briefing. Revise later with write_document." },
+            "modules": {
+                "type": "array",
+                "description": "The graph. Order does not matter; `depends_on` does. A module is claimable once every module it names is done, so two modules with no path between them may run at once — make sure they do not write the same files, or say so with `owns`.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Unique within the feature; what depends_on refers to." },
+                        "description": { "type": "string", "description": "The worker's brief: what to build, which files, which memory to read first." },
+                        "tasks": { "type": "array", "items": { "type": "string" }, "description": "The checklist. complete_module refuses until each is done or skipped with a reason." },
+                        "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Names of modules in THIS plan that must be done first. Empty = ready at once. Cycles are refused." },
+                        "owns": { "type": "array", "items": { "type": "string" }, "description": "Path prefixes this module will write to (e.g. 'crates/api/src/store.rs', 'src/components'). Optional. Two modules whose paths overlap must be ordered by depends_on or the plan is refused — that is the check that catches two writers on one file." }
+                    },
+                    "required": ["name"]
+                }
+            },
+            "stages": {
+                "type": "array",
+                "description": "DEPRECATED — the old ladder, accepted and lowered to edges (each module depends on every module of the preceding stage). Prefer `modules`. Giving both is refused.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "modules": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "tasks": { "type": "array", "items": { "type": "string" } } }, "required": ["name"] } }
+                    },
+                    "required": ["name", "modules"]
+                }
+            }
+        },
+        "required": ["name"]
+    })
+}
+
+/// The Feature → Module → Task surface.
 fn tree_tools() -> Value {
+    let plan = plan_schema();
     json!([
         {
             "name": "get_context",
@@ -33,47 +76,25 @@ fn tree_tools() -> Value {
         },
         {
             "name": "plan_feature",
-            "description": "MANAGER. Create a feature and its entire Stage → Module → Task tree \
-                in one atomic call — a half-written plan is never visible to workers. Stages \
-                run strictly in order (the server enforces the gate); modules within a stage \
-                run concurrently, one worker each; tasks are the module's checklist.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "description": { "type": "string" },
-                    "stages": {
-                        "type": "array",
-                        "description": "In pipeline order.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "modules": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "name": { "type": "string" },
-                                            "description": { "type": "string" },
-                                            "tasks": { "type": "array", "items": { "type": "string" } }
-                                        },
-                                        "required": ["name"]
-                                    }
-                                }
-                            },
-                            "required": ["name", "modules"]
-                        }
-                    }
-                },
-                "required": ["name", "stages"]
-            }
+            "description": "MANAGER. Create a feature and its entire module graph in one \
+                atomic call — a half-written plan is never visible to workers. Each module \
+                names the modules it depends_on; a module is claimable once every one of \
+                them is done (the server enforces it), so modules with no path between them \
+                run concurrently, one worker each. Tasks are each module's checklist. The \
+                plan is validated whole: an unknown prerequisite, a cycle, or two modules \
+                whose `owns` paths overlap without an edge between them is refused with \
+                PLAN_INVALID and nothing is written. Give a `whitepaper` — the plan as prose \
+                — and every worker reads it on claim.",
+            "inputSchema": plan
         },
         {
             "name": "revise_plan",
-            "description": "MANAGER. Batch plan surgery, applied atomically or not at all. The \
-                server refuses ops that rewrite history: removing anything claimed or \
-                completed, or adding modules behind a gate that already opened.",
+            "description": "MANAGER. Batch plan surgery, applied atomically or not at all. \
+                Ops: add_module (with depends_on by module ID and owns), add_task, \
+                add_dependency, remove_dependency, update_module (description / owns), \
+                rename, remove. The server refuses ops that rewrite history: removing \
+                anything claimed or completed, or adding a prerequisite to a module that has \
+                already started. Every op re-runs the cycle and ownership checks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -83,15 +104,15 @@ fn tree_tools() -> Value {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "op": { "type": "string", "enum": ["add_stage", "add_module", "add_task", "rename", "remove"] },
-                                "name": { "type": "string" },
-                                "after": { "type": "string", "description": "add_stage: stage id to insert after (omit to append)." },
-                                "stage_id": { "type": "string", "description": "add_module: target stage." },
-                                "module_id": { "type": "string", "description": "add_task: target module." },
-                                "description": { "type": "string" },
-                                "tasks": { "type": "array", "items": { "type": "string" } },
-                                "note": { "type": "string" },
-                                "id": { "type": "string", "description": "rename/remove: the tree id (feat_/stg_/mod_/tsk_)." }
+                                "op": { "type": "string", "enum": ["add_module", "add_task", "add_dependency", "remove_dependency", "update_module", "rename", "remove"] },
+                                "name": { "type": "string", "description": "add_module / add_task / rename: the name." },
+                                "module_id": { "type": "string", "description": "add_task: target module. add_dependency / remove_dependency: the module that waits." },
+                                "depends_on": { "description": "add_module: array of module ids this one waits on. add_dependency / remove_dependency: the single module id waited on." },
+                                "owns": { "type": "array", "items": { "type": "string" }, "description": "add_module / update_module: path prefixes the module writes to." },
+                                "description": { "type": "string", "description": "add_module / update_module." },
+                                "tasks": { "type": "array", "items": { "type": "string" }, "description": "add_module: the checklist." },
+                                "note": { "type": "string", "description": "add_task: why the plan missed it." },
+                                "id": { "type": "string", "description": "rename / remove / update_module: the tree id (feat_/mod_/tsk_)." }
                             },
                             "required": ["op"]
                         }
@@ -102,7 +123,7 @@ fn tree_tools() -> Value {
         },
         {
             "name": "complete_feature",
-            "description": "MANAGER. Close the feature. Refuses (STAGES_INCOMPLETE) while any \
+            "description": "MANAGER. Close the feature. Refuses (MODULES_INCOMPLETE) while any \
                 module is unfinished. The summary is committed as a feature-scope memory.",
             "inputSchema": {
                 "type": "object",
@@ -115,11 +136,14 @@ fn tree_tools() -> Value {
         },
         {
             "name": "next_work",
-            "description": "MANAGER. The dispatch decision, computed server-side: every module \
-                that is ready right now (todo, unclaimed, stage unlocked), each with its \
-                checklist — spawn one worker per entry; they can run concurrently. Never \
-                compute stage gating yourself. An empty list with an unfinished feature \
-                means wait: the response says what's in flight or blocked.",
+            "description": "The dispatch decision, computed server-side: the ready frontier — \
+                every module that is todo, unclaimed, and whose prerequisites are all done — \
+                each with its checklist. Spawn one worker per entry; they can run \
+                concurrently, because a ready set never contains two modules with a path \
+                between them. Never compute the gate yourself. An empty list with an \
+                unfinished feature means wait: the response says what's in flight or blocked. \
+                Readable by any agent; a box that owns a whole feature treats this as its \
+                standing dispatch.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "feature_id": { "type": "string", "description": "Feature id (`feat_...`), from get_context, plan_feature, or promote_wants." } },
@@ -128,10 +152,11 @@ fn tree_tools() -> Value {
         },
         {
             "name": "feature_status",
-            "description": "The manager's poll: the feature's full tree with derived stage \
-                locks, plus every event after your cursor — completions, blockers, premature \
-                claims, discovered tasks, stage unlocks. Pass the returned events_cursor back \
-                as events_since next time; nothing is missed between polls.",
+            "description": "The manager's poll: the feature's full graph — every module with \
+                what it depends_on, what it is still waiting_on, its depth and whether it is \
+                dispatchable — plus every event after your cursor: completions, blockers, \
+                premature claims, discovered tasks, module_unlocked. Pass the returned \
+                events_cursor back as events_since next time; nothing is missed between polls.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -152,20 +177,20 @@ fn tree_tools() -> Value {
                 one per module you dispatch — minting again for the same module retires the \
                 previous token. \
                 \
-                WORKERS MAY CALL THIS TOO, which is how a box runs a stage wide instead of \
-                one module at a time. A worker may mint only for a module in a feature it \
-                ALREADY holds a live claim in — so claim your own module first, then mint \
-                for the siblings you want running beside it. In practice, on a branch box \
-                dispatched a whole feature: claim the first module of the stage yourself; \
-                for each remaining dispatchable module in that SAME stage call \
-                mint_worker(module_id, agent_name) and spawn one subagent per module with \
-                its token; let them claim, work and complete_module independently; then \
-                move to the next stage when next_work says it is unlocked. Do not mint \
-                across stages — a locked stage refuses the claim anyway, and the token \
-                would sit unused. Two modules that own the same FILE are not concurrent \
-                work whatever the plan says: run those in sequence. Your authority to mint \
-                lapses by itself when you complete your last module in the feature, so \
-                nothing has to revoke it.",
+                WORKERS MAY CALL THIS TOO, which is how a box runs the ready frontier wide \
+                instead of one module at a time. A worker may mint only for a module in a \
+                feature it ALREADY holds a live claim in — so claim your own module first, \
+                then mint for the others you want running beside it. In practice, on a \
+                branch box dispatched a whole feature: claim one module next_work returned \
+                yourself; for each other dispatchable module call mint_worker(module_id, \
+                agent_name) and spawn one subagent per module with its token; let them \
+                claim, work and complete_module independently; ask next_work again as \
+                completions release more. Do not mint for a module that is not \
+                dispatchable — its claim is refused anyway, and the token would sit unused. \
+                Everything next_work returns together is safe to run together, unless two \
+                modules declare no `owns` and you can see they edit one file — then run \
+                those in sequence. Your authority to mint lapses by itself when you \
+                complete your last module in the feature, so nothing has to revoke it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -202,10 +227,11 @@ fn tree_tools() -> Value {
             "name": "claim_module",
             "description": "WORKER. Take the exclusive claim on your module — the gate check \
                 happens here, in the same transaction. A legal claim returns your full \
-                briefing: the checklist, memories from the stage and feature above you, and \
-                completed-module summaries from earlier stages. On STAGE_LOCKED: do not \
-                work; report to your manager and end your turn (the rejection is already on \
-                the event record).",
+                briefing: the checklist, the feature's whitepaper, memories from the feature \
+                and project above you, and the completed modules of this feature — your \
+                prerequisites first (each with its summary and handoff document), then the \
+                rest. On PREREQS_OPEN: do not work; report to your manager and end your turn \
+                (the rejection is already on the event record).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -251,13 +277,16 @@ fn tree_tools() -> Value {
             "name": "complete_module",
             "description": "WORKER. The exit interview. Refuses (TASKS_OPEN) until every task \
                 is done or skipped-with-reason. Your summary is committed as a module-scope \
-                memory — it is what the next stage's workers read — and completing the \
-                stage's last module unlocks the next stage automatically.",
+                memory — it is the paragraph every downstream worker's briefing carries — \
+                and completing releases every dependent whose prerequisites are now all \
+                done (module_unlocked). Give a `handoff` too: the page the summary links, \
+                for whoever continues from your work.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "module_id": { "type": "string", "description": "Module id (`mod_...`), from next_work or your claim briefing." },
-                    "summary": { "type": "string", "description": "What you built, decisions made, interfaces exposed, gotchas." },
+                    "summary": { "type": "string", "description": "What you built, decisions made, interfaces exposed, gotchas. One to three paragraphs." },
+                    "handoff": { "type": "string", "description": "Markdown. How to USE what you built, written for the agent who continues without your context: the component or function and where it lives, its parameters and what they mean, how to call it, what it refuses and why, the one trap that cost you time. Written as a new revision of the module's handoff document (write_document does the same mid-module)." },
                     "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["module_id", "summary"]
@@ -539,8 +568,56 @@ fn tree_tools() -> Value {
     ])
 }
 
+/// Long-form documents: the feature's whitepaper and each module's
+/// handoff. Read whole, by identity — the memory base is for facts
+/// retrieved by relevance; these are the pages those facts point at.
+fn document_tools() -> Value {
+    json!([
+        {
+            "name": "write_document",
+            "description": "ANY AGENT. Append a revision of a long-form document. kind \
+                'whitepaper' (subject = feature id): the plan as prose, revised as the plan \
+                moves — any undelegated agent may write it. kind 'handoff' (subject = module \
+                id): how to use what the module built, for the agent that continues the work \
+                — only the claim holder may write it, and it can be revised as often as the \
+                work changes shape; complete_module's `handoff` argument is the same write. \
+                Revisions are append-only; the newest is current. Write the handoff for the \
+                reader who has NONE of your context: name the component or function and its \
+                file, list the parameters and what each means, show the call, say what it \
+                refuses and why, and name the one trap that cost you time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["whitepaper", "handoff"] },
+                    "subject_id": { "type": "string", "description": "The feature id for a whitepaper, the module id for a handoff." },
+                    "title": { "type": "string", "description": "Optional heading shown in the console." },
+                    "body": { "type": "string", "description": "Markdown." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
+                },
+                "required": ["kind", "subject_id", "body"]
+            }
+        },
+        {
+            "name": "read_document",
+            "description": "ANY AGENT. The current revision of one document: a feature's \
+                whitepaper or a module's handoff. Your claim briefing already carries the \
+                whitepaper and your prerequisites' handoffs; use this to read a module you do \
+                not depend on, or to re-read after a revision.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["whitepaper", "handoff"] },
+                    "subject_id": { "type": "string", "description": "The feature id for a whitepaper, the module id for a handoff." }
+                },
+                "required": ["kind", "subject_id"]
+            }
+        }
+    ])
+}
+
 /// The want pool: capture loose ideas, then compose them into features.
 fn want_tools() -> Value {
+    let plan = plan_schema();
     json!([
         {
             "name": "add_want",
@@ -615,44 +692,13 @@ fn want_tools() -> Value {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string" },
-                                "rationale": { "type": "string", "description": "How this want was read into the plan, e.g. 'becomes the CSV export module in stage 2'." }
+                                "rationale": { "type": "string", "description": "How this want was read into the plan, e.g. 'becomes the CSV export module, downstream of the renderer'." }
                             },
                             "required": ["id"]
                         }
                     },
                     "feature_id": { "type": "string", "description": "Fold into this existing feature. Mutually exclusive with `plan`." },
-                    "plan": {
-                        "type": "object",
-                        "description": "Compose into a new feature. Mutually exclusive with `feature_id`.",
-                        "properties": {
-                            "name": { "type": "string" },
-                            "description": { "type": "string" },
-                            "stages": {
-                                "type": "array",
-                                "description": "In pipeline order.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string" },
-                                        "modules": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "name": { "type": "string" },
-                                                    "description": { "type": "string" },
-                                                    "tasks": { "type": "array", "items": { "type": "string" } }
-                                                },
-                                                "required": ["name"]
-                                            }
-                                        }
-                                    },
-                                    "required": ["name", "modules"]
-                                }
-                            }
-                        },
-                        "required": ["name", "stages"]
-                    }
+                    "plan": plan
                 },
                 "required": ["wants"]
             }
