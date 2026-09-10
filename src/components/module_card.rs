@@ -18,7 +18,11 @@ use crate::styles::{MonoTextSize, MonoTextTone};
 pub const CARD_W: f32 = 232.0;
 /// Card height in px — fixed for the same reason. The card clips
 /// rather than grows; the drawer has the room.
-pub const CARD_H: f32 = 108.0;
+pub const CARD_H: f32 = 124.0;
+
+/// The "waits on" line is one line: there is no no-wrap text style,
+/// so a long list is cut here and the drawer carries the whole of it.
+const WAITS_CHARS: usize = 38;
 
 /// Props for [`ModuleCard`].
 #[derive(Default, IdealystSchema)]
@@ -58,7 +62,7 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     let ticks: Vec<bool> = m.tasks.iter().map(|t| t.done).collect();
     let readiness = m.readiness();
     let waits = (readiness == Readiness::Waiting)
-        .then(|| format!("waits on {}", f.module_names(&m.waiting_on)));
+        .then(|| clip(&format!("waits on {}", f.module_names(&m.waiting_on)), WAITS_CHARS));
     let ready_arm = match readiness {
         Readiness::Open => "open",
         Readiness::Waiting => "waiting",
@@ -70,7 +74,9 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     let inner: Element = ui! {
         view(style = ModuleInner()) {
             view(style = TitleRow()) {
-                StatusDot(status = status)
+                view(style = DotSlot()) {
+                    StatusDot(status = status)
+                }
                 view(style = TitleSlot()) {
                     Typography(
                         content = name,
@@ -115,6 +121,16 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
                 .with("dim", if dim { "yes" } else { "no" }.to_string())
         })
         .into_element()
+}
+
+/// Cut `s` to at most `max` characters, with an ellipsis when it was.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 stylesheet! {
@@ -178,15 +194,15 @@ stylesheet! {
     pub TitleRow<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
+            align_items: AlignItems::FlexStart,
             gap: t.spacing.sm(),
             min_width: 0,
         }
     }
 }
 
-// The flexible / fixed pair (rule 22). The title is one line tall and
-// clips: a name long enough to wrap belongs to the drawer's H3.
+// The flexible / fixed pair (rule 22). The title gets two lines and
+// then clips: a name longer than that belongs to the drawer's H3.
 stylesheet! {
     pub TitleSlot<IdeaThemeRef> {
         base(_t) {
@@ -194,8 +210,20 @@ stylesheet! {
             min_width: 0,
             flex_grow: 1.0,
             flex_shrink: 1.0,
-            height: 20,
+            max_height: 40,
             overflow: runtime_core::Overflow::Hidden,
+        }
+    }
+}
+
+// The dot stays on the first line of a two-line title.
+stylesheet! {
+    pub DotSlot<IdeaThemeRef> {
+        base(_t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            flex_shrink: 0.0,
+            height: 20,
         }
     }
 }
