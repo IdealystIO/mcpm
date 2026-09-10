@@ -73,6 +73,20 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
     canvas.width = Some(Tokenized::Literal(Length::Px(layout.width())));
     canvas.height = Some(Tokenized::Literal(Length::Px(layout.height())));
     canvas.flex_shrink = Some(Tokenized::Literal(0.0));
+    // The strip between the two scrollers. A `scroll_view` nested
+    // straight inside a horizontal one is sized to its parent's width
+    // and clips the rest, so the outer never sees an overflow; a plain
+    // view of the canvas's own width is what the outer scrolls. At
+    // least the pane's width, so a narrow graph's vertical bar still
+    // sits at the pane's right edge; a DEFINITE height, so the canvas
+    // scrolls inside it instead of growing it (rule 23).
+    let mut strip = StyleRules::default();
+    strip.width = Some(Tokenized::Literal(Length::Px(layout.width())));
+    strip.min_width = Some(Tokenized::Literal(Length::Percent(100.0)));
+    strip.height = Some(Tokenized::Literal(Length::Percent(100.0)));
+    strip.min_height = Some(Tokenized::Literal(Length::Px(0.0)));
+    strip.flex_shrink = Some(Tokenized::Literal(0.0));
+    strip.flex_direction = Some(FlexDirection::Column);
 
     ui! {
         view(style = GraphScroll()) {
@@ -88,15 +102,17 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
             // fills the pane, so its bar sits at the pane's bottom
             // edge; the vertical one inside is pinned to its height.
             scroll_view(horizontal = true, style = StripScroll()) {
-                scroll_view(style = CanvasScroll()) {
-                    // Edges first, so a line that has to cross a
-                    // column passes under the cards in it.
-                    view(style = canvas) {
-                        for seg in segments, key = seg.id {
-                            EdgeSegment(x = seg.x, y = seg.y, w = seg.w, h = seg.h, tone = seg.tone)
-                        }
-                        for card in cards, key = card.module {
-                            GraphCard(console = console, feature = fi, x = card.x, y = card.y, module = card.module)
+                view(style = strip) {
+                    scroll_view(style = CanvasScroll()) {
+                        // Edges first, so a line that has to cross a
+                        // column passes under the cards in it.
+                        view(style = canvas) {
+                            for seg in segments, key = seg.id {
+                                EdgeSegment(x = seg.x, y = seg.y, w = seg.w, h = seg.h, tone = seg.tone)
+                            }
+                            for card in cards, key = card.module {
+                                GraphCard(console = console, feature = fi, x = card.x, y = card.y, module = card.module)
+                            }
                         }
                     }
                 }
@@ -368,17 +384,12 @@ stylesheet! {
     }
 }
 
-// A DEFINITE height, not a minimum, so the canvas scrolls inside it
-// instead of growing the strip and pushing the horizontal bar off the
-// bottom of the screen (rule 23). At least the pane's width, so a
-// narrow graph's vertical bar still sits at the pane's right edge.
+// Takes the strip's height and scrolls the canvas within it.
 stylesheet! {
     pub CanvasScroll<IdeaThemeRef> {
         base(_t) {
-            height: Length::Percent(100.0),
-            min_width: Length::Percent(100.0),
+            flex_grow: 1.0,
             min_height: 0,
-            flex_shrink: 0.0,
         }
     }
 }
