@@ -9,14 +9,23 @@ server agents connect to, the `MCPM_*` env vars). **Control Center** is
 this console and this cargo package. They are not interchangeable.
 
     Want ─┐
-    Want ─┼─► Feature → Stage → Module → Task
+    Want ─┼─► Feature → Module ──depends_on──► Module → Task
     Want ─┘
 
 The server is a **gatekeeper, not an orchestrator**: it enforces the
-invariants (stage order, exclusive claims, checklist-proven completion,
-the want pool's rules) and never spawns an agent. When you add a rule,
-it goes in the store, inside the transaction it guards — not in a
-caller.
+invariants (prerequisites, exclusive claims, checklist-proven
+completion, the plan validators, the want pool's rules) and never
+spawns an agent. When you add a rule, it goes in the store, inside the
+transaction it guards — not in a caller.
+
+**A feature is a graph, and every ordering fact is derived from it.**
+Stages were retired in migration 0012 (2026-09-10): they expressed one
+shape of dependency and a plan that needed another had to hide it in
+prompt text. `module_deps` is the edges; `claim_module` checks a
+module's own prerequisites; `topo_order` in `store.rs` gives depth and
+order at read time; nothing about readiness is stored. When you add a
+plan op, it ends in `check_ownership` and, for an edge, `reaches` — the
+cycle and overlap rules live once each and every writer calls them.
 
 **Identity is a credential, not an argument.** Over HTTP an agent does
 not say who it is: `Store::verify_key` resolves its API key to an agent
@@ -39,18 +48,19 @@ manager and its workers.
 **A WORKER MAY MINT, INSIDE A FEATURE IT ALREADY HOLDS.** `mint_worker`
 came off `MANAGER_ONLY` on 2026-09-04. A flat gate had made the fleet's
 own design impossible: a cloud branch box holds a worker key by
-construction, so "stages sequential on the box, modules concurrent as
-subagents" had never once happened — measured across two live boxes,
-zero subagents ever, and an 8-vCPU instance averaging under 15% CPU
-because one agent worked one module at a time.
+construction, so "modules concurrent as subagents" had never once
+happened — measured across two live boxes, zero subagents ever, and an
+8-vCPU instance averaging under 15% CPU because one agent worked one
+module at a time.
 
-In practice a box dispatched a whole feature now: claims the first
-module of its stage itself, calls `mint_worker` for each remaining
-dispatchable module in that SAME stage, spawns one subagent per module
-with its token, lets them claim and complete independently, then moves
-on when `next_work` says the next stage is unlocked. Not across stages —
-a locked stage refuses the claim anyway. Not for two modules that own
-the same file, whatever the plan says.
+In practice a box dispatched a whole feature now: claims one module
+`next_work` returned itself, calls `mint_worker` for each other
+dispatchable module, spawns one subagent per module with its token,
+lets them claim and complete independently, then asks `next_work` again
+as completions release more. Not for a module that is not dispatchable —
+its claim is refused anyway. Everything `next_work` returns together is
+safe to run together; the plan's `owns` declarations are what make that
+true, so a planner that leaves them off is trusting the reader.
 
 The rule that replaced the gate lives in `Store::mint_worker`, inside
 the transaction, like every other invariant here: a worker's key may

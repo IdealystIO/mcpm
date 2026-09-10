@@ -11,7 +11,7 @@ correction is a *new* memory that supersedes the old one.
 
 Three reasons it has to work this way:
 
-- **The ledger already does.** Events are append-only and stage status
+- **The ledger already does.** Events are append-only and module readiness
   is derived, never stored. A knowledge base that can be edited in place
   cannot be reconciled against a ledger that cannot.
 - **A superseded memory is evidence, not garbage.** It records that this
@@ -28,7 +28,7 @@ where the explanation lives.
 
 ## Node state is derived
 
-Like stage status, never stored — there is no `status` column to drift.
+Like module readiness, never stored — there is no `status` column to drift.
 
 | State | Means |
 | --- | --- |

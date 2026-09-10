@@ -5,16 +5,19 @@ project management for agent crews. One deployed instance is tied to one
 project, and the entire agent-facing surface is an MCP server.
 
     Want ─┐
-    Want ─┼─► Feature → Stage → Module → Task
-    Want ─┘             ↑        ↑
-                        │        └ one worker subagent each,
-                        │          concurrent within a stage
-                        └ sequential gate, server-enforced
+    Want ─┼─► Feature → Module ──depends_on──► Module → Task
+    Want ─┘             ↑                        ↑
+                        │                        └ one worker subagent each,
+                        │                          concurrent unless an edge
+                        │                          says otherwise
+                        └ a graph, not a ladder: a module is claimable
+                          once every prerequisite it names is done
 
-A **manager agent** owns a feature: it plans the tree, dispatches one
-worker per ready module, watches the ledger, and closes the feature. A
-**worker agent** owns one module: it claims, works the checklist,
-records what it learned, and exits through exactly one door.
+A **manager agent** owns a feature: it plans the graph and writes the
+whitepaper, dispatches one worker per ready module, watches the ledger,
+and closes the feature. A **worker agent** owns one module: it claims,
+works the checklist, writes a handoff for whoever continues, records what
+it learned, and exits through exactly one door.
 
 The server is a **gatekeeper, not an orchestrator**. It never spawns an
 agent. It enforces the invariants so a bad plan fails loudly at the tool
@@ -125,20 +128,66 @@ Beyond the 28 tools there are:
 - **Resources**, read-only: `project://status`, `project://wants`,
   `project://events`, and `project://features/<id>`.
 
-Ids are prefixed by kind: `feat_`, `stg_`, `mod_`, `tsk_`, `want_`.
+Ids are prefixed by kind: `feat_`, `mod_`, `tsk_`, `doc_`, `want_`.
 
 ## The gate
 
 The one coordination rule the server owns: **a module may be claimed
-only when every module in every earlier stage of its feature is done.**
-It is checked in exactly one place, `claim_module`, inside the same
-transaction that takes the claim.
+only when every module it `depends_on` is done.** It is checked in
+exactly one place, `claim_module`, inside the same transaction that
+takes the claim.
 
 When a manager dispatches a worker too early, the rejection travels two
-independent paths. The worker gets a `STAGE_LOCKED` error whose `hint`
+independent paths. The worker gets a `PREREQS_OPEN` error whose `hint`
 tells it to stop and report back, and the server appends a
 `premature_claim` event the manager sees on its next `feature_status`
 poll. Neither path depends on the other working.
+
+Everything else about ordering is derived from the graph at read time,
+like every other status here: a module is *ready* when it is unclaimed
+and its prerequisites are all done; its *depth* is the longest path from
+a root, which is the column the console draws it in. `next_work` returns
+the ready frontier, and a ready set is an antichain by construction —
+two ready modules cannot depend on each other — so "they can run
+concurrently" is a fact about the graph rather than a hope about the
+plan. Completing a module emits `module_unlocked` for every dependent
+whose gate it opened.
+
+## The plan is validated whole
+
+`plan_feature` refuses, naming the offender and writing nothing: an
+unknown prerequisite, a self-dependency, a cycle, and two modules whose
+declared `owns` paths overlap without one depending on the other. That
+last check is the one that catches two writers on one file — the plan
+that says "concurrent" about modules that both edit `store.rs`. `owns`
+is optional; an undeclared module is exempt. `revise_plan` re-runs the
+same checks after every op, and refuses to add a prerequisite to a
+module that has already started (that rewrites the decision that let it
+start).
+
+The old `stages` shape is still accepted and lowered to edges — each
+module depends on every module of the preceding stage — which is also
+how migration 0012 backfilled every feature that existed before the
+graph. The gate it produces is identical to the old one.
+
+## Documents
+
+A memory is a fact, retrieved by relevance. A document is read whole, by
+identity, and there are two kinds:
+
+- **The whitepaper** is the feature's: the plan as prose, what the
+  manager would say to a new hire. Given in `plan_feature`, revised with
+  `write_document`, carried into every worker's claim briefing.
+- **A handoff** is a module's: how to use what the module built — the
+  component or function and where it lives, its parameters, the call,
+  what it refuses and why. Written by the claim holder with
+  `write_document` as the work takes shape, or with `complete_module`'s
+  `handoff` on the way out. The claim briefing carries the handoffs of
+  the module's transitive prerequisites first, then the rest of the
+  feature's completed modules, so a worker reads how to call the thing
+  before it reads the code.
+
+Revisions are append-only; the newest is current.
 
 ## Wants
 
@@ -152,7 +201,7 @@ deliberate step: `promote_wants` takes a group plus either the plan they
 add up to or the id of a feature they belong in, then writes the
 feature, every want/feature link, the event, and a feature-scope *origin
 memory* in one transaction. That memory closes the loop. A worker four
-stages downstream calling `search_memory(direction='up')` reads the raw
+modules downstream calling `search_memory(direction='up')` reads the raw
 ideas its module exists to satisfy, in the user's own phrasing, beside
 the rationale the composing agent recorded.
 
@@ -406,10 +455,10 @@ rotate or forget it.
 
 | Crate | What it is |
 | --- | --- |
-| `crates/mcpm-core` | Domain and Postgres store. The stage gate, exclusive claims, checklist-proven completion, the want pool, the append-only event ledger, and scoped memory search. Every invariant is enforced inside a transaction. |
-| `crates/mcpm-mcp` | The MCP server: 28 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
+| `crates/mcpm-core` | Domain and Postgres store. The prerequisite gate, plan validation (cycles, ownership overlap), exclusive claims, checklist-proven completion, documents, the want pool, the append-only event ledger, and scoped memory search. Every invariant is enforced inside a transaction. |
+| `crates/mcpm-mcp` | The MCP server: 30 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, the `#[server]` functions and `#[subscription]` the console calls, plus the `mcpm-web` host binary (feature-gated). |
-| `src/` | The Idealyst console: want pool with capture composer, board, hierarchy, live feed, dependency graph, composed-from, and the module and want drawers. |
+| `src/` | The Idealyst console: want pool with capture composer, the module graph, the whitepaper, live feed, composed-from, and the module and want drawers. |
 
 ## Development
 
@@ -427,8 +476,9 @@ of the `server` SDK, so running only one hides breakage in the other.
 (tag lifting, `#42` staying prose, tags-only lines, UTF-16 caret
 conversion). `-p control-center` checks Tab completion against a seeded
 registry. `-p mcpm-core` runs against a real Postgres, replaying the
-worked scenario end to end (premature claim, stage unlocks, discovered
-tasks, blockers, memory search directions, every completion guard),
+worked scenario end to end (premature claim, per-module unlocks, the
+plan validators, documents, discovered tasks, blockers, memory search
+directions, every completion guard),
 exercising the want pool (capture, search, group composition, the
 frozen-once-promoted rule, declines and reopens, one want across two
 features, atomicity of a promotion naming an unknown id, the tag
