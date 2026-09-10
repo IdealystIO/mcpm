@@ -166,7 +166,7 @@ pub fn AttentionRow(props: &AttentionRowProps) -> Element {
     let title = row.title.clone();
     let place = row.place.clone();
     let target = match row.target {
-        AttentionTarget::Module(fi, si, mi) => Some((fi, si, mi)),
+        AttentionTarget::Module(fi, mi) => Some((fi, mi)),
         AttentionTarget::Pool => None,
     };
     let first = if props.first { "yes" } else { "no" };
@@ -188,7 +188,7 @@ pub fn AttentionRow(props: &AttentionRowProps) -> Element {
     };
 
     pressable(vec![inner], move || match target {
-        Some((fi, si, mi)) => console.open_module_in(fi, si, mi),
+        Some((fi, mi)) => console.open_module_in(fi, mi),
         None => console.show_wants(),
     })
     .with_style(StyleApplication::new(divided_row_style()).with("first", first.to_string()))
@@ -219,10 +219,10 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
     let status = f.status;
     let fraction = f.fraction();
     let pct = f.pct_label();
-    let (stages_done, stages_total) = f.stage_count();
     let (mods_done, mods_total) = f.module_count();
     let meta = format!(
-        "{stages_done}/{stages_total} stages \u{b7} {mods_done}/{mods_total} modules \u{b7} {}",
+        "{mods_done}/{mods_total} modules \u{b7} {} ready \u{b7} {}",
+        f.ready_count(),
         f.agent,
     );
     let first = if props.first { "yes" } else { "no" };

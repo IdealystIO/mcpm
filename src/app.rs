@@ -85,9 +85,9 @@ pub fn app() -> Element {
     let drawer_host = presence(move || {
         switch(
             move || (console.feature.get(), console.last_module.get(), console.rev.get()),
-            move |&(fi, sel, _rev): &(usize, Option<(usize, usize)>, u64)| match sel {
-                Some((si, mi)) if drawer_target_exists(fi, si, mi) => ui! {
-                    Drawer(console = console, feature = fi, stage = si, module = mi)
+            move |&(fi, sel, _rev): &(usize, Option<usize>, u64)| match sel {
+                Some(mi) if drawer_target_exists(fi, mi) => ui! {
+                    Drawer(console = console, feature = fi, module = mi)
                 },
                 _ => ui! { view {} },
             },
@@ -184,11 +184,10 @@ pub fn app() -> Element {
     }
 }
 
-fn drawer_target_exists(fi: usize, si: usize, mi: usize) -> bool {
+fn drawer_target_exists(fi: usize, mi: usize) -> bool {
     model::features()
         .get(fi)
-        .and_then(|f| f.stages.get(si))
-        .map(|s| mi < s.modules.len())
+        .map(|f| mi < f.modules.len())
         .unwrap_or(false)
 }
 

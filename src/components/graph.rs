@@ -1,18 +1,39 @@
-//! Dependency-graph view: the feature agent fanning out through the
-//! stage gates to its module subagents.
+//! The module graph: a layered DAG. One column per depth — every
+//! module sits right of everything it depends on — and an edge from
+//! each prerequisite to what depends on it.
+//!
+//! The layout is computed here from known card geometry
+//! ([`CARD_W`]/[`CARD_H`]) and the edges are absolutely-positioned
+//! views inside one relatively-positioned canvas, drawn BEFORE the
+//! cards so a line that has to cross a column passes under it.
 
-use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Stack, StackAlign, StackAxis, StackGap,
-    Typography};
+use std::collections::HashMap;
+
+use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Typography};
 use runtime_core::{
-    component, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
-    IdealystSchema, JustifyContent,
+    component, stylesheet, ui, AlignItems, Element, FlexDirection, IdealystSchema, Length,
+    Position, StyleRules, Tokenized,
 };
 
-use crate::components::bits::{Hint, Mono, StatusBadge};
-use crate::components::module_card::ModuleRow;
-use crate::model::{features, Status};
+use crate::components::bits::Hint;
+use crate::components::module_card::{ModuleCard, CARD_H, CARD_W};
+use crate::model::{features, Module, Status};
 use crate::state::Console;
-use crate::styles::{MonoTextSize, SectionLabel};
+
+/// Gap between columns, in px. Wide enough to hold the vertical run of
+/// every edge into that column on its own lane (see [`edges`]).
+pub const COL_GAP: f32 = 72.0;
+/// Gap between cards in a column.
+pub const ROW_GAP: f32 = 16.0;
+/// The canvas's inner padding. Part of the canvas, not the scroller,
+/// so the scrollbars hug the pane edge (rule 3).
+pub const PAD: f32 = 24.0;
+/// Edge stroke width.
+const LINE: f32 = 2.0;
+/// Horizontal spacing between the vertical lanes inside a column gap.
+const LANE_STEP: f32 = 6.0;
+/// Inset of the first lane from the gap's left edge.
+const LANE_INSET: f32 = 12.0;
 
 /// Props for [`GraphView`].
 #[derive(Default, IdealystSchema)]
@@ -23,48 +44,60 @@ pub struct GraphViewProps {
     pub feature: usize,
 }
 
-/// The dependency-graph view for one feature.
+/// The module graph for one feature.
 #[component]
 pub fn GraphView(props: &GraphViewProps) -> Element {
     let console = props.console;
     let fi = props.feature;
     let feats = features();
     let f = &feats[fi];
-    let agent = f.agent.to_string();
-    let stage_count = f.stages.len();
+    let count = f.modules.len();
+    if count == 0 {
+        return ui! {
+            view(style = GraphBlank()) {
+                Typography(content = "No modules planned.", kind = typography_kind::BodySm, muted = true)
+            }
+        };
+    }
+
+    let layout = GraphLayout::compute(&f.modules);
+    let segments = edges(&f.modules, &layout);
+    let cards: Vec<CardSlot> = layout
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(module, slot)| CardSlot { module, x: layout.x(slot.col), y: layout.y(slot.row) })
+        .collect();
+    let mut canvas = StyleRules::default();
+    canvas.position = Some(Position::Relative);
+    canvas.width = Some(Tokenized::Literal(Length::Px(layout.width())));
+    canvas.height = Some(Tokenized::Literal(Length::Px(layout.height())));
+    canvas.flex_shrink = Some(Tokenized::Literal(0.0));
+
     ui! {
         view(style = GraphScroll()) {
-            view(style = GraphPad()) {
-                view(style = LegendRowBox()) {
-                    Spacer()
-                    Hint(
-                        text = "Green edge: gate satisfied, work released.\n\
-                                Amber edge: gate blocking the stages downstream.\n\
-                                Dimmed module: subagent not yet spawned.",
-                    )
-                }
-                // The strip is a row of fixed-width stage nodes, so it
-                // outgrows the viewport as soon as a feature has more
-                // than a few stages. `scroll_view` is single-axis, so
-                // the wide part gets its own horizontal scroller rather
-                // than clipping inside the vertical one.
-                scroll_view(horizontal = true, style = StripScroll()) {
-                    view(style = GraphStrip()) {
-                    view(style = AgentCell()) {
-                        Stack(axis = StackAxis::Row, gap = StackGap::Xs, align = StackAlign::Center) {
-                            text(style = SectionLabel()) { "Feature agent" }
-                            Hint(text = "Plans the stages and spawns one subagent per module.")
+            view(style = LegendRowBox()) {
+                Spacer()
+                Hint(
+                    text = "A module sits right of everything it depends on.\n\
+                            Green edge: that prerequisite is done. Amber edge: still open.\n\
+                            A card's left edge is green when it can be claimed, amber while it waits.",
+                )
+            }
+            // Two axes, two scrollers (rule 23). The horizontal one
+            // fills the pane, so its bar sits at the pane's bottom
+            // edge; the vertical one inside is pinned to its height.
+            scroll_view(horizontal = true, style = StripScroll()) {
+                scroll_view(style = CanvasScroll()) {
+                    // Edges first, so a line that has to cross a
+                    // column passes under the cards in it.
+                    view(style = canvas) {
+                        for seg in segments, key = seg.id {
+                            EdgeSegment(x = seg.x, y = seg.y, w = seg.w, h = seg.h, tone = seg.tone)
                         }
-                        Mono(content = agent, tone = crate::styles::MonoTextTone::Text)
-                    }
-                    for si in 0..stage_count {
-                        GraphEdge(feature = fi, stage = si)
-                        GraphStage(
-                            console = console,
-                            feature = fi,
-                            stage = si,
-                        )
-                    }
+                        for card in cards, key = card.module {
+                            GraphCard(console = console, feature = fi, x = card.x, y = card.y, module = card.module)
+                        }
                     }
                 }
             }
@@ -72,108 +105,241 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
     }
 }
 
-/// Props for [`GraphEdge`].
+/// Props for [`EdgeSegment`].
 #[derive(Default, IdealystSchema)]
-pub struct GraphEdgeProps {
-    /// Feature index.
-    pub feature: usize,
-    /// The stage this edge leads INTO.
-    pub stage: usize,
+pub struct EdgeSegmentProps {
+    /// Canvas-relative left edge, px.
+    pub x: f32,
+    /// Canvas-relative top edge, px.
+    pub y: f32,
+    /// Width, px.
+    pub w: f32,
+    /// Height, px.
+    pub h: f32,
+    /// Colour arm.
+    pub tone: EdgeLineTone,
 }
 
-/// The connector between the previous node and a stage card.
+/// One straight piece of an edge, absolutely positioned on the canvas.
 #[component]
-pub fn GraphEdge(props: &GraphEdgeProps) -> Element {
-    let feats = features();
-    let f = &feats[props.feature];
-    // The edge into stage N blocks while stage N-1 is unfinished.
-    let blocking = props.stage > 0 && f.stages[props.stage - 1].status != Status::Done;
-    let reached = !blocking
-        && !matches!(f.stages[props.stage].status, Status::Queued);
-    let arm = if blocking {
-        GraphEdgeLineTone::Blocking
-    } else if reached {
-        GraphEdgeLineTone::Open
-    } else {
-        GraphEdgeLineTone::Idle
-    };
+pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
+    let rules = abs_rules(props.x, props.y, props.w, props.h);
+    let tone = props.tone;
     ui! {
-        view(style = EdgeCell()) {
-            view(style = GraphEdgeLine().tone(arm)) {}
+        view(style = rules) {
+            view(style = EdgeLine().tone(tone)) {}
         }
     }
 }
 
-/// Props for [`GraphStage`].
+/// Props for [`GraphCard`].
 #[derive(Default, IdealystSchema)]
-pub struct GraphStageProps {
+pub struct GraphCardProps {
     /// Console state handles.
     pub console: Console,
     /// Feature index.
     pub feature: usize,
-    /// Stage index.
-    pub stage: usize,
+    /// Module index in [`crate::model::Feature::modules`].
+    pub module: usize,
+    /// Canvas-relative left edge, px.
+    pub x: f32,
+    /// Canvas-relative top edge, px.
+    pub y: f32,
 }
 
-/// One stage node with its module subagent rows.
+/// A module card at its slot on the canvas.
 #[component]
-pub fn GraphStage(props: &GraphStageProps) -> Element {
+pub fn GraphCard(props: &GraphCardProps) -> Element {
     let console = props.console;
-    let (fi, si) = (props.feature, props.stage);
-    let feats = features();
-    let stage = &feats[fi].stages[si];
-    let code = format!("STAGE {:02}", si + 1);
-    let name = stage.name.clone();
-    let status = stage.status;
-    let module_count = stage.modules.len();
-    let fanout = if module_count > 1 {
-        format!("{module_count} subagents")
-    } else {
-        "1 subagent".to_string()
-    };
-    let arm = if status == Status::Running {
-        StageNodeState::Active
-    } else {
-        StageNodeState::Idle
-    };
+    let (fi, mi) = (props.feature, props.module);
+    let mut rules = abs_rules(props.x, props.y, CARD_W, CARD_H);
+    // A flex column, so the card inside stretches to the slot.
+    rules.flex_direction = Some(FlexDirection::Column);
     ui! {
-        view(style = StageNode().state(arm)) {
-            Stack(axis = StackAxis::Row, align = StackAlign::Center) {
-                Mono(content = code, size = MonoTextSize::Overline)
-                Spacer()
-                StatusBadge(status = status)
-            }
-            Typography(
-                content = name,
-                kind = typography_kind::Body,
-                weight = Some(FontWeight::SemiBold),
-            )
-            scroll_view(style = NodeModules()) {
-                for mi in 0..module_count {
-                    ModuleRow(
-                        console = console,
-                        feature = fi,
-                        stage = si,
-                        module = mi,
-                    )
-                }
-            }
-            text(style = FanoutNote()) { fanout }
+        view(style = rules) {
+            ModuleCard(console = console, feature = fi, module = mi)
         }
     }
 }
 
-// The graph is a canvas: it takes the pane rather than sizing to its
-// diagram, so the horizontal scrollbar lands at the bottom edge.
-//
-// A plain view and not a `scroll_view`, deliberately. Wrapping this in a
-// vertical scroller would make everything inside auto-height again —
-// scroll content sizes to itself — and the strip's `flex_grow` would
-// have nothing to grow against. The vertical overflow lives one level
-// in, on each stage node's module list, where it can actually be bounded.
+/// A module's slot on the canvas, in px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardSlot {
+    pub module: usize,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Where one module sits: column = depth − 1, row = its place in that
+/// column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slot {
+    pub col: usize,
+    pub row: usize,
+}
+
+/// The computed placement of every module, indexed like
+/// [`crate::model::Feature::modules`].
+#[derive(Debug)]
+pub struct GraphLayout {
+    pub slots: Vec<Slot>,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl GraphLayout {
+    /// Columns by depth; rows within a column ordered by the average
+    /// row of the module's prerequisites (then by plan order), which
+    /// keeps a chain straight and a fan-out next to its source.
+    /// Modules arrive topologically sorted, so every prerequisite is
+    /// already placed when its dependents are.
+    pub fn compute(modules: &[Module]) -> Self {
+        let index: HashMap<&str, usize> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id.as_str(), i))
+            .collect();
+        let cols = modules.iter().map(|m| m.depth).max().unwrap_or(1);
+        let mut by_col: Vec<Vec<usize>> = vec![Vec::new(); cols];
+        for (i, m) in modules.iter().enumerate() {
+            by_col[m.depth - 1].push(i);
+        }
+        let mut slots = vec![Slot { col: 0, row: 0 }; modules.len()];
+        let mut rows = 0;
+        for (col, members) in by_col.iter().enumerate() {
+            let mut members = members.clone();
+            if col > 0 {
+                let placed = slots.clone();
+                let key = |i: usize| -> f32 {
+                    let prereq_rows: Vec<f32> = modules[i]
+                        .depends_on
+                        .iter()
+                        .filter_map(|id| index.get(id.as_str()).copied())
+                        .filter(|&j| placed[j].col < col)
+                        .map(|j| placed[j].row as f32)
+                        .collect();
+                    if prereq_rows.is_empty() {
+                        f32::MAX
+                    } else {
+                        prereq_rows.iter().sum::<f32>() / prereq_rows.len() as f32
+                    }
+                };
+                // Stable, so ties keep plan order.
+                members.sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+            }
+            for (row, &i) in members.iter().enumerate() {
+                slots[i] = Slot { col, row };
+            }
+            rows = rows.max(members.len());
+        }
+        GraphLayout { slots, cols, rows: rows.max(1) }
+    }
+
+    /// Left edge of a column's cards.
+    pub fn x(&self, col: usize) -> f32 {
+        PAD + col as f32 * (CARD_W + COL_GAP)
+    }
+
+    /// Top edge of a row's cards.
+    pub fn y(&self, row: usize) -> f32 {
+        PAD + row as f32 * (CARD_H + ROW_GAP)
+    }
+
+    /// Canvas width, padding included.
+    pub fn width(&self) -> f32 {
+        PAD * 2.0 + self.cols as f32 * CARD_W + (self.cols - 1) as f32 * COL_GAP
+    }
+
+    /// Canvas height, padding included.
+    pub fn height(&self) -> f32 {
+        PAD * 2.0 + self.rows as f32 * CARD_H + (self.rows - 1) as f32 * ROW_GAP
+    }
+}
+
+/// One straight piece of an edge, in canvas px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Segment {
+    /// Position in the edge list — the reconciliation key.
+    pub id: usize,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub tone: EdgeLineTone,
+}
+
+/// Every edge as three segments — out of the prerequisite, down or up
+/// the gap before the dependent's column, into the dependent.
+///
+/// The vertical run sits on a lane chosen by the dependent's row, so
+/// two edges into different modules never share one vertical and read
+/// as a single line; edges into the SAME module share a lane and merge,
+/// which is the fan-in a reader expects to see.
+///
+/// Tone follows the prerequisite: green once it is done (the gate is
+/// satisfied on this edge), amber while it is open; muted once the
+/// dependent itself is done.
+pub fn edges(modules: &[Module], layout: &GraphLayout) -> Vec<Segment> {
+    let index: HashMap<&str, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.as_str(), i))
+        .collect();
+    let lanes = ((COL_GAP - LANE_INSET * 2.0) / LANE_STEP).max(1.0) as usize;
+    let mut out = Vec::new();
+    for (ti, m) in modules.iter().enumerate() {
+        let t = layout.slots[ti];
+        for dep in &m.depends_on {
+            let Some(&si) = index.get(dep.as_str()) else { continue };
+            let s = layout.slots[si];
+            if s.col >= t.col {
+                continue;
+            }
+            let tone = if m.status == Status::Done {
+                EdgeLineTone::Muted
+            } else if modules[si].status == Status::Done {
+                EdgeLineTone::Open
+            } else {
+                EdgeLineTone::Blocking
+            };
+            let x1 = layout.x(s.col) + CARD_W;
+            let y1 = layout.y(s.row) + CARD_H / 2.0;
+            let x2 = layout.x(t.col);
+            let y2 = layout.y(t.row) + CARD_H / 2.0;
+            let xm = x2 - COL_GAP + LANE_INSET + (t.row % lanes) as f32 * LANE_STEP;
+            let half = LINE / 2.0;
+            let id = out.len();
+            out.push(Segment { id, x: x1, y: y1 - half, w: xm - x1 + LINE, h: LINE, tone });
+            out.push(Segment {
+                id: id + 1,
+                x: xm,
+                y: y1.min(y2) - half,
+                w: LINE,
+                h: (y2 - y1).abs() + LINE,
+                tone,
+            });
+            out.push(Segment { id: id + 2, x: xm, y: y2 - half, w: x2 - xm, h: LINE, tone });
+        }
+    }
+    out
+}
+
+/// An absolutely-positioned box inside the canvas.
+fn abs_rules(x: f32, y: f32, w: f32, h: f32) -> StyleRules {
+    let mut rules = StyleRules::default();
+    rules.position = Some(Position::Absolute);
+    rules.left = Some(Tokenized::Literal(Length::Px(x)));
+    rules.top = Some(Tokenized::Literal(Length::Px(y)));
+    rules.width = Some(Tokenized::Literal(Length::Px(w)));
+    rules.height = Some(Tokenized::Literal(Length::Px(h)));
+    rules
+}
+
+// The graph takes the pane rather than sizing to its diagram, so the
+// horizontal scrollbar lands at the bottom edge.
 stylesheet! {
     pub GraphScroll<IdeaThemeRef> {
-        base(t) {
+        base(_t) {
             flex_grow: 1.0,
             min_height: 0,
             min_width: 0,
@@ -183,29 +349,18 @@ stylesheet! {
 }
 
 stylesheet! {
-    pub GraphPad<IdeaThemeRef> {
+    pub GraphBlank<IdeaThemeRef> {
         base(t) {
-            flex_direction: FlexDirection::Column,
-            gap: t.spacing.md(),
-            // Horizontal padding belongs to the strip, which scrolls;
-            // putting it here would inset the scrollbar from the pane
-            // edge and clip the first node against it (rule 3).
-            padding_top: t.spacing.lg(),
-            padding_horizontal: 0,
-            // Fills the pane so the strip below can too, which is what
-            // puts its horizontal scrollbar at the bottom of the screen
-            // rather than under the diagram.
-            flex_grow: 1.0,
-            min_height: 0,
+            padding: t.spacing.xl(),
         }
     }
 }
 
-// No padding here — it lives on `GraphStrip` inside, so the scrollbar
-// hugs the container edge (rule 3).
+// No padding here — it is inside the canvas, so the scrollbar hugs the
+// container edge (rule 3).
 stylesheet! {
     pub StripScroll<IdeaThemeRef> {
-        base(t) {
+        base(_t) {
             min_width: 0,
             flex_grow: 1.0,
             min_height: 0,
@@ -213,122 +368,33 @@ stylesheet! {
     }
 }
 
-// Not a card. A surface that has to be as wide as its content is not a
-// container the reader can see the edges of — at eight stages its right
-// border sits two screens away, so the border and background only ever
-// read as "the diagram is broken out of its box". The nodes are cards;
-// the strip is just the row they sit in.
+// A DEFINITE height, not a minimum, so the canvas scrolls inside it
+// instead of growing the strip and pushing the horizontal bar off the
+// bottom of the screen (rule 23). At least the pane's width, so a
+// narrow graph's vertical bar still sits at the pane's right edge.
 stylesheet! {
-    pub GraphStrip<IdeaThemeRef> {
-        base(t) {
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Stretch,
-            // A DEFINITE height, not a minimum. `min_height` lets the
-            // row grow to its tallest lane, which then makes the whole
-            // board scroll vertically and pushes the horizontal
-            // scrollbar off the bottom of the screen — the exact bug
-            // this nesting exists to fix, reappearing as soon as one
-            // lane is deep. Pinned to the viewport, the lanes are
-            // bounded and their card lists scroll instead.
-            height: runtime_core::Length::Percent(100.0),
-            // Padding on the content, so the scrollbar hugs the
-            // container edge (rule 3).
-            padding_vertical: t.spacing.sm(),
-            padding_horizontal: t.spacing.xl(),
-        }
-    }
-}
-
-stylesheet! {
-    pub AgentCell<IdeaThemeRef> {
-        base(t) {
-            width: 150,
+    pub CanvasScroll<IdeaThemeRef> {
+        base(_t) {
+            height: Length::Percent(100.0),
+            min_width: Length::Percent(100.0),
+            min_height: 0,
             flex_shrink: 0.0,
-            flex_direction: FlexDirection::Column,
-            justify_content: JustifyContent::Center,
-            gap: t.spacing.sm(),
-            padding_right: t.spacing.lg(),
         }
     }
 }
 
+// Fills its absolutely-positioned segment; the colour is the theme's.
 stylesheet! {
-    pub EdgeCell<IdeaThemeRef> {
-        base(t) {
-            width: 34,
-            flex_shrink: 0.0,
-            flex_direction: FlexDirection::Column,
-            justify_content: JustifyContent::Center,
-        }
-    }
-}
-
-stylesheet! {
-    pub GraphEdgeLine<IdeaThemeRef> {
-        base(t) {
-            height: 2,
+    pub EdgeLine<IdeaThemeRef> {
+        base(_t) {
+            width: Length::Percent(100.0),
+            height: Length::Percent(100.0),
         }
         variant tone {
             #[default]
-            idle(t) { background: t.color.border() }
+            muted(t) { background: t.color.border() }
             open(t) { background: t.intent.success.fg() }
             blocking(t) { background: t.intent.warning.fg() }
-        }
-    }
-}
-
-stylesheet! {
-    pub StageNode<IdeaThemeRef> {
-        base(t) {
-            width: 270,
-            flex_shrink: 0.0,
-            flex_direction: FlexDirection::Column,
-            gap: t.spacing.sm(),
-            padding: t.spacing.md(),
-            border_width: 1.0,
-            border_radius: t.radius.md(),
-            // Bounded by the strip, so the module list inside has a
-            // definite height to scroll within.
-            min_height: 0,
-        }
-        variant state {
-            #[default]
-            idle(t) {
-                border_color: t.color.border(),
-                background: t.color.surface_alt(),
-            }
-            active(t) {
-                border_color: t.intent.info.border(),
-                background: t.intent.info.soft_bg(),
-            }
-        }
-    }
-}
-
-stylesheet! {
-    pub NodeModules<IdeaThemeRef> {
-        base(t) {
-            flex_direction: FlexDirection::Column,
-            gap: t.spacing.xs(),
-            padding_top: 2,
-            // Takes the slack the node's header leaves, and no more:
-            // `min_height: 0` is what lets a flex child shrink below its
-            // content and therefore scroll at all.
-            flex_grow: 1.0,
-            min_height: 0,
-        }
-    }
-}
-
-stylesheet! {
-    pub FanoutNote<IdeaThemeRef> {
-        base(t) {
-            font_size: 9,
-            text_transform: runtime_core::TextTransform::Uppercase,
-            letter_spacing: 0.8,
-            color: t.color.text_muted(),
-            text_align: runtime_core::TextAlign::Center,
-            padding_top: 2,
         }
     }
 }
@@ -340,7 +406,85 @@ stylesheet! {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
             gap: t.spacing.xs(),
-            padding_bottom: t.spacing.sm(),
+            padding_top: t.spacing.md(),
+            padding_bottom: t.spacing.xs(),
+            flex_shrink: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Module, Status};
+
+    fn module(id: &str, depth: usize, deps: &[&str], status: Status) -> Module {
+        Module {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            status,
+            agent: String::new(),
+            spawned: String::new(),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            waiting_on: Vec::new(),
+            owns: Vec::new(),
+            depth,
+            dispatchable: false,
+            handoff: None,
+            summary: None,
+            block: None,
+            tasks: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    // The worked scenario: a chain that fans out at the end. The two
+    // leaves share a column, sit under their common prerequisite, and
+    // every edge runs left to right.
+    #[test]
+    fn columns_follow_depth_and_edges_run_rightwards() {
+        let modules = vec![
+            module("schema", 1, &[], Status::Done),
+            module("api", 2, &["schema"], Status::Running),
+            module("app", 3, &["api"], Status::Queued),
+            module("mcp", 3, &["api"], Status::Queued),
+        ];
+        let layout = GraphLayout::compute(&modules);
+        assert_eq!(layout.cols, 3);
+        assert_eq!(layout.rows, 2);
+        assert_eq!(layout.slots[0], Slot { col: 0, row: 0 });
+        assert_eq!(layout.slots[1], Slot { col: 1, row: 0 });
+        assert_eq!(layout.slots[2], Slot { col: 2, row: 0 });
+        assert_eq!(layout.slots[3], Slot { col: 2, row: 1 });
+        let segs = edges(&modules, &layout);
+        assert_eq!(segs.len(), 9, "three segments per edge");
+        for seg in &segs {
+            assert!(seg.w > 0.0 && seg.h > 0.0, "{seg:?}");
+        }
+        // The satisfied edge is green; the open ones are amber.
+        assert_eq!(segs[0].tone, EdgeLineTone::Open);
+        assert_eq!(segs[3].tone, EdgeLineTone::Blocking);
+        // Nothing pokes outside the canvas.
+        for seg in &segs {
+            assert!(seg.x + seg.w <= layout.width() && seg.y + seg.h <= layout.height());
+        }
+    }
+
+    // Two dependents in the same column, on different rows, get their
+    // own vertical lanes — otherwise A→D and B→C read as one line.
+    #[test]
+    fn edges_into_different_rows_do_not_share_a_lane() {
+        let modules = vec![
+            module("a", 1, &[], Status::Done),
+            module("b", 1, &[], Status::Done),
+            module("c", 2, &["b"], Status::Queued),
+            module("d", 2, &["a"], Status::Queued),
+        ];
+        let layout = GraphLayout::compute(&modules);
+        let segs = edges(&modules, &layout);
+        let verticals: Vec<f32> = segs.iter().filter(|s| s.w == LINE).map(|s| s.x).collect();
+        assert_eq!(verticals.len(), 2);
+        assert_ne!(verticals[0], verticals[1]);
     }
 }

@@ -1,6 +1,5 @@
 //! Console-wide UI state: which pane is showing, which feature is
-//! selected, which view tab is active, which drawer is open onto what,
-//! which tree rows are toggled.
+//! selected, which view tab is active, which drawer is open onto what.
 //!
 //! All signals — `Console` is a bag of `Copy` handles the components
 //! pass through props by value, mirroring the framework's refs idiom.
@@ -24,11 +23,13 @@ pub struct Console {
     pub nav_open: Signal<bool>,
     /// Index into [`crate::model::features`] of the selected feature.
     pub feature: Signal<usize>,
-    /// Active main-pane view tab id: "board" | "tree" | "feed" | "graph".
+    /// Active main-pane view tab id: "graph" | "whitepaper" | "feed" |
+    /// "origin".
     pub view: Signal<String>,
-    /// Module drawer target: `(stage index, module index)` in the
-    /// selected feature, or `None` when the drawer is closed.
-    pub selected: Signal<Option<(usize, usize)>>,
+    /// Module drawer target: the module's index in
+    /// [`crate::model::Feature::modules`] of the selected feature, or
+    /// `None` when the drawer is closed.
+    pub selected: Signal<Option<usize>>,
     /// Want drawer target: the id of the want whose detail panel is
     /// open, or `None`. An **id**, not an index — the pool re-sorts
     /// under a poll, so an index would drift onto another idea.
@@ -40,13 +41,9 @@ pub struct Console {
     // has to keep rendering its contents for those frames — clearing
     // both together would blank the panel and then slide the blank out.
     /// Last module the drawer was opened onto.
-    pub last_module: Signal<Option<(usize, usize)>>,
+    pub last_module: Signal<Option<usize>>,
     /// Last want the drawer was opened onto.
     pub last_want: Signal<Option<String>>,
-    /// Tree rows whose disclosure state has been flipped from its
-    /// default (stages default open, modules default closed). Keys are
-    /// `"s{stage}"` / `"m{stage}.{module}"`.
-    pub toggled: Signal<Vec<String>>,
     /// Dark-mode flag; drives `install_idea_theme_reactive` in `app()`.
     pub dark: Signal<bool>,
     /// Data revision: bumped whenever a changed snapshot lands, so every
@@ -161,12 +158,11 @@ pub fn use_console() -> Console {
         pane: signal("overview".to_string()),
         nav_open: signal(false),
         feature: signal(0),
-        view: signal("board".to_string()),
+        view: signal("graph".to_string()),
         selected: signal(None),
         want: signal(None),
         last_module: signal(None),
         last_want: signal(None),
-        toggled: signal(Vec::new()),
         dark: signal(false),
         rev: signal(0),
         connected: signal(false),
@@ -225,11 +221,11 @@ impl Console {
     /// project, so following a row has to move the selection as well as
     /// the drawer — `open_module` alone would open the drawer onto a
     /// coordinate in a feature the reader is not looking at.
-    pub fn open_module_in(&self, feature: usize, stage: usize, module: usize) {
+    pub fn open_module_in(&self, feature: usize, module: usize) {
         self.pane.set("feature".to_string());
         self.feature.set(feature);
-        self.view.set("board".to_string());
-        self.open_module(stage, module);
+        self.view.set("graph".to_string());
+        self.open_module(module);
     }
 
     /// Select a feature in the sidebar (closes any open drawer).
@@ -387,11 +383,13 @@ impl Console {
         self.feature_page.set(page);
     }
 
-    /// Open the module drawer.
-    pub fn open_module(&self, stage: usize, module: usize) {
+    /// Open the module drawer on one module of the selected feature.
+    /// Also how the drawer moves to a prerequisite: with `selected`
+    /// already `Some`, the panel stays present and re-targets.
+    pub fn open_module(&self, module: usize) {
         self.want.set(None);
-        self.selected.set(Some((stage, module)));
-        self.last_module.set(Some((stage, module)));
+        self.selected.set(Some(module));
+        self.last_module.set(Some(module));
     }
 
     /// Open the want drawer on one idea. Both drawers occupy the same
@@ -449,23 +447,5 @@ impl Console {
     /// Step the pool's page. Callers clamp to the page count.
     pub fn set_pool_page(&self, page: usize) {
         self.pool_page.set(page);
-    }
-
-    /// Flip a tree row's disclosure state.
-    pub fn toggle(&self, key: &str) {
-        self.toggled.update(|keys| {
-            let mut next = keys.clone();
-            if let Some(pos) = next.iter().position(|k| k == key) {
-                next.remove(pos);
-            } else {
-                next.push(key.to_string());
-            }
-            next
-        });
-    }
-
-    /// Whether a tree row key has been flipped from its default.
-    pub fn is_toggled(keys: &[String], key: &str) -> bool {
-        keys.iter().any(|k| k == key)
     }
 }

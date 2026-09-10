@@ -1,6 +1,6 @@
 //! The right-hand detail overlays. Two of them share one slot and one
-//! shell: [`Drawer`] over a module (stats, task checklist, handoff
-//! history, MCP call trace), and [`WantDrawer`] over one loose idea
+//! shell: [`Drawer`] over a module (stats, prerequisites, task
+//! checklist, handoff document, ledger history), and [`WantDrawer`] over one loose idea
 //! (its tags, provenance, and every feature that absorbed it — with
 //! the composing agent's rationale for each).
 //!
@@ -16,6 +16,7 @@ use runtime_core::{
 };
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
+use crate::components::document::DocumentView;
 use crate::model::{features, wants};
 use crate::state::Console;
 use crate::styles::{MonoTextSize, MonoTextTone, SectionLabel};
@@ -27,9 +28,7 @@ pub struct DrawerProps {
     pub console: Console,
     /// Feature index.
     pub feature: usize,
-    /// Stage index of the open module.
-    pub stage: usize,
-    /// Module index of the open module.
+    /// Index of the open module in [`crate::model::Feature::modules`].
     pub module: usize,
 }
 
@@ -38,12 +37,12 @@ pub struct DrawerProps {
 #[component]
 pub fn Drawer(props: &DrawerProps) -> Element {
     let console = props.console;
-    let (fi, si, mi) = (props.feature, props.stage, props.module);
+    let (fi, mi) = (props.feature, props.module);
     let backdrop = pressable(Vec::new(), move || console.close_drawer())
         .with_style(StyleApplication::new(backdrop_sheet_style()))
         .into_element();
     let panel = panel_motion(
-        move || ui! { ModulePanel(console = console, feature = fi, stage = si, module = mi) },
+        move || ui! { ModulePanel(console = console, feature = fi, module = mi) },
         move || console.selected.get().is_some(),
     );
     ui! {
@@ -62,9 +61,7 @@ pub struct ModulePanelProps {
     pub console: Console,
     /// Feature index.
     pub feature: usize,
-    /// Stage index of the open module.
-    pub stage: usize,
-    /// Module index of the open module.
+    /// Index of the open module in [`crate::model::Feature::modules`].
     pub module: usize,
 }
 
@@ -75,26 +72,45 @@ pub struct ModulePanelProps {
 #[component]
 pub fn ModulePanel(props: &ModulePanelProps) -> Element {
     let console = props.console;
-    let (fi, si, mi) = (props.feature, props.stage, props.module);
+    let (fi, mi) = (props.feature, props.module);
     let feats = features();
     let f = &feats[fi];
-    let m = &f.stages[si].modules[mi];
+    let m = &f.modules[mi];
 
-    let path = format!("{}  ▸  Stage {:02} {}  ▸  Module", f.name, si + 1, f.stages[si].name);
+    let path = format!("{}  \u{25b8}  Module", f.name);
     let name = m.name.clone();
     let status = m.status;
     let agent = m.agent.to_string();
+    let description = m.description.trim().to_string();
+    let has_description = !description.is_empty();
     let done = m.tasks.iter().filter(|t| t.done).count();
     let total = m.tasks.len();
     let added = m.tasks.iter().filter(|t| t.added).count();
-    let in_stage = m.in_stage.to_string();
+    let column = format!("column {}", m.depth);
     let spawned = if m.spawned.is_empty() { "not spawned".to_string() } else { m.spawned.to_string() };
     let task_label = format!("{done} of {total} checked off");
     let block = m.block.clone();
+    // Each prerequisite by its index, so its row opens the same drawer
+    // onto it; `waiting` marks the ones still holding this module back.
+    let prereqs: Vec<(usize, bool)> = m
+        .depends_on
+        .iter()
+        .filter_map(|id| f.module_index(id))
+        .map(|i| (i, m.waiting_on.iter().any(|w| *w == f.modules[i].id)))
+        .collect();
+    let has_prereqs = !prereqs.is_empty();
+    let owns: Vec<String> = m.owns.clone();
+    let has_owns = !owns.is_empty();
     let tasks: Vec<(String, bool, bool)> =
         m.tasks.iter().map(|t| (t.label.to_string(), t.done, t.added)).collect();
-    let handoffs: Vec<(String, String, String, String, bool)> = m
-        .handoffs
+    let summary = m.summary.clone().unwrap_or_default();
+    let has_summary = !summary.is_empty();
+    let (handoff_present, handoff_body, handoff_meta) = match &m.handoff {
+        Some(d) => (true, d.body.clone(), d.meta()),
+        None => (false, String::new(), String::new()),
+    };
+    let history: Vec<(String, String, String, String, bool)> = m
+        .history
         .iter()
         .map(|h| {
             (
@@ -106,18 +122,10 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
             )
         })
         .collect();
-    let trace: Vec<(String, String, String, bool)> = m
-        .trace
-        .iter()
-        .map(|c| {
-            let bad = c.result == "denied" || c.result.contains("fail");
-            (c.at.to_string(), c.tool.to_string(), c.result.to_string(), bad)
-        })
-        .collect();
-    let has_trace = !trace.is_empty();
+    let has_history = !history.is_empty();
 
     let close = pressable(
-        vec![ui! { text(style = CloseGlyph()) { "×" } }],
+        vec![ui! { text(style = CloseGlyph()) { "\u{d7}" } }],
         move || console.close_drawer(),
     )
     .with_style(StyleApplication::new(close_box_style()))
@@ -144,8 +152,12 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                             close
                         }
 
+                        if has_description {
+                            Typography(content = description, kind = typography_kind::BodySm, muted = true)
+                        }
+
                         Grid(columns = 2u32, gap = StackGap::Xs) {
-                            StatCell(label = "time in stage", value = in_stage)
+                            StatCell(label = "depth", value = column)
                             StatCell(label = "spawned", value = spawned)
                             StatCell(label = "tasks done", value = format!("{done} / {total}"))
                             StatCell(label = "agent-added", value = format!("{added}"))
@@ -155,6 +167,25 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                             view(style = BlockBox()) {
                                 text(style = BlockTitle()) { title }
                                 text(style = BlockBody()) { body }
+                            }
+                        }
+
+                        view(style = SectionCol()) {
+                            text(style = SectionLabel()) { "Prerequisites" }
+                            if !has_prereqs {
+                                Typography(content = "None.", kind = typography_kind::BodySm, muted = true)
+                            }
+                            for (index, waiting) in prereqs {
+                                PrereqRow(console = console, feature = fi, module = index, waiting = waiting)
+                            }
+                        }
+
+                        if has_owns {
+                            view(style = SectionCol()) {
+                                text(style = SectionLabel()) { "Owns" }
+                                for path in owns {
+                                    Mono(content = path, tone = MonoTextTone::Text)
+                                }
                             }
                         }
 
@@ -169,20 +200,29 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                             }
                         }
 
-                        view(style = SectionCol()) {
-                            text(style = SectionLabel()) { "Handoff history" }
-                            for (title, body, at, from, gate) in handoffs {
-                                HandoffRow(title = title, body = body, at = at, from = from, gate = gate)
+                        if has_summary {
+                            view(style = SectionCol()) {
+                                text(style = SectionLabel()) { "Summary" }
+                                Typography(content = summary, kind = typography_kind::BodySm)
                             }
                         }
 
-                        if has_trace {
+                        view(style = SectionCol()) {
+                            text(style = SectionLabel()) { "Handoff" }
+                            DocumentView(
+                                console = console,
+                                present = handoff_present,
+                                body = handoff_body,
+                                meta = handoff_meta,
+                                empty = "No handoff written.",
+                            )
+                        }
+
+                        if has_history {
                             view(style = SectionCol()) {
-                                text(style = SectionLabel()) { "MCP calls" }
-                                view(style = TraceBox()) {
-                                    for (at, tool, result, bad) in trace {
-                                        TraceRow(at = at, tool = tool, result = result, bad = bad)
-                                    }
+                                text(style = SectionLabel()) { "History" }
+                                for (title, body, at, from, gate) in history {
+                                    HistoryRow(title = title, body = body, at = at, from = from, gate = gate)
                                 }
                             }
                         }
@@ -190,6 +230,52 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                 }
         }
     }
+}
+
+/// Props for [`PrereqRow`].
+#[derive(Default, IdealystSchema)]
+pub struct PrereqRowProps {
+    /// Console state handles.
+    pub console: Console,
+    /// Feature index.
+    pub feature: usize,
+    /// The prerequisite's index in [`crate::model::Feature::modules`].
+    pub module: usize,
+    /// Whether this prerequisite is still holding the open module back.
+    pub waiting: bool,
+}
+
+/// One prerequisite of the open module. Pressing it moves the drawer
+/// onto that module — one detail surface per entity, reached from
+/// wherever it appears (rule 20).
+#[component]
+pub fn PrereqRow(props: &PrereqRowProps) -> Element {
+    let console = props.console;
+    let index = props.module;
+    let feats = features();
+    let Some(m) = feats.get(props.feature).and_then(|f| f.modules.get(index)) else {
+        return ui! { view {} };
+    };
+    let name = m.name.clone();
+    let status = m.status;
+    let waiting = props.waiting;
+
+    let inner: Element = ui! {
+        view(style = PrereqInner()) {
+            StatusDot(status = status)
+            view(style = TaskLabelCell()) {
+                Typography(content = name, kind = typography_kind::BodySm)
+            }
+            if waiting {
+                Mono(content = "waiting", size = MonoTextSize::Overline, tone = MonoTextTone::Warning)
+            }
+            text(style = PrereqChevron()) { "\u{203a}" }
+        }
+    };
+
+    pressable(vec![inner], move || console.open_module(index))
+        .with_style(StyleApplication::new(prereq_box_style()))
+        .into_element()
 }
 
 /// Props for [`WantDrawer`].
@@ -459,12 +545,12 @@ pub fn TaskRow(props: &TaskRowProps) -> Element {
     }
 }
 
-/// Props for [`HandoffRow`].
+/// Props for [`HistoryRow`].
 #[derive(Default, IdealystSchema)]
-pub struct HandoffRowProps {
-    /// Handoff title.
+pub struct HistoryRowProps {
+    /// Event title.
     pub title: String,
-    /// Handoff body.
+    /// Event body.
     pub body: String,
     /// Timestamp.
     pub at: String,
@@ -474,9 +560,9 @@ pub struct HandoffRowProps {
     pub gate: bool,
 }
 
-/// One handoff-history entry.
+/// One ledger entry that touched the open module.
 #[component]
-pub fn HandoffRow(props: &HandoffRowProps) -> Element {
+pub fn HistoryRow(props: &HistoryRowProps) -> Element {
     let title = props.title.clone();
     let body = props.body.clone();
     let has_body = !body.is_empty();
@@ -507,37 +593,6 @@ pub fn HandoffRow(props: &HandoffRowProps) -> Element {
                     Mono(content = from, size = MonoTextSize::Overline)
                 }
             }
-        }
-    }
-}
-
-/// Props for [`TraceRow`].
-#[derive(Default, IdealystSchema)]
-pub struct TraceRowProps {
-    /// Timestamp.
-    pub at: String,
-    /// MCP tool invoked.
-    pub tool: String,
-    /// Result label ("ok", "denied", "2 fail").
-    pub result: String,
-    /// Whether the result is a failure/denial.
-    pub bad: bool,
-}
-
-/// One MCP trace row.
-#[component]
-pub fn TraceRow(props: &TraceRowProps) -> Element {
-    let at = props.at.clone();
-    let tool = props.tool.clone();
-    let result = props.result.clone();
-    let tone = if props.bad { MonoTextTone::Danger } else { MonoTextTone::Success };
-    ui! {
-        view(style = TraceRowBox()) {
-            Mono(content = at, size = MonoTextSize::Overline)
-            view(style = TraceToolCell()) {
-                Mono(content = tool, size = MonoTextSize::Overline, tone = MonoTextTone::Info)
-            }
-            Mono(content = result, size = MonoTextSize::Overline, tone = tone)
         }
     }
 }
@@ -775,6 +830,47 @@ stylesheet! {
 }
 
 stylesheet! {
+    pub PrereqBox<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Column,
+            border_bottom_width: 1.0,
+            border_color: t.color.border(),
+            cursor: runtime_core::Cursor::Pointer,
+        }
+        transitions {
+            background: 160ms EaseOut,
+            border_color: 160ms EaseOut,
+            opacity: 160ms EaseOut,
+        }
+        state hovered(t) {
+            background: t.color.surface_alt(),
+        }
+    }
+}
+
+stylesheet! {
+    pub PrereqInner<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            gap: t.spacing.sm(),
+            padding_vertical: 9,
+            min_width: 0,
+        }
+    }
+}
+
+stylesheet! {
+    pub PrereqChevron<IdeaThemeRef> {
+        base(t) {
+            font_size: t.typography.body_size(),
+            color: t.color.text_muted(),
+            flex_shrink: 0.0,
+        }
+    }
+}
+
+stylesheet! {
     pub HandoffGrid<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
@@ -831,42 +927,6 @@ stylesheet! {
             flex_direction: FlexDirection::Column,
             gap: 3,
             padding_bottom: t.spacing.md(),
-        }
-    }
-}
-
-stylesheet! {
-    pub TraceBox<IdeaThemeRef> {
-        base(t) {
-            flex_direction: FlexDirection::Column,
-            border_width: 1.0,
-            border_color: t.color.border(),
-            border_radius: t.radius.md(),
-            overflow: runtime_core::Overflow::Hidden,
-        }
-    }
-}
-
-stylesheet! {
-    pub TraceRowBox<IdeaThemeRef> {
-        base(t) {
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            gap: t.spacing.sm(),
-            padding_vertical: t.spacing.sm(),
-            padding_horizontal: 10,
-            border_top_width: 1.0,
-            border_color: t.color.border(),
-            background: t.color.surface(),
-        }
-    }
-}
-
-stylesheet! {
-    pub TraceToolCell<IdeaThemeRef> {
-        base(t) {
-            flex_grow: 1.0,
-            min_width: 0,
         }
     }
 }

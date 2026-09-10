@@ -3,7 +3,7 @@
 
 pub mod bits;
 pub mod composer;
-pub mod board;
+pub mod document;
 pub mod drawer;
 pub mod feature_list;
 pub mod feed;
@@ -15,5 +15,4 @@ pub mod main_pane;
 pub mod module_card;
 pub mod overview;
 pub mod sidebar;
-pub mod tree;
 pub mod wants;

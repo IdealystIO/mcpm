@@ -572,6 +572,7 @@ mod tests {
         let mut expected = runtime_scene::Registry::<host_mock::HostMock>::new();
         codeblock::register(&mut expected);
         table::register(&mut expected);
+        markdown::register(&mut expected);
 
         assert_eq!(
             seam.handler_count(),

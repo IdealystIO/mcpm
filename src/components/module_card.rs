@@ -1,161 +1,137 @@
-//! Module cards — the full board card and the compact graph row. Both
-//! are pressables that open the module drawer.
+//! The module card: the one pressable per module on the graph, opening
+//! the module drawer.
 
-use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Stack, StackAlign, StackAxis, StackGap,
-    Typography};
+use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Typography};
 use runtime_core::{
     component, pressable, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
     IdealystSchema, IntoElement, StyleApplication,
 };
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot, Ticks};
-use crate::model::{features, Status};
+use crate::model::{features, Readiness, Status};
 use crate::state::Console;
 use crate::styles::{MonoTextSize, MonoTextTone};
 
-/// Props for [`ModuleCard`] and [`ModuleRow`].
+/// Card width in px. The graph positions cards and draws edges from
+/// this geometry, so it is a constant and not a style: a value the
+/// layout maths cannot read is a value the edges would miss by.
+pub const CARD_W: f32 = 232.0;
+/// Card height in px — fixed for the same reason. The card clips
+/// rather than grows; the drawer has the room.
+pub const CARD_H: f32 = 108.0;
+
+/// Props for [`ModuleCard`].
 #[derive(Default, IdealystSchema)]
 pub struct ModuleCardProps {
     /// Console state handles.
     pub console: Console,
     /// Feature index.
     pub feature: usize,
-    /// Stage index within the feature.
-    pub stage: usize,
-    /// Module index within the stage.
+    /// Module index in [`crate::model::Feature::modules`].
     pub module: usize,
 }
 
-/// The card's pressable shell, shared by the board card and the graph
-/// row.
+/// One module on the graph.
 ///
-/// The style is a CLOSURE and not a value: selecting a module writes
-/// `Console::selected`, and reading it here means the highlight lands
-/// on this one node instead of rebuilding the board that contains it.
-/// That is what lets the border transition play at all — a rebuilt node
-/// has no previous colour to move from — and it is why the pane's
-/// `switch` no longer keys on the selection.
-fn module_pressable(
-    console: Console,
-    si: usize,
-    mi: usize,
-    status: Status,
-    inner: Element,
-) -> Element {
-    let selection = console.selected;
+/// Two axes are visible at once: the status pill says what the module
+/// is doing, and the left edge says where it stands against its
+/// prerequisites — green when every one is done, amber while it waits
+/// (with the names it waits on underneath), muted once it is done
+/// itself.
+#[component]
+pub fn ModuleCard(props: &ModuleCardProps) -> Element {
+    let console = props.console;
+    let (fi, mi) = (props.feature, props.module);
+    let feats = features();
+    let f = &feats[fi];
+    let m = &f.modules[mi];
+
+    let name = m.name.clone();
+    let status = m.status;
+    let agent = m.agent.clone();
+    let agent_tone = match agent.as_str() {
+        "ready" => MonoTextTone::Success,
+        "waiting" => MonoTextTone::Warning,
+        _ => MonoTextTone::Muted,
+    };
+    let task_label = m.task_label();
+    let ticks: Vec<bool> = m.tasks.iter().map(|t| t.done).collect();
+    let readiness = m.readiness();
+    let waits = (readiness == Readiness::Waiting)
+        .then(|| format!("waits on {}", f.module_names(&m.waiting_on)));
+    let ready_arm = match readiness {
+        Readiness::Open => "open",
+        Readiness::Waiting => "waiting",
+        Readiness::Done => "done",
+    };
     let dim = matches!(status, Status::Blocked | Status::Queued);
-    pressable(vec![inner], move || console.open_module(si, mi))
+    let selection = console.selected;
+
+    let inner: Element = ui! {
+        view(style = ModuleInner()) {
+            view(style = TitleRow()) {
+                StatusDot(status = status)
+                view(style = TitleSlot()) {
+                    Typography(
+                        content = name,
+                        kind = typography_kind::BodySm,
+                        weight = Some(FontWeight::SemiBold),
+                    )
+                }
+                view(style = FixedSlot()) {
+                    StatusBadge(status = status)
+                }
+            }
+            view(style = MetaRow()) {
+                Mono(content = agent, size = MonoTextSize::Overline, tone = agent_tone)
+                Spacer()
+                Mono(content = task_label, size = MonoTextSize::Overline)
+            }
+            Ticks(ticks = ticks)
+            if let Some(line) = waits {
+                text(style = WaitsLine()) { line }
+            }
+        }
+    };
+
+    // The style is a CLOSURE and not a value: selecting a module writes
+    // `Console::selected`, and reading it here means the highlight
+    // lands on this one node instead of rebuilding the graph around it
+    // — which is what lets the border transition play at all.
+    pressable(vec![inner], move || console.open_module(mi))
         .with_style(move || {
-            let arm = accent_arm(status, selection.get() == Some((si, mi)));
+            let accent = if selection.get() == Some(mi) {
+                "selected"
+            } else {
+                match status {
+                    Status::Running => "running",
+                    Status::Violation => "violation",
+                    _ => "plain",
+                }
+            };
             StyleApplication::new(module_box_style())
-                .with("accent", arm.to_string())
+                .with("accent", accent.to_string())
+                .with("ready", ready_arm.to_string())
                 .with("dim", if dim { "yes" } else { "no" }.to_string())
         })
         .into_element()
 }
 
-/// Accent arm for a module surface, from status + selection.
-fn accent_arm(status: Status, selected: bool) -> &'static str {
-    if selected {
-        "selected"
-    } else {
-        match status {
-            Status::Running => "running",
-            Status::Violation => "violation",
-            _ => "plain",
-        }
-    }
-}
-
-/// The full board card for one module.
-#[component]
-pub fn ModuleCard(props: &ModuleCardProps) -> Element {
-    let console = props.console;
-    let (fi, si, mi) = (props.feature, props.stage, props.module);
-    let feats = features();
-    let m = &feats[fi].stages[si].modules[mi];
-
-    let name = m.name.clone();
-    let status = m.status;
-    let agent = m.agent.to_string();
-    let task_label = m.task_label();
-    let ticks: Vec<bool> = m.tasks.iter().map(|t| t.done).collect();
-    let now = m.now.clone();
-
-    let inner: Element = ui! {
-        view(style = ModuleInner()) {
-            Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
-                StatusDot(status = status)
-                Typography(
-                    content = name,
-                    kind = typography_kind::BodySm,
-                    weight = Some(FontWeight::SemiBold),
-                )
-                Spacer()
-                StatusBadge(status = status)
-            }
-            Stack(axis = StackAxis::Row, align = StackAlign::Center) {
-                Mono(content = agent, size = MonoTextSize::Overline)
-                Spacer()
-                Mono(content = task_label, size = MonoTextSize::Overline)
-            }
-            Ticks(ticks = ticks)
-            if let Some((tool, doing)) = now {
-                view(style = NowRow()) {
-                    Mono(content = tool.to_string(), tone = MonoTextTone::Info)
-                    Typography(content = doing, kind = typography_kind::Caption, muted = true)
-                }
-            }
-        }
-    };
-
-    module_pressable(console, si, mi, status, inner)
-}
-
-/// Props for [`ModuleRow`] — same shape as [`ModuleCardProps`], its own
-/// type because each `#[component]` owns its props' dispatch impl.
-#[derive(Default, IdealystSchema)]
-pub struct ModuleRowProps {
-    /// Console state handles.
-    pub console: Console,
-    /// Feature index.
-    pub feature: usize,
-    /// Stage index within the feature.
-    pub stage: usize,
-    /// Module index within the stage.
-    pub module: usize,
-}
-
-/// The compact dependency-graph row for one module.
-#[component]
-pub fn ModuleRow(props: &ModuleRowProps) -> Element {
-    let console = props.console;
-    let (fi, si, mi) = (props.feature, props.stage, props.module);
-    let feats = features();
-    let m = &feats[fi].stages[si].modules[mi];
-
-    let name = m.name.clone();
-    let status = m.status;
-    let task_label = m.task_label();
-
-    let inner: Element = ui! {
-        view(style = RowInner()) {
-            StatusDot(status = status)
-            Typography(content = name, kind = typography_kind::Caption)
-            Spacer()
-            Mono(content = task_label, size = MonoTextSize::Overline)
-        }
-    };
-
-    module_pressable(console, si, mi, status, inner)
-}
-
 stylesheet! {
     pub ModuleBox<IdeaThemeRef> {
         base(t) {
-            border_width: 1.0,
+            flex_grow: 1.0,
+            min_height: 0,
+            // Spelled per side: the `border_width` shorthand expands to
+            // all four and collides with the left edge.
+            border_top_width: 1.0,
+            border_right_width: 1.0,
+            border_bottom_width: 1.0,
+            border_left_width: 3.0,
             border_radius: t.radius.md(),
             background: t.color.surface(),
+            overflow: runtime_core::Overflow::Hidden,
+            cursor: runtime_core::Cursor::Pointer,
         }
         variant accent {
             #[default]
@@ -164,10 +140,18 @@ stylesheet! {
             violation(t) { border_color: t.intent.danger.border() }
             selected(t) { border_color: t.intent.primary.fg() }
         }
+        // Declared AFTER `accent` so the left edge wins over the
+        // all-sides colour.
+        variant ready {
+            #[default]
+            open(t) { border_left_color: t.intent.success.fg() }
+            waiting(t) { border_left_color: t.intent.warning.fg() }
+            done(t) { border_left_color: t.color.border_strong() }
+        }
         variant dim {
             #[default]
             no(t) { opacity: 1.0 }
-            yes(t) { opacity: 0.72 }
+            yes(t) { opacity: 0.8 }
         }
         transitions {
             border_color: 260ms EaseOut,
@@ -185,28 +169,64 @@ stylesheet! {
             flex_direction: FlexDirection::Column,
             gap: t.spacing.sm(),
             padding: t.spacing.md(),
+            min_width: 0,
         }
     }
 }
 
 stylesheet! {
-    pub RowInner<IdeaThemeRef> {
+    pub TitleRow<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
             gap: t.spacing.sm(),
-            padding_vertical: t.spacing.sm(),
-            padding_horizontal: t.spacing.md(),
+            min_width: 0,
+        }
+    }
+}
+
+// The flexible / fixed pair (rule 22). The title is one line tall and
+// clips: a name long enough to wrap belongs to the drawer's H3.
+stylesheet! {
+    pub TitleSlot<IdeaThemeRef> {
+        base(_t) {
+            flex_direction: FlexDirection::Column,
+            min_width: 0,
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            height: 20,
+            overflow: runtime_core::Overflow::Hidden,
         }
     }
 }
 
 stylesheet! {
-    pub NowRow<IdeaThemeRef> {
+    pub FixedSlot<IdeaThemeRef> {
+        base(_t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            flex_shrink: 0.0,
+        }
+    }
+}
+
+stylesheet! {
+    pub MetaRow<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
-            gap: t.spacing.xs(),
+            gap: t.spacing.sm(),
+            min_width: 0,
+        }
+    }
+}
+
+stylesheet! {
+    pub WaitsLine<IdeaThemeRef> {
+        base(t) {
+            font_size: t.typography.overline_size(),
+            color: t.intent.warning.soft_text(),
+            overflow: runtime_core::Overflow::Hidden,
         }
     }
 }

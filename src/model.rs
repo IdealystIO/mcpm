@@ -10,9 +10,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Execution status shared by features, stages, modules, events, and
-/// agents. `Violation` is a display state: a module whose claim bounced
-/// off the stage gate (`premature_claim` on the ledger).
+/// Execution status shared by features, modules, events, and agents.
+/// `Violation` is a display state: a module whose claim bounced off the
+/// gate because a prerequisite was still open (`premature_claim` on the
+/// ledger).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
     Done,
@@ -29,7 +30,7 @@ impl Status {
         match self {
             Status::Done => "complete",
             Status::Running => "running",
-            Status::Blocked => "gated",
+            Status::Blocked => "blocked",
             Status::Violation => "rejected",
             Status::Queued => "queued",
             Status::Planning => "planning",
@@ -43,37 +44,69 @@ pub struct Task {
     pub added: bool,
 }
 
-pub struct TraceCall {
-    pub at: String,
-    pub tool: String,
-    pub result: String,
-}
-
-pub struct Handoff {
+/// One ledger entry that touched a module, as the drawer's history
+/// shows it.
+pub struct ModuleEvent {
     pub title: String,
     pub body: String,
     pub at: String,
     pub from: String,
 }
 
+/// The current revision of a document: a feature's whitepaper or a
+/// module's handoff. Markdown in `body`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Document {
+    pub revision: i32,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub written: String,
+}
+
+impl Document {
+    /// The muted provenance line under a rendered document.
+    pub fn meta(&self) -> String {
+        format!("rev {} \u{b7} {} \u{b7} {}", self.revision, self.author, self.written)
+    }
+}
+
 pub struct Module {
+    pub id: String,
     pub name: String,
+    pub description: String,
     pub status: Status,
     pub agent: String,
     pub spawned: String,
-    pub in_stage: String,
-    pub now: Option<(String, String)>,
+    /// Prerequisite module ids.
+    pub depends_on: Vec<String>,
+    /// The prerequisites not yet done. Empty means the gate is open.
+    pub waiting_on: Vec<String>,
+    /// Path prefixes this module writes to; empty = undeclared.
+    pub owns: Vec<String>,
+    /// Longest path from a root, 1-based — the graph's column.
+    pub depth: usize,
+    /// todo + unclaimed + every prerequisite done.
+    pub dispatchable: bool,
+    pub handoff: Option<Document>,
+    pub summary: Option<String>,
     pub block: Option<(String, String)>,
     pub tasks: Vec<Task>,
-    pub handoffs: Vec<Handoff>,
-    pub trace: Vec<TraceCall>,
+    /// Every ledger entry whose subject is this module, oldest first.
+    pub history: Vec<ModuleEvent>,
 }
 
-pub struct Stage {
-    pub name: String,
-    pub status: Status,
-    pub time: String,
-    pub modules: Vec<Module>,
+/// Where a module stands against its prerequisites — the axis the graph
+/// colours, separate from [`Status`] (which is what the module itself
+/// is doing).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// Every prerequisite is done: ready to claim, or already claimed.
+    Open,
+    /// At least one prerequisite is still open.
+    Waiting,
+    /// The module itself is done.
+    Done,
 }
 
 pub struct EventItem {
@@ -152,10 +185,14 @@ pub struct WantSource {
 
 pub struct Feature {
     pub name: String,
+    pub description: String,
     pub status: Status,
     pub agent: String,
     pub elapsed: String,
-    pub stages: Vec<Stage>,
+    /// Topological order: every module after all of its prerequisites,
+    /// ties by depth then name.
+    pub modules: Vec<Module>,
+    pub whitepaper: Option<Document>,
     pub events: Vec<EventItem>,
     /// The loose ideas this feature was composed from.
     pub sources: Vec<WantSource>,
@@ -184,7 +221,7 @@ pub fn task_fraction<'a>(modules: impl Iterator<Item = &'a Module>) -> f32 {
 
 impl Feature {
     pub fn fraction(&self) -> f32 {
-        task_fraction(self.stages.iter().flat_map(|s| s.modules.iter()))
+        task_fraction(self.modules.iter())
     }
 
     pub fn pct_label(&self) -> String {
@@ -192,16 +229,15 @@ impl Feature {
     }
 
     pub fn module_count(&self) -> (usize, usize) {
-        let all: Vec<_> = self.stages.iter().flat_map(|s| s.modules.iter()).collect();
         (
-            all.iter().filter(|m| m.status == Status::Done).count(),
-            all.len(),
+            self.modules.iter().filter(|m| m.status == Status::Done).count(),
+            self.modules.len(),
         )
     }
 
     pub fn task_count(&self) -> (usize, usize, usize) {
         let (mut done, mut total, mut added) = (0, 0, 0);
-        for m in self.stages.iter().flat_map(|s| s.modules.iter()) {
+        for m in &self.modules {
             for t in &m.tasks {
                 total += 1;
                 if t.done {
@@ -215,45 +251,54 @@ impl Feature {
         (done, total, added)
     }
 
-    pub fn stage_count(&self) -> (usize, usize) {
-        (
-            self.stages
-                .iter()
-                .filter(|s| s.status == Status::Done)
-                .count(),
-            self.stages.len(),
-        )
-    }
-}
-
-impl Stage {
-    pub fn fraction(&self) -> f32 {
-        task_fraction(self.modules.iter())
+    /// Modules an agent could claim right now.
+    pub fn ready_count(&self) -> usize {
+        self.modules.iter().filter(|m| m.dispatchable).count()
     }
 
-    pub fn done_label(&self) -> String {
+    /// The one-line rollup every feature row and header shows.
+    pub fn meta_line(&self) -> String {
+        let (done, total) = self.module_count();
         format!(
-            "{}/{} modules",
-            self.modules
-                .iter()
-                .filter(|m| m.status == Status::Done)
-                .count(),
-            self.modules.len()
+            "{done}/{total} modules \u{b7} {} ready \u{b7} {} of tasks",
+            self.ready_count(),
+            self.pct_label(),
         )
     }
 
-    pub fn concurrency_note(&self) -> String {
-        if self.modules.len() > 1 {
-            format!("{} modules run concurrently", self.modules.len())
-        } else {
-            "single module".to_string()
-        }
+    /// Index of a module in [`Feature::modules`] by id.
+    pub fn module_index(&self, id: &str) -> Option<usize> {
+        self.modules.iter().position(|m| m.id == id)
+    }
+
+    /// A module's name by id, for the graph's "waits on" lines. Falls
+    /// back to the id so a dangling reference is visible rather than
+    /// blank.
+    pub fn module_name(&self, id: &str) -> String {
+        self.module_index(id)
+            .map(|i| self.modules[i].name.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Names of the given module ids, joined for display.
+    pub fn module_names(&self, ids: &[String]) -> String {
+        ids.iter()
+            .map(|id| self.module_name(id))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
 impl Module {
-    pub fn fraction(&self) -> f32 {
-        task_fraction(std::iter::once(self))
+    /// Where the module stands against its prerequisites.
+    pub fn readiness(&self) -> Readiness {
+        if self.status == Status::Done {
+            Readiness::Done
+        } else if self.waiting_on.is_empty() {
+            Readiness::Open
+        } else {
+            Readiness::Waiting
+        }
     }
 
     pub fn task_label(&self) -> String {
@@ -350,8 +395,8 @@ pub fn rail_features(selected: usize) -> Vec<usize> {
 
 /// Where an [`Attention`] row goes when it is opened.
 pub enum AttentionTarget {
-    /// A module drawer: `(feature, stage, module)`.
-    Module(usize, usize, usize),
+    /// A module drawer: `(feature, module)`.
+    Module(usize, usize),
     /// The want pool screen.
     Pool,
 }
@@ -390,28 +435,33 @@ pub fn attention() -> Vec<Attention> {
     let mut rejected = Vec::new();
     let mut blocked = Vec::new();
     for (fi, f) in feats.iter().enumerate() {
-        for (si, stage) in f.stages.iter().enumerate() {
-            for (mi, m) in stage.modules.iter().enumerate() {
-                let row = |kind, status, title| Attention {
-                    kind,
-                    status,
-                    title,
-                    place: f.name.clone(),
-                    target: AttentionTarget::Module(fi, si, mi),
-                };
-                match m.status {
-                    Status::Violation => rejected.push(row(
+        for (mi, m) in f.modules.iter().enumerate() {
+            let row = |kind, status, title| Attention {
+                kind,
+                status,
+                title,
+                place: f.name.clone(),
+                target: AttentionTarget::Module(fi, mi),
+            };
+            match m.status {
+                Status::Violation => {
+                    let on = if m.waiting_on.is_empty() {
+                        "its prerequisites are done now".to_string()
+                    } else {
+                        format!("waiting on {}", f.module_names(&m.waiting_on))
+                    };
+                    rejected.push(row(
                         "gate",
                         Status::Violation,
-                        format!("Claim on {} denied — {} is locked", m.name, stage.name),
-                    )),
-                    Status::Blocked => blocked.push(row(
-                        "blocked",
-                        Status::Blocked,
-                        format!("{} is blocked, waiting on the manager", m.name),
-                    )),
-                    _ => {}
+                        format!("Claim on {} denied \u{2014} {on}", m.name),
+                    ))
                 }
+                Status::Blocked => blocked.push(row(
+                    "blocked",
+                    Status::Blocked,
+                    format!("{} is blocked, waiting on the manager", m.name),
+                )),
+                _ => {}
             }
         }
     }
@@ -592,7 +642,10 @@ fn event_display(kind: &str) -> (&'static str, Status) {
         "task_skipped" => ("task", Status::Queued),
         "task_added" => ("task", Status::Planning),
         "module_done" => ("module", Status::Done),
-        "stage_unlocked" => ("gate", Status::Done),
+        // `stage_unlocked` is history: the ledger still carries rows
+        // from before modules had prerequisites of their own.
+        "stage_unlocked" | "module_unlocked" => ("gate", Status::Done),
+        "document_written" => ("doc", Status::Planning),
         "blocker_reported" => ("blocker", Status::Violation),
         "module_released" => ("module", Status::Queued),
         "feature_done" => ("feature", Status::Done),
@@ -623,10 +676,12 @@ fn map_feature(f: &api::FeatureDto) -> Feature {
     };
     Feature {
         name: f.name.clone(),
+        description: f.description.clone(),
         status,
         agent: f.created_by.clone().unwrap_or_else(|| "—".into()),
         elapsed,
-        stages: f.stages.iter().map(|s| map_stage(s, f)).collect(),
+        modules: f.modules.iter().map(|m| map_module(m, f)).collect(),
+        whitepaper: f.whitepaper.as_ref().map(map_document),
         // Newest first, like the design's feed.
         events: f
             .events
@@ -654,27 +709,13 @@ fn map_feature(f: &api::FeatureDto) -> Feature {
     }
 }
 
-fn map_stage(s: &api::StageDto, f: &api::FeatureDto) -> Stage {
-    let any_active = s
-        .modules
-        .iter()
-        .any(|m| m.status == "in_progress" || m.status == "blocked");
-    let status = match s.status.as_str() {
-        "done" => Status::Done,
-        "locked" => Status::Blocked,
-        _ if any_active => Status::Running,
-        _ => Status::Running,
-    };
-    let time = match s.status.as_str() {
-        "done" => "closed".to_string(),
-        "locked" => "not started".to_string(),
-        _ => "open".to_string(),
-    };
-    Stage {
-        name: s.name.clone(),
-        status,
-        time,
-        modules: s.modules.iter().map(|m| map_module(m, f)).collect(),
+fn map_document(d: &api::DocumentDto) -> Document {
+    Document {
+        revision: d.revision,
+        title: d.title.clone(),
+        body: d.body.clone(),
+        author: d.author.clone(),
+        written: d.written.clone(),
     }
 }
 
@@ -699,13 +740,13 @@ fn map_module(m: &api::ModuleDto, f: &api::FeatureDto) -> Module {
             .iter()
             .rev()
             .find(|e| e.kind == "premature_claim")
-            .map(|e| ("Start rejected — stage order violated".to_string(), e.body.clone()))
+            .map(|e| ("Start rejected \u{2014} prerequisites open".to_string(), e.body.clone()))
     } else if m.status == "blocked" {
         module_events
             .iter()
             .rev()
             .find(|e| e.kind == "blocker_reported")
-            .map(|e| ("Blocked — waiting on the manager".to_string(), e.body.clone()))
+            .map(|e| ("Blocked \u{2014} waiting on the manager".to_string(), e.body.clone()))
     } else {
         None
     };
@@ -714,16 +755,30 @@ fn map_module(m: &api::ModuleDto, f: &api::FeatureDto) -> Module {
         .find(|e| e.kind == "module_claimed")
         .map(|e| e.time.clone())
         .unwrap_or_default();
+    // The agent slot doubles as the readiness word while nobody holds
+    // the module: what a reader wants from an unclaimed card is whether
+    // it could be claimed, not that it has not been.
+    let agent = match m.claimed_by.clone() {
+        Some(a) => a,
+        None if m.status == "done" => "\u{2014}".to_string(),
+        None if m.dispatchable => "ready".to_string(),
+        None if !m.waiting_on.is_empty() => "waiting".to_string(),
+        None => "not spawned".to_string(),
+    };
     Module {
+        id: m.id.clone(),
         name: m.name.clone(),
+        description: m.description.clone(),
         status,
-        agent: m
-            .claimed_by
-            .clone()
-            .unwrap_or_else(|| "not spawned".to_string()),
+        agent,
         spawned,
-        in_stage: "—".to_string(),
-        now: None,
+        depends_on: m.depends_on.clone(),
+        waiting_on: m.waiting_on.clone(),
+        owns: m.owns.clone(),
+        depth: m.depth.max(1) as usize,
+        dispatchable: m.dispatchable,
+        handoff: m.handoff.as_ref().map(map_document),
+        summary: m.summary.clone().filter(|s| !s.trim().is_empty()),
         block,
         tasks: m
             .tasks
@@ -734,9 +789,9 @@ fn map_module(m: &api::ModuleDto, f: &api::FeatureDto) -> Module {
                 added: t.origin == "discovered",
             })
             .collect(),
-        handoffs: module_events
+        history: module_events
             .iter()
-            .map(|e| Handoff {
+            .map(|e| ModuleEvent {
                 title: e.title.clone(),
                 body: e.body.clone(),
                 at: e.time.clone(),
@@ -744,18 +799,6 @@ fn map_module(m: &api::ModuleDto, f: &api::FeatureDto) -> Module {
                     "server.gate".to_string()
                 } else {
                     e.agent.clone().unwrap_or_default()
-                },
-            })
-            .collect(),
-        trace: module_events
-            .iter()
-            .map(|e| TraceCall {
-                at: e.time.clone(),
-                tool: e.kind.clone(),
-                result: if e.kind == "premature_claim" {
-                    "denied".to_string()
-                } else {
-                    "ok".to_string()
                 },
             })
             .collect(),

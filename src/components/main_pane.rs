@@ -1,8 +1,7 @@
 //! Main pane: the want pool, the all-features screen, the knowledge
 //! base, or one feature — header (title, stats, tabs) and the active
-//! view. Rebuilt via one
-//! coarse `switch` whenever the pane, selection, view tab, tree toggles,
-//! or drawer target change, which keeps every view a plain function of
+//! view. Rebuilt via one coarse `switch` whenever the pane, selection
+//! or view tab change, which keeps every view a plain function of
 //! state.
 
 use std::rc::Rc;
@@ -16,13 +15,12 @@ use runtime_core::{
 };
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
-use crate::components::board::BoardView;
+use crate::components::document::DocumentView;
 use crate::components::feature_list::FeaturesView;
 use crate::components::feed::FeedView;
 use crate::components::graph::GraphView;
 use crate::components::knowledge::KnowledgeView;
 use crate::components::overview::OverviewView;
-use crate::components::tree::TreeView;
 use crate::components::wants::WantsView;
 use crate::model::features;
 use crate::state::Console;
@@ -62,16 +60,10 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             // which threw away the very node the selection highlight
             // wanted to animate. Every surface that draws a selection
             // now reads `Console::selected` itself.
-            (
-                pane,
-                console.feature.get(),
-                console.view.get(),
-                console.toggled.get(),
-                rev,
-            )
+            (pane, console.feature.get(), console.view.get(), rev)
         },
-        move |state: &(String, usize, String, Vec<String>, u64)| {
-            let (pane, fi, active_view, toggled, _rev) = state.clone();
+        move |state: &(String, usize, String, u64)| {
+            let (pane, fi, active_view, _rev) = state.clone();
             if pane == "overview" {
                 return ui! { OverviewView(console = console) };
             }
@@ -87,7 +79,7 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             if features().get(fi).is_none() {
                 return empty_pane();
             }
-            pane_body(console, fi, active_view, toggled)
+            pane_body(console, fi, active_view)
         },
     )
 }
@@ -114,25 +106,49 @@ fn empty_pane() -> Element {
     }
 }
 
-fn pane_body(
-    console: Console,
-    fi: usize,
-    active_view: String,
-    toggled: Vec<String>,
-) -> Element {
+fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
     let feats = features();
     let f = &feats[fi];
     let sources = f.sources.len();
     let has_sources = sources > 0;
-    let is_board = active_view == "board";
-    let is_tree = active_view == "tree";
-    let is_feed = active_view == "feed";
+    let description = f.description.trim().to_string();
+    let has_description = !description.is_empty();
+    let (paper_present, paper_body, paper_meta) = match &f.whitepaper {
+        Some(d) => (true, d.body.clone(), d.meta()),
+        None => (false, String::new(), String::new()),
+    };
     let is_graph = active_view == "graph";
+    let is_paper = active_view == "whitepaper";
+    let is_feed = active_view == "feed";
     let is_origin = active_view == "origin";
 
     ui! {
         view(style = PaneBox()) {
             FeatureHead(console = console, feature = fi)
+            if is_graph {
+                GraphView(console = console, feature = fi)
+            }
+            if is_paper {
+                scroll_view(style = PaneScroll()) {
+                    view(style = PanePad()) {
+                        view(style = PaperCol()) {
+                            if has_description {
+                                Typography(content = description, kind = typography_kind::Body, muted = true)
+                            }
+                            DocumentView(
+                                console = console,
+                                present = paper_present,
+                                body = paper_body,
+                                meta = paper_meta,
+                                empty = "No whitepaper written.",
+                            )
+                        }
+                    }
+                }
+            }
+            if is_feed {
+                FeedView(feature = fi)
+            }
             if is_origin {
                 scroll_view(style = PaneScroll()) {
                     view(style = PanePad()) {
@@ -152,22 +168,6 @@ fn pane_body(
                         }
                     }
                 }
-            }
-            if is_board {
-                BoardView(console = console, feature = fi)
-            }
-            if is_tree {
-                scroll_view(style = PaneScroll()) {
-                    view(style = PanePad()) {
-                        TreeView(console = console, feature = fi, toggled = toggled.clone())
-                    }
-                }
-            }
-            if is_feed {
-                FeedView(feature = fi)
-            }
-            if is_graph {
-                GraphView(console = console, feature = fi)
             }
         }
     }
@@ -238,25 +238,18 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
     let name = f.name.clone();
     let status = f.status;
     let agent = f.agent.to_string();
-    let (stages_done, stages_total) = f.stage_count();
-    let (mods_done, mods_total) = f.module_count();
     let (_tasks_done, _tasks_total, tasks_added) = f.task_count();
     let elapsed = f.elapsed.to_string();
-    let pct = f.pct_label();
-    let mut meta = format!(
-        "{stages_done}/{stages_total} stages \u{b7} {mods_done}/{mods_total} modules \u{b7} \
-         {pct} of tasks",
-    );
+    let mut meta = f.meta_line();
     if tasks_added > 0 {
         meta.push_str(&format!(" \u{b7} {tasks_added} agent-added"));
     }
     meta.push_str(&format!(" \u{b7} {elapsed}"));
 
     let tabs = signal(vec![
-        Tab::new("board", "Stage pipeline"),
-        Tab::new("tree", "Hierarchy"),
+        Tab::new("graph", "Graph"),
+        Tab::new("whitepaper", "Whitepaper"),
         Tab::new("feed", "Activity"),
-        Tab::new("graph", "Dependencies"),
         Tab::new("origin", "Composed from"),
     ]);
     let on_change: Rc<dyn Fn(String)> = Rc::new(move |id| console.view.set(id));
@@ -787,6 +780,18 @@ stylesheet! {
     pub PanePad<IdeaThemeRef> {
         base(t) {
             padding: t.spacing.xl(),
+        }
+    }
+}
+
+// A reading column: prose wider than this stops being read.
+stylesheet! {
+    pub PaperCol<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Column,
+            gap: t.spacing.lg(),
+            max_width: 760,
+            min_width: 0,
         }
     }
 }
