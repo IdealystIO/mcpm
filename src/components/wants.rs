@@ -21,13 +21,13 @@ use runtime_core::{
 
 use crate::components::bits::{Pager, StatusDot};
 use crate::components::composer::Composer;
-use crate::model::{filter_wants, want_counts, wants, WantState};
+use crate::model::{want_counts, want_total, wants, WantState};
 use crate::state::Console;
 use crate::styles::SectionLabel;
 
 /// Rows per page. Rule 5 of UX_GUIDELINES: data tables page, they do
 /// not render unbounded.
-const PAGE_SIZE: usize = 20;
+const PAGE_SIZE: usize = crate::app::POOL_PAGE;
 
 /// Props for [`WantsView`].
 #[derive(Default, IdealystSchema)]
@@ -71,16 +71,18 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
             )
         },
         move |state: &(u64, String, String, Vec<String>, usize)| {
-            let (_rev, query, status, tags, page) = state.clone();
-            let matched = filter_wants(&query, &status, &tags);
-            let total = matched.len();
+            let (_rev, _query, _status, _tags, page) = state.clone();
+            // The page on screen is whatever the server sent for these
+            // filters — paged there, against the text index, because
+            // the pool grows without bound (see `api::search_wants`).
+            let total = want_total();
             let pages = total.div_ceil(PAGE_SIZE).max(1);
-            // A filter change resets the page, but a poll can shrink the
-            // result set under a page that is already showing.
+            // A filter change resets the page, but a tick can shrink
+            // the result set under a page that is already showing.
             let page = page.min(pages - 1);
             let start = page * PAGE_SIZE;
-            let visible: Vec<usize> = matched.iter().skip(start).take(PAGE_SIZE).copied().collect();
-            let shown = visible.len();
+            let shown = wants().len();
+            let visible: Vec<usize> = (0..shown).collect();
             let empty = shown == 0;
             let summary = if total == 0 {
                 "No wants match".to_string()

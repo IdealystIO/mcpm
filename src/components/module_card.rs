@@ -70,6 +70,8 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     };
     let dim = matches!(status, Status::Blocked | Status::Queued);
     let selection = console.selected;
+    let id = m.id.clone();
+    let press_id = id.clone();
 
     let inner: Element = ui! {
         view(style = ModuleInner()) {
@@ -104,9 +106,9 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     // `Console::selected`, and reading it here means the highlight
     // lands on this one node instead of rebuilding the graph around it
     // — which is what lets the border transition play at all.
-    pressable(vec![inner], move || console.open_module(mi))
+    pressable(vec![inner], move || console.open_module(&press_id))
         .with_style(move || {
-            let accent = if selection.get() == Some(mi) {
+            let accent = if selection.get().as_deref() == Some(id.as_str()) {
                 "selected"
             } else {
                 match status {

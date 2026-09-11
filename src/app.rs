@@ -14,6 +14,10 @@ use crate::components::header::Header;
 use crate::components::knowledge::KnowledgeDrawer;
 use crate::components::main_pane::MainPane;
 use crate::components::sidebar::Sidebar;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use crate::model;
 use crate::state::{use_console_live, Console};
 
@@ -32,11 +36,18 @@ const API_ORIGIN: &str = match option_env!("MCPM_API_ORIGIN") {
     Some(origin) => origin,
     None => "http://127.0.0.1:3210",
 };
-/// Snapshot poll cadence — the FALLBACK, not the primary path. Every
-/// committed event arrives over `watch_events` within a frame or two;
-/// this is what keeps the console correct if that socket is down (the
-/// host restarted, a proxy dropped the upgrade, LISTEN failed).
+/// Poll cadence — the FALLBACK, not the primary path. Every committed
+/// event arrives over `watch_events` within a frame or two; this is
+/// what keeps the console correct if that socket is down (the host
+/// restarted, a proxy dropped the upgrade, LISTEN failed). A poll
+/// refreshes everything on screen, as if a tick had named all of it.
 const POLL_MICROS: u64 = 30_000_000;
+/// How many ledger entries one page of a feature's activity feed holds.
+const FEED_PAGE: i64 = 50;
+/// How many wants one page of the pool holds. The server's
+/// `search_wants` pages by the same number; the wants screen's pager
+/// reads it from here.
+pub const POOL_PAGE: usize = 20;
 
 // Drawer motion. The backdrop fades over the whole overlay; the panel
 // itself slides (see `drawer::panel_motion`). Out is quicker than in —
@@ -82,14 +93,19 @@ pub fn app() -> Element {
     // down on the same frame, leaving no window for an exit. The inner
     // `switch` is keyed on the STICKY target so the panel keeps drawing
     // itself while it slides away.
+    // The module is held by id and resolved to its index in the
+    // feature's graph here, on every rebuild: the graph may not have
+    // loaded yet when the drawer is asked for (the home screen's
+    // attention list opens into any feature), and it arrives a rev
+    // later.
     let drawer_host = presence(move || {
         switch(
             move || (console.feature.get(), console.last_module.get(), console.rev.get()),
-            move |&(fi, sel, _rev): &(usize, Option<usize>, u64)| match sel {
-                Some(mi) if drawer_target_exists(fi, mi) => ui! {
-                    Drawer(console = console, feature = fi, module = mi)
-                },
-                _ => ui! { view {} },
+            move |(fi, sel, _rev): &(usize, Option<String>, u64)| {
+                match sel.as_deref().and_then(|id| drawer_target(*fi, id)) {
+                    Some(mi) => ui! { Drawer(console = console, feature = *fi, module = mi) },
+                    None => ui! { view {} },
+                }
             },
         )
     })
@@ -99,17 +115,18 @@ pub fn app() -> Element {
     .into_element();
 
     // The want drawer shares the module drawer's slot; `Console` keeps
-    // at most one of the two targets set. Keyed on the want **id**,
-    // resolved to an index here, because a poll can re-sort the pool
-    // under an index.
+    // at most one of the two targets set. Keyed on the want **id**:
+    // the pool is paged and re-sorted under the reader, and an origin
+    // row can open an idea no loaded page holds — the sync loop
+    // fetches it by id and the panel reads it back the same way.
     let want_host = presence(move || {
         switch(
             move || (console.last_want.get(), console.rev.get()),
-            move |(id, _rev): &(Option<String>, u64)| {
-                match id.as_deref().and_then(model::want_index) {
-                    Some(wi) => ui! { WantDrawer(console = console, want = wi) },
-                    None => ui! { view {} },
-                }
+            move |(id, _rev): &(Option<String>, u64)| match id {
+                Some(id) if model::want_by_id(id).is_some() => ui! {
+                    WantDrawer(console = console, want = id.clone())
+                },
+                _ => ui! { view {} },
             },
         )
     })
@@ -184,23 +201,63 @@ pub fn app() -> Element {
     }
 }
 
-fn drawer_target_exists(fi: usize, mi: usize) -> bool {
-    model::features()
-        .get(fi)
-        .map(|f| mi < f.modules.len())
-        .unwrap_or(false)
+fn drawer_target(fi: usize, module_id: &str) -> Option<usize> {
+    model::features().get(fi)?.module_index(module_id)
 }
 
-/// Configure the RPC origin, open the event subscription, and drive the
-/// snapshot fetch from a raf clock (scope-anchored, so both die with
-/// the scope that called this).
+/// Which reads the screen needs loaded right now. Computed every frame
+/// from `Console`, so a fetch is exactly the consequence of something
+/// being on screen — no view spawns one of its own.
+#[derive(Clone, PartialEq, Eq, Default)]
+struct Wanted {
+    /// The selected feature's graph, when the feature pane is showing.
+    feature: Option<String>,
+    /// The open module's drawer contents.
+    module: Option<String>,
+    /// The selected feature's feed, when its activity tab is showing.
+    feed: Option<String>,
+    /// The pool page the wants screen is showing.
+    pool: Option<PoolKey>,
+    /// The idea whose drawer is open.
+    want: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Default)]
+struct PoolKey {
+    query: String,
+    status: String,
+    tags: Vec<String>,
+    page: usize,
+}
+
+/// One read that is on its way, and when it left. A fetch answers (or
+/// fails) well within a poll window; one older than that is treated as
+/// dropped so a lost callback cannot wedge its slot forever.
+type InFlight = Rc<RefCell<HashMap<String, u64>>>;
+
+/// Configure the RPC origin, open the event subscription, and drive
+/// every fetch from a raf clock (scope-anchored, so both die with the
+/// scope that called this).
 ///
-/// The socket carries only "an event committed, at seq N" — the console
-/// then refetches the snapshot it already knows how to apply, rather
-/// than folding individual events into the tree. That keeps
-/// `apply_snapshot` the single place the model is written, and costs
-/// one ~16KB fetch per change instead of one every three seconds
-/// forever.
+/// This is the console's one scheduler. Each frame it works out what
+/// the screen needs ([`Wanted`]), what the model already holds, and
+/// what a tick has made stale — and issues the difference:
+///
+/// - the **board** is fetched on every tick, poll, or local write. It
+///   is a row of counts per feature and never grows past that.
+/// - the **selected feature** is fetched when the selection changes,
+///   and refetched only for a tick that names it: an event on another
+///   feature moves its counts on the board and leaves the open tree
+///   alone. The open module's drawer and the visible feed follow the
+///   same rule.
+/// - a **pool page** is fetched when its filters or page change, and
+///   refetched for a tick on a want or a tag.
+/// - the **open want** is fetched by id when the drawer opens.
+///
+/// A tick's `feature_id` and `kind` are what make the split possible;
+/// a tick without them (a database whose trigger predates migration
+/// 0013) is treated as touching everything, which is what every tick
+/// did before.
 ///
 /// `key` is empty against an open loopback host, which sends no
 /// `Authorization` at all — the gate on that host does not ask for one,
@@ -217,27 +274,64 @@ fn start_sync(console: Console, key: String) {
     // header on a WebSocket handshake — see `api::watch_events`.
     let events = api::watch_events(key);
     // `None` means "fetch on the next frame"; `Some(t)` is when the
-    // last attempt started. Deliberately not `0`: on web `now_micros`
+    // last poll started. Deliberately not `0`: on web `now_micros`
     // counts from page load, so for the first POLL_MICROS after load
     // `now - 0` is still inside the window — a zero sentinel would gate
-    // off the very first snapshot, and any event tick or local capture
+    // off the very first fetch, and any event tick or local capture
     // that lands while the page is young, until the window elapsed.
-    let mut last_fetch: Option<u64> = None;
-    let mut in_flight = false;
+    let mut last_poll: Option<u64> = None;
     let mut seen_nudge: u64 = 0;
     let mut seen_seq: i64 = 0;
+    let mut last_wanted = Wanted::default();
+    // What a tick (or the poll) has invalidated since it was last read.
+    let mut stale_board = true;
+    let mut stale_feature = true;
+    let mut stale_pool = true;
+    let mut stale_want = true;
+    let in_flight: InFlight = Rc::new(RefCell::new(HashMap::new()));
+
     raf_loop_scoped(move || {
         let now = runtime_core::time::now_micros();
         // Report the real connection, not "a snapshot landed once".
         console.connected.set(matches!(events.status(), server::SocketStatus::Open));
+
+        // --- What is on screen ------------------------------------
+        let pane = console.pane.get();
+        let fi = console.feature.get();
+        let feature_id = model::feature_id_at(fi);
+        let on_feature = pane == "feature" && feature_id.is_some();
+        let wanted = Wanted {
+            feature: on_feature.then(|| feature_id.clone()).flatten(),
+            module: on_feature.then(|| console.selected.get()).flatten(),
+            feed: (on_feature && console.view.get() == "feed")
+                .then(|| feature_id.clone())
+                .flatten(),
+            pool: (pane == "wants").then(|| PoolKey {
+                query: console.pool_query.get(),
+                status: console.pool_status.get(),
+                tags: console.pool_tags.get(),
+                page: console.pool_page.get(),
+            }),
+            want: console.want.get(),
+        };
+
+        // --- What has changed under us ----------------------------
         // An event committed anywhere — an agent's write as much as our
         // own. Seq-keyed, so a replayed notification is not a second
         // fetch.
         if let Some(tick) = events.latest() {
             if tick.seq > seen_seq {
                 seen_seq = tick.seq;
-                last_fetch = None;
-                in_flight = false;
+                stale_board = true;
+                // No kind means an old trigger: assume the worst.
+                let untyped = tick.kind.is_empty();
+                if untyped || tick.feature_id == feature_id {
+                    stale_feature = true;
+                }
+                if untyped || tick.kind.starts_with("want") || tick.kind.starts_with("tag") {
+                    stale_pool = true;
+                    stale_want = true;
+                }
             }
         }
         // A local write (the capture composer) bumps `refresh` so its
@@ -245,57 +339,232 @@ fn start_sync(console: Console, key: String) {
         let nudge = console.refresh.get();
         if nudge != seen_nudge {
             seen_nudge = nudge;
-            last_fetch = None;
-            in_flight = false;
+            stale_board = true;
+            stale_pool = true;
         }
-        let due = last_fetch.is_none_or(|t| now.saturating_sub(t) >= POLL_MICROS);
-        if in_flight || !due {
-            // A fetch answers (or fails) well within a poll window;
-            // reset the in-flight latch once the window passes so a
-            // dropped callback can't wedge the loop.
-            if due {
-                in_flight = false;
+        // The fallback poll refreshes everything, as a tick naming all
+        // of it would.
+        if last_poll.is_none_or(|t| now.saturating_sub(t) >= POLL_MICROS) {
+            last_poll = Some(now);
+            stale_board = true;
+            stale_feature = true;
+            stale_pool = true;
+            stale_want = true;
+        }
+        // A selection change is stale by definition: the new target
+        // may be cached, but it has not been refreshed since it was
+        // last looked at.
+        if wanted.feature != last_wanted.feature {
+            stale_feature = true;
+        }
+        if wanted.pool != last_wanted.pool {
+            stale_pool = true;
+        }
+        if wanted.want != last_wanted.want {
+            stale_want = true;
+        }
+        // The feed's "load older" is a one-shot request, not a state.
+        let older = console.feed_older.get();
+        if older.is_some() {
+            console.feed_older.set(None);
+        }
+        last_wanted = wanted.clone();
+
+        // --- Issue what is due ------------------------------------
+        let started = |slot: &str| -> bool { claim(&in_flight, now, slot) };
+        let done = |slot: String| {
+            let pending = in_flight.clone();
+            move || {
+                pending.borrow_mut().remove(&slot);
             }
-            return;
-        }
-        last_fetch = Some(now);
-        in_flight = true;
-        spawn_then(api::load_snapshot(), move |result| {
-            match result {
-                Ok(snapshot) => {
-                    // A fetch that lands is proof the key (or the lack
-                    // of one) is accepted, so the gate clears itself
-                    // rather than waiting to be dismissed.
-                    console.denied.set(false);
-                    // Only the FIRST snapshot moves the selection. A
-                    // later poll must not steal the feature the reader
-                    // is on because a newer one arrived.
-                    let first_load = !model::loaded();
-                    if model::apply_snapshot(snapshot) {
-                        if first_load {
-                            if let Some(open) = model::first_open_feature() {
-                                console.feature.set(open);
+        };
+        let bump = move |changed: bool| {
+            if changed {
+                console.rev.update(|r| r + 1);
+            }
+        };
+
+        if stale_board && started("board") {
+            stale_board = false;
+            let release = done("board".into());
+            spawn_then(api::load_board(), move |result| {
+                release();
+                match result {
+                    Ok(board) => {
+                        // A fetch that lands is proof the key (or the
+                        // lack of one) is accepted, so the gate clears
+                        // itself rather than waiting to be dismissed.
+                        console.denied.set(false);
+                        // Only the FIRST board moves the selection. A
+                        // later one must not steal the feature the
+                        // reader is on because a newer one arrived.
+                        let first_load = !model::loaded();
+                        if model::apply_board(board) {
+                            if first_load {
+                                if let Some(open) = model::first_open_feature() {
+                                    console.feature.set(open);
+                                }
                             }
+                            bump(true);
                         }
+                    }
+                    // A refusal is a condition the reader can act on —
+                    // it ends when they paste a working key — so it
+                    // reaches the screen. Every other failure is
+                    // transient and the next poll retries it, so it
+                    // stays a log line: the screen already says
+                    // "connecting", and a poll that fails forever with
+                    // no trace anywhere is undiagnosable.
+                    Err(err) => {
+                        if matches!(err, server::ServerError::Server { status: 401, .. }) {
+                            console.denied.set(true);
+                        }
+                        runtime_core::log_warn!("board fetch failed: {err:?}");
+                    }
+                }
+            });
+        }
+
+        if let Some(id) = wanted.feature.clone() {
+            let due = stale_feature || !model::has_detail(&id);
+            if due && started("feature") {
+                stale_feature = false;
+                let release = done("feature".into());
+                // The drawer and the feed refresh with their feature.
+                let module = wanted.module.clone();
+                let feed = wanted.feed.clone();
+                spawn_then(api::load_feature(id.clone()), move |result| {
+                    release();
+                    match result {
+                        Ok(detail) => bump(model::apply_feature(detail)),
+                        Err(err) => runtime_core::log_warn!("feature fetch failed: {err:?}"),
+                    }
+                });
+                if let Some(mid) = module {
+                    fetch_module(console, &in_flight, now, mid);
+                }
+                if let Some(fid) = feed {
+                    fetch_feed(console, &in_flight, now, fid, None);
+                }
+            }
+        }
+        // A drawer or feed opened onto something already fresh.
+        if let Some(mid) = wanted.module.clone() {
+            if model::module_detail(&mid).is_none() {
+                fetch_module(console, &in_flight, now, mid);
+            }
+        }
+        if let Some(fid) = wanted.feed.clone() {
+            if model::feed(&fid).is_none() {
+                fetch_feed(console, &in_flight, now, fid, None);
+            }
+        }
+        if let Some(fid) = older {
+            let cursor = model::feed(&fid).and_then(|f| f.oldest());
+            if cursor.is_some() {
+                fetch_feed(console, &in_flight, now, fid, cursor);
+            }
+        }
+
+        if let Some(key) = wanted.pool.clone() {
+            if stale_pool && started("pool") {
+                stale_pool = false;
+                let release = done("pool".into());
+                let asked = key.page;
+                spawn_then(
+                    api::search_wants(key.query, key.status, key.tags, key.page as i64),
+                    move |result| {
+                        release();
+                        match result {
+                            Ok(page) => {
+                                // A tick can shrink the pool under the
+                                // page the reader is on. Step back to
+                                // the last page that exists — a signal
+                                // change, so the loop refetches it.
+                                let last = (page.total.max(0) as usize).div_ceil(POOL_PAGE).max(1) - 1;
+                                if asked > last {
+                                    console.set_pool_page(last);
+                                }
+                                bump(model::set_want_page(page));
+                            }
+                            Err(err) => runtime_core::log_warn!("pool fetch failed: {err:?}"),
+                        }
+                    },
+                );
+            }
+        }
+
+        if let Some(id) = wanted.want.clone() {
+            if stale_want && started("want") {
+                stale_want = false;
+                let release = done("want".into());
+                spawn_then(api::load_want(id), move |result| {
+                    release();
+                    match result {
+                        Ok(want) => bump(model::set_open_want(want)),
+                        Err(err) => runtime_core::log_warn!("want fetch failed: {err:?}"),
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// Fetch one module's drawer contents, unless that read is already on
+/// its way.
+fn fetch_module(console: Console, in_flight: &InFlight, now: u64, module_id: String) {
+    let slot = format!("module:{module_id}");
+    if !claim(in_flight, now, &slot) {
+        return;
+    }
+    let pending = in_flight.clone();
+    spawn_then(api::load_module(module_id), move |result| {
+        pending.borrow_mut().remove(&slot);
+        match result {
+            Ok(detail) => {
+                if model::apply_module(detail) {
+                    console.rev.update(|r| r + 1);
+                }
+            }
+            Err(err) => runtime_core::log_warn!("module fetch failed: {err:?}"),
+        }
+    });
+}
+
+/// Fetch one page of a feature's feed: the newest page when `before`
+/// is `None`, the page older than that seq otherwise.
+fn fetch_feed(console: Console, in_flight: &InFlight, now: u64, feature_id: String, before: Option<i64>) {
+    let slot = format!("feed:{feature_id}:{}", before.unwrap_or(0));
+    if !claim(in_flight, now, &slot) {
+        return;
+    }
+    let pending = in_flight.clone();
+    spawn_then(
+        api::load_events(feature_id, before.unwrap_or(0), FEED_PAGE),
+        move |result| {
+            pending.borrow_mut().remove(&slot);
+            match result {
+                Ok(page) => {
+                    if model::apply_events(page) {
                         console.rev.update(|r| r + 1);
                     }
                 }
-                // A refusal is a condition the reader can act on — it
-                // ends when they paste a working key — so it reaches the
-                // screen. Every other failure is transient and the next
-                // poll retries it, so it stays a log line: the screen
-                // already says "connecting", and a poll that fails
-                // forever with no trace anywhere is undiagnosable.
-                Err(err) => {
-                    if matches!(err, server::ServerError::Server { status: 401, .. }) {
-                        console.denied.set(true);
-                    }
-                    runtime_core::log_warn!("snapshot poll failed: {err:?}");
-                }
+                Err(err) => runtime_core::log_warn!("feed fetch failed: {err:?}"),
             }
-        });
-        in_flight = false;
-    });
+        },
+    );
+}
+
+/// Take a fetch slot, unless a fresh read already holds it.
+fn claim(in_flight: &InFlight, now: u64, slot: &str) -> bool {
+    let mut pending = in_flight.borrow_mut();
+    match pending.get(slot) {
+        Some(&t) if now.saturating_sub(t) < POLL_MICROS => false,
+        _ => {
+            pending.insert(slot.to_string(), now);
+            true
+        }
+    }
 }
 
 // The two sheets below restore what `BodyRow` used to supply before

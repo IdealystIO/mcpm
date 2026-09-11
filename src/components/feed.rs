@@ -1,45 +1,69 @@
 //! Live feed view: the feature's event ledger as a timeline, with the
 //! agent roster alongside.
 
-use idea_ui::{typography_kind, Badge, IdeaThemeRef, Spacer, Stack, StackAlign, StackAxis,
-    StackGap, Typography};
+use std::rc::Rc;
+
+use idea_ui::{size, typography_kind, variant, Badge, Button, IdeaThemeRef, Spacer, Stack,
+    StackAlign, StackAxis, StackGap, Typography};
 use runtime_core::{
     component, stylesheet, ui, AlignItems, Element, FlexDirection, FlexWrap, FontWeight,
     IdealystSchema,
 };
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
-use crate::model::features;
+use crate::model::{feed, features};
+use crate::state::Console;
 use crate::styles::{MonoTextSize, SectionLabel};
 
 /// Props for [`FeedView`].
 #[derive(Default, IdealystSchema)]
 pub struct FeedViewProps {
+    /// Console state handles.
+    pub console: Console,
     /// Feature index.
     pub feature: usize,
 }
 
 /// The live-feed view for one feature (roster is the project-wide
 /// agent registry).
+///
+/// The ledger is paged: the newest page arrives when the tab opens
+/// and refreshes on a tick, and the control at the bottom reads the
+/// next older page. A feed is the one part of a feature that grows
+/// without bound, so nothing here ever asks for all of it.
 #[component]
 pub fn FeedView(props: &FeedViewProps) -> Element {
+    let console = props.console;
     let fi = props.feature;
     let feats = features();
-    let event_count = feats[fi].events.len();
+    let feature_id = feats[fi].id.clone();
+    let held = feed(&feature_id);
+    let loaded = held.is_some();
+    let event_count = held.as_ref().map(|f| f.events.len()).unwrap_or(0);
+    let has_older = held.as_ref().is_some_and(|f| !f.exhausted && !f.events.is_empty());
+    let blank = if loaded { "No events yet for this feature." } else { "Loading the ledger\u{2026}" };
     let roster_count = crate::model::agents().len();
+    let older_id = feature_id.clone();
+    let on_older: Rc<dyn Fn()> = Rc::new(move || console.load_older_events(&older_id));
     ui! {
         scroll_view(style = FeedScroll()) {
             view(style = FeedRow()) {
                 view(style = EventsCol()) {
                     if event_count == 0 {
-                        Typography(
-                            content = "No events yet for this feature.",
-                            kind = typography_kind::BodySm,
-                            muted = true,
-                        )
+                        Typography(content = blank, kind = typography_kind::BodySm, muted = true)
                     }
                     for i in 0..event_count {
-                        EventRow(feature = fi, index = i, last = i + 1 == event_count)
+                        EventRow(feature = feature_id.clone(), index = i, last = i + 1 == event_count)
+                    }
+                    if has_older {
+                        view(style = OlderRow()) {
+                            Button(
+                                label = "Load older",
+                                on_click = on_older.clone(),
+                                size = size::Sm,
+                                variant = variant::Ghost,
+                            )
+                        }
                     }
                 }
                 view(style = RosterCol()) {
@@ -56,8 +80,8 @@ pub fn FeedView(props: &FeedViewProps) -> Element {
 /// Props for [`EventRow`].
 #[derive(Default, IdealystSchema)]
 pub struct EventRowProps {
-    /// Feature index.
-    pub feature: usize,
+    /// The feature whose feed this row is in.
+    pub feature: String,
     /// Event index (newest first).
     pub index: usize,
     /// Whether this is the last row (no trailing rail).
@@ -67,8 +91,12 @@ pub struct EventRowProps {
 /// One event ledger entry.
 #[component]
 pub fn EventRow(props: &EventRowProps) -> Element {
-    let feats = features();
-    let e = &feats[props.feature].events[props.index];
+    let Some(held) = feed(&props.feature) else {
+        return ui! { view {} };
+    };
+    let Some(e) = held.events.get(props.index) else {
+        return ui! { view {} };
+    };
     let time = e.time.to_string();
     let kind = e.kind.to_string();
     let status = e.status;
@@ -178,6 +206,16 @@ stylesheet! {
             flex_grow: 1.0,
             min_width: 420,
             flex_direction: FlexDirection::Column,
+        }
+    }
+}
+
+stylesheet! {
+    pub OlderRow<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            padding_top: t.spacing.md(),
+            padding_left: 88,
         }
     }
 }

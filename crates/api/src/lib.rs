@@ -1,10 +1,27 @@
 //! Wire types + server functions for the Control Center console.
 //!
-//! The console (wasm) calls [`load_snapshot`] and renders whatever the
-//! store holds — nothing is hardcoded client-side. The server body
-//! (feature `server`) reads through `mcpm_core::Store`, the same
-//! gatekeeper the MCP tools use, and pre-formats event titles/bodies so
-//! the UI stays a dumb renderer.
+//! The console (wasm) reads in tiers and renders whatever the store
+//! holds — nothing is hardcoded client-side:
+//!
+//! - [`load_board`] is the one global read: a rollup row per feature,
+//!   the attention list, the newest few events, the roster, the tag
+//!   registry and the pool's counts. Scalars per feature, so it stays
+//!   small however old the project gets. Refetched on every tick.
+//! - [`load_feature`] is one feature's tree and whitepaper — fetched
+//!   when it is selected, refetched when a tick names that feature.
+//! - [`load_module`] is one module's handoff and history, for its
+//!   drawer; [`load_events`] is one page of a ledger, newest first;
+//!   [`search_wants`] is one page of the pool; [`load_want`] one idea.
+//!
+//! The earlier design shipped the whole project — every feature's
+//! tree, every document body, five hundred events per feature — on
+//! every event, and it grew without bound. What a view needs is now
+//! what that view's read returns, and a [`Tick`] says which feature an
+//! event touched so the client refetches the tree only when it has to.
+//!
+//! The server body (feature `server`) reads through `mcpm_core::Store`,
+//! the same gatekeeper the MCP tools use, and pre-formats event
+//! titles/bodies so the UI stays a dumb renderer.
 
 pub mod capture;
 
@@ -18,15 +35,25 @@ use server::{server, subscription, ServerError};
 // Wire types
 // ---------------------------------------------------------------------
 
+/// The console's global read: everything the home screen, the rail and
+/// the all-features list show, and nothing any single feature's board
+/// needs. One row of counts per feature — never a tree, never a
+/// document body, never a ledger — so its size is the feature count
+/// and not the project's age.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Snapshot {
+pub struct Board {
     pub project: ProjectDto,
-    pub features: Vec<FeatureDto>,
+    /// Every feature, oldest first.
+    pub features: Vec<FeatureRollupDto>,
+    /// What is stuck across the project, worst first.
+    pub attention: Vec<AttentionDto>,
+    /// The newest events project-wide, newest first.
+    pub recent: Vec<EventDto>,
     pub agents: Vec<AgentDto>,
-    /// The whole want pool — loose ideas, in every state.
-    pub wants: Vec<WantDto>,
     /// The tag registry, most-used first.
     pub tags: Vec<TagDto>,
+    /// The pool's shape. The pool itself is paged — see [`search_wants`].
+    pub wants: WantCountsDto,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -35,26 +62,70 @@ pub struct ProjectDto {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FeatureDto {
+/// One feature as the board sees it: identity, state, and counts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FeatureRollupDto {
+    pub id: String,
+    pub name: String,
+    /// planning | in_progress | done | shelved
+    pub status: String,
+    pub created_by: Option<String>,
+    pub modules_done: i64,
+    pub modules_total: i64,
+    /// todo + unclaimed + every prerequisite done.
+    pub modules_ready: i64,
+    pub tasks_done: i64,
+    pub tasks_total: i64,
+    /// Tasks the crew added beyond the plan.
+    pub tasks_added: i64,
+    /// "MMM D HH:MM" of the first and last ledger entry, or empty.
+    pub started: String,
+    pub last_activity: String,
+}
+
+/// One stuck thing on the home screen's attention list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AttentionDto {
+    pub feature_id: String,
+    pub feature_name: String,
+    pub module_id: String,
+    pub module_name: String,
+    /// rejected | blocked
+    pub kind: String,
+    /// Names of the prerequisites still open.
+    pub waiting_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct WantCountsDto {
+    pub open: i64,
+    pub promoted: i64,
+    pub declined: i64,
+}
+
+/// One feature's board: the graph and the plan. Fetched when the
+/// feature is selected; refetched when a [`Tick`] names it.
+///
+/// No ledger and no handoffs: the feed is paged by [`load_events`] and
+/// a module's handoff and history arrive with its drawer
+/// ([`load_module`]). Both are the unbounded parts of a feature.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FeatureDetail {
     pub id: String,
     pub name: String,
     pub description: String,
     /// planning | in_progress | done | shelved
     pub status: String,
-    pub created_by: Option<String>,
     /// Topological order: every module after all of its prerequisites,
     /// ties by depth then name.
     pub modules: Vec<ModuleDto>,
     /// The plan as prose, current revision, when one was written.
     pub whitepaper: Option<DocumentDto>,
-    /// Ascending seq. Pre-formatted for display.
-    pub events: Vec<EventDto>,
     /// The wants this feature was composed from, oldest link first.
     pub sources: Vec<WantSourceDto>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModuleDto {
     pub id: String,
     pub name: String,
@@ -73,9 +144,47 @@ pub struct ModuleDto {
     pub depth: i32,
     /// todo + unclaimed + every prerequisite done.
     pub dispatchable: bool,
+    /// Unclaimed, not done, and a claim on it once bounced off the
+    /// gate. Derived from the ledger server-side so the card needs no
+    /// events to draw itself.
+    pub rejected: bool,
+    /// The latest rejection or blocker on it, pre-formatted, or empty.
+    pub block_title: String,
+    pub block_body: String,
+    /// "MMM D HH:MM" of its first claim, or empty.
+    pub spawned: String,
+    pub tasks: Vec<TaskDto>,
+}
+
+/// What a module's drawer adds to its card: the handoff and the
+/// history. Its own read because both grow with the module's life and
+/// neither is needed until the drawer opens.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModuleDetail {
+    pub id: String,
+    pub feature_id: String,
     /// How to use what this module built, current revision.
     pub handoff: Option<DocumentDto>,
-    pub tasks: Vec<TaskDto>,
+    /// Every ledger entry whose subject is this module, oldest first.
+    pub history: Vec<EventDto>,
+}
+
+/// One page of a ledger, newest first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EventPage {
+    /// The feature the page is of; empty for the project-wide ledger.
+    pub feature_id: String,
+    pub events: Vec<EventDto>,
+    /// Whether an older page exists past the last event here.
+    pub more: bool,
+}
+
+/// One page of the pool, plus what the filters matched in total so the
+/// pager can say "1–20 of 142" without a second round trip.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WantPage {
+    pub wants: Vec<WantDto>,
+    pub total: i64,
 }
 
 /// One current document revision: a feature's whitepaper or a
@@ -93,7 +202,7 @@ pub struct DocumentDto {
     pub written: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TaskDto {
     pub id: String,
     pub name: String,
@@ -104,7 +213,7 @@ pub struct TaskDto {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct EventDto {
     pub seq: i64,
     /// "HH:MM"
@@ -112,13 +221,14 @@ pub struct EventDto {
     /// The raw event type (module_claimed, premature_claim, …).
     pub kind: String,
     pub agent: Option<String>,
+    pub feature_id: Option<String>,
     pub subject_id: Option<String>,
     pub title: String,
     pub body: String,
 }
 
 /// One idea in the pool.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct WantDto {
     pub id: String,
     pub body: String,
@@ -248,17 +358,24 @@ pub struct AgentDto {
     pub claim_names: String,
 }
 
-/// One committed event, announced. The console does not read anything
-/// out of this beyond "something landed, and here is how far the ledger
-/// has got" — it refetches the snapshot it already knows how to apply.
+/// One committed event, announced. The console renders nothing out of
+/// it — it refetches the reads it already knows how to apply — but it
+/// reads `feature_id` and `kind` to decide WHICH: an event on another
+/// feature refreshes the board's counts and leaves the open tree alone.
 ///
 /// Carrying `seq` rather than an empty ping is what makes the client
 /// idempotent: two notifications for the same seq (a reconnect
 /// replaying, say) collapse into one refetch.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Tick {
     /// The `events.seq` of the row that fired the trigger.
     pub seq: i64,
+    /// The raw event type. Empty from a database whose trigger predates
+    /// migration 0013 — the client then treats every tick as touching
+    /// everything, which is what it did before.
+    pub kind: String,
+    pub feature_id: Option<String>,
+    pub subject_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -344,8 +461,15 @@ pub async fn watch_events(
     // A listener that cannot be opened yields an empty stream: the
     // console keeps its slow fallback poll, which is exactly the
     // degraded mode this is a fast path over.
-    let seqs = store.watch_events().await;
-    async_stream_compat(seqs).map(|seq| Tick { seq }).right_stream()
+    let notices = store.watch_events().await;
+    async_stream_compat(notices)
+        .map(|n| Tick {
+            seq: n.seq,
+            kind: n.kind,
+            feature_id: n.feature_id,
+            subject_id: n.subject_id,
+        })
+        .right_stream()
 }
 
 /// Whether this socket may open. Mirrors `mcpm-web`'s gate: with auth
@@ -402,10 +526,13 @@ pub fn binds_loopback() -> bool {
 /// logged here rather than crashing the socket handler.
 #[cfg(feature = "server")]
 fn async_stream_compat(
-    seqs: std::result::Result<impl futures_core::Stream<Item = i64>, mcpm_core::McpmError>,
-) -> impl futures_core::Stream<Item = i64> {
+    notices: std::result::Result<
+        impl futures_core::Stream<Item = mcpm_core::EventNotice>,
+        mcpm_core::McpmError,
+    >,
+) -> impl futures_core::Stream<Item = mcpm_core::EventNotice> {
     use futures_util::StreamExt as _;
-    match seqs {
+    match notices {
         Ok(stream) => stream.left_stream(),
         Err(err) => {
             eprintln!("mcpm-web: event listener unavailable, console will poll: {err}");
@@ -414,94 +541,55 @@ fn async_stream_compat(
     }
 }
 
-/// The console's one read: the whole board, presentation-ready.
+/// The console's global read. See [`Board`].
 #[server]
-pub async fn load_snapshot() -> Result<Snapshot, ServerError> {
+pub async fn load_board() -> Result<Board, ServerError> {
     let store = server::use_state::<mcpm_core::Store>()
         .ok_or_else(|| ServerError::failed("Store not installed"))?;
-    let raw = store
-        .snapshot()
-        .await
-        .map_err(|e| ServerError::failed(e.to_string()))?;
+    let raw = store.snapshot().await.map_err(fail)?;
     let project = ProjectDto {
         name: raw["project"]["name"].as_str().unwrap_or("control-center").to_string(),
         description: raw["project"]["description"].as_str().unwrap_or("").to_string(),
     };
-
-    let mut features = Vec::new();
-    for rollup in store.rollups().await.map_err(fail)? {
-        let tree = store.feature_tree(&rollup.id).await.map_err(fail)?;
-        let events = store
-            .get_events(Some(&rollup.id), 0, 500)
-            .await
-            .map_err(fail)?;
-        // Every current document of the feature in one read; the
-        // handoffs are matched to their modules below.
-        let documents = store.feature_documents(&rollup.id).await.map_err(fail)?;
-        let handoff_of = |module_id: &str| -> Option<DocumentDto> {
-            documents
-                .iter()
-                .find(|d| {
-                    d.kind == mcpm_core::DocumentKind::Handoff && d.subject_id == module_id
-                })
-                .map(document_dto)
-        };
-        features.push(FeatureDto {
-            id: tree.id,
-            name: tree.name,
-            description: tree.description,
-            status: tree.status,
-            created_by: feature_creator(&store, &rollup.id).await,
-            whitepaper: tree.whitepaper.as_ref().map(document_dto),
-            modules: tree
-                .modules
-                .into_iter()
-                .map(|m| ModuleDto {
-                    handoff: handoff_of(&m.id),
-                    id: m.id,
-                    name: m.name,
-                    description: m.description,
-                    status: m.status,
-                    claimed_by: m.claimed_by,
-                    summary: m.summary,
-                    depends_on: m.depends_on,
-                    waiting_on: m.waiting_on,
-                    owns: m.owns,
-                    depth: m.depth,
-                    dispatchable: m.dispatchable,
-                    tasks: m
-                        .tasks
-                        .into_iter()
-                        .map(|t| TaskDto {
-                            id: t.id,
-                            name: t.name,
-                            status: t.status,
-                            origin: t.origin,
-                            note: t.note,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            events: events.iter().map(format_event).collect(),
-            sources: store
-                .wants_of_feature(&rollup.id)
-                .await
-                .map_err(fail)?
-                .into_iter()
-                .map(|w| WantSourceDto {
-                    rationale: w
-                        .features
-                        .iter()
-                        .find(|l| l.feature_id == rollup.id)
-                        .map(|l| l.rationale.clone())
-                        .unwrap_or_default(),
-                    want_id: w.id,
-                    body: w.body,
-                })
-                .collect(),
-        });
-    }
-
+    let stamp = |t: Option<chrono::DateTime<chrono::Utc>>| {
+        t.map(|t| t.format("%b %-d %H:%M").to_string()).unwrap_or_default()
+    };
+    let features = store
+        .rollups()
+        .await
+        .map_err(fail)?
+        .into_iter()
+        .map(|r| FeatureRollupDto {
+            id: r.id,
+            name: r.name,
+            status: r.status,
+            created_by: r.created_by,
+            modules_done: r.modules_done,
+            modules_total: r.modules_total,
+            modules_ready: r.modules_ready,
+            tasks_done: r.tasks_done,
+            tasks_total: r.tasks_total,
+            tasks_added: r.tasks_added,
+            started: stamp(r.started),
+            last_activity: stamp(r.last_activity),
+        })
+        .collect();
+    let attention = store
+        .attention()
+        .await
+        .map_err(fail)?
+        .into_iter()
+        .map(|a| AttentionDto {
+            feature_id: a.feature_id,
+            feature_name: a.feature_name,
+            module_id: a.module_id,
+            module_name: a.module_name,
+            kind: a.kind,
+            waiting_on: a.waiting_on,
+        })
+        .collect();
+    // A dozen: the home screen shows six and a tick usually lands one.
+    let (recent, _) = store.events_page(None, None, 12).await.map_err(fail)?;
     let agents = store
         .agents_overview()
         .await
@@ -514,33 +602,6 @@ pub async fn load_snapshot() -> Result<Snapshot, ServerError> {
             claim_names: a.claim_names,
         })
         .collect();
-
-    let wants = store
-        .list_wants("", mcpm_core::WantFilter::All, &[], 500)
-        .await
-        .map_err(fail)?
-        .wants
-        .into_iter()
-        .map(|w| WantDto {
-            id: w.id,
-            body: w.body,
-            tags: w.tags,
-            status: w.status,
-            note: w.decline_reason.unwrap_or_default(),
-            author: w.author,
-            captured: w.created_at.format("%b %-d %H:%M").to_string(),
-            features: w
-                .features
-                .into_iter()
-                .map(|l| WantLinkDto {
-                    feature_id: l.feature_id,
-                    feature_name: l.feature_name,
-                    rationale: l.rationale,
-                })
-                .collect(),
-        })
-        .collect();
-
     let tags = store
         .list_tags()
         .await
@@ -552,14 +613,225 @@ pub async fn load_snapshot() -> Result<Snapshot, ServerError> {
             uses: t.uses,
         })
         .collect();
+    let counts = store.want_counts().await.map_err(fail)?;
 
-    Ok(Snapshot {
+    Ok(Board {
         project,
         features,
+        attention,
+        recent: recent.iter().map(format_event).collect(),
         agents,
-        wants,
         tags,
+        wants: WantCountsDto {
+            open: counts.open,
+            promoted: counts.promoted,
+            declined: counts.declined,
+        },
     })
+}
+
+/// One feature's board. See [`FeatureDetail`].
+#[server]
+pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let tree = store.feature_tree(&feature_id).await.map_err(fail)?;
+    let milestones = store.module_milestones(&feature_id).await.map_err(fail)?;
+    let sources = store
+        .wants_of_feature(&feature_id)
+        .await
+        .map_err(fail)?
+        .into_iter()
+        .map(|w| WantSourceDto {
+            rationale: w
+                .features
+                .iter()
+                .find(|l| l.feature_id == feature_id)
+                .map(|l| l.rationale.clone())
+                .unwrap_or_default(),
+            want_id: w.id,
+            body: w.body,
+        })
+        .collect();
+
+    let modules = tree
+        .modules
+        .into_iter()
+        .map(|m| {
+            let marks = milestones.iter().find(|x| x.module_id == m.id);
+            let rejected = m.status != "done"
+                && m.claimed_by.is_none()
+                && marks.is_some_and(|x| x.last_rejection.is_some());
+            let (block_title, block_body) = if rejected {
+                (
+                    "Start rejected \u{2014} prerequisites open".to_string(),
+                    marks
+                        .and_then(|x| x.last_rejection.as_ref())
+                        .map(|e| format_event(e).body)
+                        .unwrap_or_default(),
+                )
+            } else if m.status == "blocked" {
+                (
+                    "Blocked \u{2014} waiting on the manager".to_string(),
+                    marks
+                        .and_then(|x| x.last_blocker.as_ref())
+                        .map(|e| format_event(e).body)
+                        .unwrap_or_default(),
+                )
+            } else {
+                (String::new(), String::new())
+            };
+            ModuleDto {
+                spawned: marks
+                    .and_then(|x| x.first_claim)
+                    .map(|t| t.format("%b %-d %H:%M").to_string())
+                    .unwrap_or_default(),
+                rejected,
+                block_title,
+                block_body,
+                id: m.id,
+                name: m.name,
+                description: m.description,
+                status: m.status,
+                claimed_by: m.claimed_by,
+                summary: m.summary,
+                depends_on: m.depends_on,
+                waiting_on: m.waiting_on,
+                owns: m.owns,
+                depth: m.depth,
+                dispatchable: m.dispatchable,
+                tasks: m
+                    .tasks
+                    .into_iter()
+                    .map(|t| TaskDto {
+                        id: t.id,
+                        name: t.name,
+                        status: t.status,
+                        origin: t.origin,
+                        note: t.note,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+
+    Ok(FeatureDetail {
+        id: tree.id,
+        name: tree.name,
+        description: tree.description,
+        status: tree.status,
+        modules,
+        whitepaper: tree.whitepaper.as_ref().map(document_dto),
+        sources,
+    })
+}
+
+/// One module's drawer. See [`ModuleDetail`].
+#[server]
+pub async fn load_module(module_id: String) -> Result<ModuleDetail, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let handoff = store
+        .read_document(mcpm_core::DocumentKind::Handoff, &module_id)
+        .await
+        .map_err(fail)?;
+    let history = store.events_of_subject(&module_id, 200).await.map_err(fail)?;
+    let feature_id = history
+        .iter()
+        .find_map(|e| e.feature_id.clone())
+        .unwrap_or_default();
+    Ok(ModuleDetail {
+        id: module_id,
+        feature_id,
+        handoff: handoff.as_ref().map(document_dto),
+        history: history.iter().map(format_event).collect(),
+    })
+}
+
+/// One page of a ledger, newest first: one feature's when `feature_id`
+/// is set, the project's when it is empty. `before` is the oldest
+/// `seq` the reader already holds (0 for the newest page).
+#[server]
+pub async fn load_events(
+    feature_id: String,
+    before: i64,
+    limit: i64,
+) -> Result<EventPage, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let scope = (!feature_id.is_empty()).then_some(feature_id.as_str());
+    let cursor = (before > 0).then_some(before);
+    let (events, more) = store.events_page(scope, cursor, limit).await.map_err(fail)?;
+    Ok(EventPage {
+        feature_id,
+        events: events.iter().map(format_event).collect(),
+        more,
+    })
+}
+
+/// One page of the pool. `status` is one of all / open / promoted /
+/// declined; every tag in `tags` must be present; `query` is a
+/// full-text search, ranked when non-empty.
+///
+/// Paged server-side for the same reason the knowledge base is: the
+/// pool grows without bound, and the filter that makes it useful runs
+/// against the text index — shipping it whole to filter in the browser
+/// was the second-largest thing the console sent.
+#[server]
+pub async fn search_wants(
+    query: String,
+    status: String,
+    tags: Vec<String>,
+    page: i64,
+) -> Result<WantPage, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    const PER_PAGE: i64 = 20;
+    let filter = match status.as_str() {
+        "open" => mcpm_core::WantFilter::Open,
+        "promoted" => mcpm_core::WantFilter::Promoted,
+        "declined" => mcpm_core::WantFilter::Declined,
+        _ => mcpm_core::WantFilter::All,
+    };
+    let found = store
+        .search_wants(&query, filter, &tags, page.max(0) * PER_PAGE, PER_PAGE)
+        .await
+        .map_err(fail)?;
+    Ok(WantPage {
+        wants: found.wants.iter().map(want_dto).collect(),
+        total: found.total,
+    })
+}
+
+/// One idea, for its drawer — which can open from a feature's origin
+/// list onto a want that is on no loaded page of the pool.
+#[server]
+pub async fn load_want(want_id: String) -> Result<WantDto, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    Ok(want_dto(&store.get_want(&want_id).await.map_err(fail)?))
+}
+
+#[cfg(feature = "server")]
+fn want_dto(w: &mcpm_core::Want) -> WantDto {
+    WantDto {
+        id: w.id.clone(),
+        body: w.body.clone(),
+        tags: w.tags.clone(),
+        status: w.status.clone(),
+        note: w.decline_reason.clone().unwrap_or_default(),
+        author: w.author.clone(),
+        captured: w.created_at.format("%b %-d %H:%M").to_string(),
+        features: w
+            .features
+            .iter()
+            .map(|l| WantLinkDto {
+                feature_id: l.feature_id.clone(),
+                feature_name: l.feature_name.clone(),
+                rationale: l.rationale.clone(),
+            })
+            .collect(),
+    }
 }
 
 /// What one capture wrote. Returned to the console so it can say what
@@ -826,18 +1098,6 @@ fn document_dto(d: &mcpm_core::DocumentView) -> DocumentDto {
     }
 }
 
-#[cfg(feature = "server")]
-async fn feature_creator(store: &mcpm_core::Store, feature_id: &str) -> Option<String> {
-    // The feature_planned event's agent is the planning manager.
-    store
-        .get_events(Some(feature_id), 0, 5)
-        .await
-        .ok()?
-        .into_iter()
-        .find(|e| e.kind == "feature_planned")
-        .and_then(|e| e.agent)
-}
-
 /// Pre-format one ledger entry for display.
 #[cfg(feature = "server")]
 fn format_event(e: &mcpm_core::Event) -> EventDto {
@@ -969,6 +1229,7 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
         time: e.ts.format("%H:%M").to_string(),
         kind: e.kind.clone(),
         agent: e.agent.clone(),
+        feature_id: e.feature_id.clone(),
         subject_id: e.subject_id.clone(),
         title,
         body,

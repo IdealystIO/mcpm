@@ -611,6 +611,87 @@ pub struct FeatureRollup {
     pub modules_ready: i64,
     pub tasks_done: i64,
     pub tasks_total: i64,
+    /// Tasks the crew added while working, beyond the plan.
+    pub tasks_added: i64,
+    /// The planning manager, as recorded at plan time.
+    pub created_by: Option<String>,
+    /// When the ledger first and last mention this feature. `None` on a
+    /// feature nothing has happened to.
+    pub started: Option<DateTime<Utc>>,
+    pub last_activity: Option<DateTime<Utc>>,
+}
+
+/// One thing across the project that has stopped and is waiting on a
+/// person: a claim the gate refused, or a module its worker escalated.
+///
+/// Every row is a CURRENT condition, derived from the module's own
+/// state — it disappears by itself the moment the work moves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionItem {
+    pub feature_id: String,
+    pub feature_name: String,
+    pub module_id: String,
+    pub module_name: String,
+    /// `rejected` — unclaimed, not done, and a claim on it once bounced
+    /// off the gate; or `blocked` — its worker reported a blocker.
+    pub kind: String,
+    /// Names of the prerequisites still open. Empty means the gate is
+    /// open now.
+    pub waiting_on: Vec<String>,
+}
+
+/// The ledger entries that fix a module's displayed state: when it was
+/// first claimed, and the latest gate rejection and blocker on it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModuleMilestones {
+    pub module_id: String,
+    pub first_claim: Option<DateTime<Utc>>,
+    pub last_rejection: Option<Event>,
+    pub last_blocker: Option<Event>,
+}
+
+/// The pool's shape: how many ideas sit in each state.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct WantCounts {
+    pub open: i64,
+    pub promoted: i64,
+    pub declined: i64,
+}
+
+/// One page of the pool, with what the filters matched in total.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WantSearch {
+    pub wants: Vec<Want>,
+    pub total: i64,
+}
+
+/// One committed event, as announced over LISTEN/NOTIFY.
+///
+/// Carries enough to decide what to refetch — which feature, what
+/// kind of write — and nothing a listener would render: the console
+/// re-reads the store rather than trusting a payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventNotice {
+    pub seq: i64,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub feature_id: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+}
+
+impl EventNotice {
+    /// Decode a notification payload: the JSON object the trigger sends
+    /// since migration 0013, or the bare `seq` it sent before — a
+    /// database migrated while a listener was up must not stall it.
+    pub fn parse(payload: &str) -> Option<EventNotice> {
+        let payload = payload.trim();
+        if let Ok(seq) = payload.parse::<i64>() {
+            return Some(EventNotice { seq, ..Default::default() });
+        }
+        serde_json::from_str(payload).ok()
+    }
 }
 
 /// Full graph for one feature.

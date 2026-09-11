@@ -53,9 +53,12 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
     let f = &feats[fi];
     let count = f.modules.len();
     if count == 0 {
+        // Two different blanks: the graph has not been read yet, or it
+        // has and there is nothing in it.
+        let word = if f.detail_loaded { "No modules planned." } else { "Loading the graph\u{2026}" };
         return ui! {
             view(style = GraphBlank()) {
-                Typography(content = "No modules planned.", kind = typography_kind::BodySm, muted = true)
+                Typography(content = word, kind = typography_kind::BodySm, muted = true)
             }
         };
     }
@@ -441,12 +444,9 @@ mod tests {
             waiting_on: Vec::new(),
             owns: Vec::new(),
             depth,
-            dispatchable: false,
-            handoff: None,
             summary: None,
             block: None,
             tasks: Vec::new(),
-            history: Vec::new(),
         }
     }
 

@@ -147,7 +147,7 @@ fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
                 }
             }
             if is_feed {
-                FeedView(feature = fi)
+                FeedView(console = console, feature = fi)
             }
             if is_origin {
                 scroll_view(style = PaneScroll()) {

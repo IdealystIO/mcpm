@@ -213,6 +213,19 @@ of the `server` SDK, and only running one hides breakage in the other.
   copies that drifted would mean agents and the console were looking at
   differently ordered versions of the same base, which nobody would
   notice.
+- **The console reads in tiers, and every fetch is issued from one
+  place.** `load_board` is the only global read and is scalars per
+  feature; a feature's tree, a module's handoff and history, a page of
+  a feed, a page of the pool are each their own read, fetched when
+  they are on screen. The scheduler is `start_sync` in `src/app.rs`:
+  it computes what the screen needs each frame, what a tick has made
+  stale, and issues the difference. A view that spawns its own fetch
+  breaks that — a rev bump rebuilds it, it fetches again, and the
+  console quietly doubles its traffic. And nothing may grow back into
+  the board: it was once the whole project (every tree, every document
+  body, 500 events per feature, on every tick), and it did not scale.
+  A tick's `feature_id`/`kind` are what let the client skip the tree
+  refetch, so the notify trigger must keep sending them.
 - **The capture syntax is defined once**, in `crates/api/src/capture.rs`,
   and used by both the editor's highlighting and the server function
   that writes. Never add a second parser — drift between them means the
@@ -289,7 +302,7 @@ of the `server` SDK, and only running one hides breakage in the other.
   without it points every visitor's browser at THEIR own loopback: the
   page renders perfectly, every call fails on the visitor's machine, and
   the server logs show a healthy host that nobody is talking to.
-- **`mcpm-web` must reference the `api` crate** (`api::Snapshot::default()`)
+- **`mcpm-web` must reference the `api` crate** (`api::Board::default()`)
   or the linker dead-strips its route inventory and every `/_srv/` path
   404s with no build error.
 - **The host binary lives inside `crates/api`** behind

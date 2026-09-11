@@ -17,7 +17,7 @@ use runtime_core::{
 
 use crate::components::bits::{Mono, StatusDot};
 use crate::model::{
-    active_agent_count, attention, features, in_play, project_name, recent_events, want_counts,
+    active_agent_count, attention, features, in_play, project_name, recent, want_counts,
     AttentionTarget,
 };
 use crate::state::Console;
@@ -52,8 +52,7 @@ fn overview_body(console: Console) -> Element {
     let attention_rows = attention();
     let attention_count = attention_rows.len();
     let play_count = playing.len();
-    let events = recent_events(6);
-    let event_count = events.len();
+    let event_count = recent().len().min(6);
 
     ui! {
         view(style = OverviewBox()) {
@@ -118,11 +117,7 @@ fn overview_body(console: Console) -> Element {
                             view(style = SurfaceCard()) {
                                 view(style = FeedPad()) {
                                     for i in 0..event_count {
-                                        ActivityRow(
-                                            feature = events[i].0,
-                                            event = events[i].1,
-                                            last = i + 1 == event_count,
-                                        )
+                                        ActivityRow(index = i, last = i + 1 == event_count)
                                     }
                                     if event_count == 0 {
                                         Typography(
@@ -165,10 +160,7 @@ pub fn AttentionRow(props: &AttentionRowProps) -> Element {
     let status = row.status;
     let title = row.title.clone();
     let place = row.place.clone();
-    let target = match row.target {
-        AttentionTarget::Module(fi, mi) => Some((fi, mi)),
-        AttentionTarget::Pool => None,
-    };
+    let target = row.target.clone();
     let first = if props.first { "yes" } else { "no" };
 
     let inner: Element = ui! {
@@ -187,9 +179,9 @@ pub fn AttentionRow(props: &AttentionRowProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || match target {
-        Some((fi, mi)) => console.open_module_in(fi, mi),
-        None => console.show_wants(),
+    pressable(vec![inner], move || match &target {
+        AttentionTarget::Module(fi, id) => console.open_module_in(*fi, id),
+        AttentionTarget::Pool => console.show_wants(),
     })
     .with_style(StyleApplication::new(divided_row_style()).with("first", first.to_string()))
     .into_element()
@@ -257,10 +249,8 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
 /// Props for [`ActivityRow`].
 #[derive(Default, IdealystSchema)]
 pub struct ActivityRowProps {
-    /// Index into [`features`].
-    pub feature: usize,
-    /// Index into that feature's events.
-    pub event: usize,
+    /// Index into [`recent`], newest first.
+    pub index: usize,
     /// Whether this is the last row — its connector stops here.
     pub last: bool,
 }
@@ -268,11 +258,8 @@ pub struct ActivityRowProps {
 /// One line of the project-wide ledger.
 #[component]
 pub fn ActivityRow(props: &ActivityRowProps) -> Element {
-    let feats = features();
-    let Some(event) = feats
-        .get(props.feature)
-        .and_then(|f| f.events.get(props.event))
-    else {
+    let events = recent();
+    let Some(event) = events.get(props.index) else {
         return ui! { view {} };
     };
     let time = event.time.clone();

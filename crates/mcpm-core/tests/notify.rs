@@ -48,11 +48,15 @@ async fn a_committed_event_reaches_the_watcher() {
         store.get_context("agent.test", "manager").await.expect("register");
         store.plan_feature("agent.test", plan).await.expect("plan");
 
-        let seq = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
             .await
             .expect("a notification within 10s — is the events_notify trigger installed?")
-            .expect("stream yielded a seq");
-        assert!(seq > 0, "seq should be the events.seq of the committed row");
+            .expect("stream yielded a notice");
+        assert!(notice.seq > 0, "seq should be the events.seq of the committed row");
+        // The payload names what landed, so a console can tell an event
+        // on the open feature from one anywhere else without a fetch.
+        assert_eq!(notice.kind, "feature_planned");
+        assert!(notice.feature_id.is_some(), "a planning event carries its feature");
     }
 
     admin
@@ -104,11 +108,11 @@ async fn many_subscribers_share_one_listener() {
         store.plan_feature("agent.test", plan).await.expect("plan");
 
         for (i, stream) in streams.iter_mut().enumerate() {
-            let seq = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            let notice = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
                 .await
                 .unwrap_or_else(|_| panic!("subscriber {i} never got the event"))
-                .expect("stream yielded a seq");
-            assert!(seq > 0);
+                .expect("stream yielded a notice");
+            assert!(notice.seq > 0);
         }
     }
 

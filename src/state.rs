@@ -26,10 +26,11 @@ pub struct Console {
     /// Active main-pane view tab id: "graph" | "whitepaper" | "feed" |
     /// "origin".
     pub view: Signal<String>,
-    /// Module drawer target: the module's index in
-    /// [`crate::model::Feature::modules`] of the selected feature, or
-    /// `None` when the drawer is closed.
-    pub selected: Signal<Option<usize>>,
+    /// Module drawer target: the id of the open module, or `None` when
+    /// the drawer is closed. An **id**, not an index: the home screen's
+    /// attention list opens a module in a feature whose graph may not
+    /// have loaded yet, and the drawer resolves the id once it has.
+    pub selected: Signal<Option<String>>,
     /// Want drawer target: the id of the want whose detail panel is
     /// open, or `None`. An **id**, not an index — the pool re-sorts
     /// under a poll, so an index would drift onto another idea.
@@ -41,14 +42,18 @@ pub struct Console {
     // has to keep rendering its contents for those frames — clearing
     // both together would blank the panel and then slide the blank out.
     /// Last module the drawer was opened onto.
-    pub last_module: Signal<Option<usize>>,
+    pub last_module: Signal<Option<String>>,
     /// Last want the drawer was opened onto.
     pub last_want: Signal<Option<String>>,
     /// Dark-mode flag; drives `install_idea_theme_reactive` in `app()`.
     pub dark: Signal<bool>,
-    /// Data revision: bumped whenever a changed snapshot lands, so every
-    /// view keyed on it re-reads [`crate::model`].
+    /// Data revision: bumped whenever a read lands that changed the
+    /// model, so every view keyed on it re-reads [`crate::model`].
     pub rev: Signal<u64>,
+    /// The feed's "load older" request: the feature id whose next
+    /// older page the reader asked for. The sync loop fetches it and
+    /// clears this.
+    pub feed_older: Signal<Option<String>>,
     /// Whether the event socket is open. A real connection state, not
     /// "we managed a fetch once" — the header reports it.
     pub connected: Signal<bool>,
@@ -165,6 +170,7 @@ pub fn use_console() -> Console {
         last_want: signal(None),
         dark: signal(false),
         rev: signal(0),
+        feed_older: signal(None),
         connected: signal(false),
         pool_query: signal(String::new()),
         pool_status: signal("all".to_string()),
@@ -221,7 +227,7 @@ impl Console {
     /// project, so following a row has to move the selection as well as
     /// the drawer — `open_module` alone would open the drawer onto a
     /// coordinate in a feature the reader is not looking at.
-    pub fn open_module_in(&self, feature: usize, module: usize) {
+    pub fn open_module_in(&self, feature: usize, module: &str) {
         self.pane.set("feature".to_string());
         self.feature.set(feature);
         self.view.set("graph".to_string());
@@ -386,10 +392,16 @@ impl Console {
     /// Open the module drawer on one module of the selected feature.
     /// Also how the drawer moves to a prerequisite: with `selected`
     /// already `Some`, the panel stays present and re-targets.
-    pub fn open_module(&self, module: usize) {
+    pub fn open_module(&self, module: &str) {
         self.want.set(None);
-        self.selected.set(Some(module));
-        self.last_module.set(Some(module));
+        self.selected.set(Some(module.to_string()));
+        self.last_module.set(Some(module.to_string()));
+    }
+
+    /// Ask for the next older page of a feature's ledger. The sync
+    /// loop owns every fetch, so this is a request rather than a call.
+    pub fn load_older_events(&self, feature_id: &str) {
+        self.feed_older.set(Some(feature_id.to_string()));
     }
 
     /// Open the want drawer on one idea. Both drawers occupy the same

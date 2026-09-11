@@ -951,7 +951,7 @@ mod tests {
 
     /// Seed the model's tag registry the way a snapshot would.
     fn with_tags(names: &[&str]) {
-        let mut snap = api::Snapshot::default();
+        let mut snap = api::Board::default();
         snap.tags = names
             .iter()
             .map(|n| api::TagDto {
@@ -960,7 +960,7 @@ mod tests {
                 uses: 1,
             })
             .collect();
-        model::apply_snapshot(snap);
+        model::apply_board(snap);
     }
 
     #[test]

@@ -92,7 +92,7 @@ pub struct Store {
     /// The process-wide fan-out of `EVENT_CHANNEL`, started on first
     /// use. One Postgres connection serves every subscriber, however
     /// many consoles are open.
-    events: Arc<OnceCell<broadcast::Sender<i64>>>,
+    events: Arc<OnceCell<broadcast::Sender<EventNotice>>>,
 }
 
 impl Store {
@@ -172,7 +172,7 @@ impl Store {
     /// A slow subscriber that falls behind skips to the newest seq
     /// rather than closing: the tick is a nudge to refetch, so missing
     /// intermediate numbers costs nothing.
-    pub async fn watch_events(&self) -> Result<impl futures_core::Stream<Item = i64>> {
+    pub async fn watch_events(&self) -> Result<impl futures_core::Stream<Item = EventNotice>> {
         let tx = self
             .events
             .get_or_try_init(|| async {
@@ -183,9 +183,9 @@ impl Store {
                 tokio::spawn(async move {
                     let mut stream = listener.into_stream();
                     while let Some(Ok(note)) = futures_util::StreamExt::next(&mut stream).await {
-                        if let Ok(seq) = note.payload().parse::<i64>() {
+                        if let Some(notice) = EventNotice::parse(note.payload()) {
                             // Err just means nobody is listening yet.
-                            let _ = feed.send(seq);
+                            let _ = feed.send(notice);
                         }
                     }
                 });
@@ -196,7 +196,7 @@ impl Store {
         Ok(async_stream::stream! {
             loop {
                 match rx.recv().await {
-                    Ok(seq) => yield seq,
+                    Ok(notice) => yield notice,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -340,7 +340,14 @@ impl Store {
                (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
                   WHERE m.feature_id = f.id) AS tasks_total,
                (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
-                  WHERE m.feature_id = f.id AND t.status IN ('done','skipped')) AS tasks_done
+                  WHERE m.feature_id = f.id AND t.status IN ('done','skipped')) AS tasks_done,
+               (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
+                  WHERE m.feature_id = f.id AND t.origin = 'discovered') AS tasks_added,
+               f.created_by,
+               (SELECT e.ts FROM events e WHERE e.feature_id = f.id
+                  ORDER BY e.seq ASC LIMIT 1) AS started,
+               (SELECT e.ts FROM events e WHERE e.feature_id = f.id
+                  ORDER BY e.seq DESC LIMIT 1) AS last_activity
              FROM features f ORDER BY f.created_at",
         )
         .fetch_all(&self.pool)
@@ -356,6 +363,58 @@ impl Store {
                 modules_ready: r.get("modules_ready"),
                 tasks_done: r.get("tasks_done"),
                 tasks_total: r.get("tasks_total"),
+                tasks_added: r.get("tasks_added"),
+                created_by: r.get("created_by"),
+                started: r.get("started"),
+                last_activity: r.get("last_activity"),
+            })
+            .collect())
+    }
+
+    /// Everything across the project that has stopped and is waiting
+    /// on a person, worst first: claims the gate refused, then modules
+    /// their workers escalated.
+    ///
+    /// Computed here rather than by walking every feature's tree on the
+    /// client: the set of stuck modules is small however old the
+    /// project gets, and it is the one cross-feature question the
+    /// console's home screen asks. A rejection is "sticky" — a module
+    /// that once bounced off the gate stays flagged until someone
+    /// claims it or it is done — so that a refusal nobody has come back
+    /// to is not silently forgotten when its prerequisites finish.
+    pub async fn attention(&self) -> Result<Vec<AttentionItem>> {
+        let rows = sqlx::query(
+            "SELECT m.id AS module_id, m.name AS module_name,
+                    f.id AS feature_id, f.name AS feature_name,
+                    (m.status <> 'done' AND m.claimed_by IS NULL
+                     AND EXISTS (SELECT 1 FROM events e
+                                 WHERE e.subject_id = m.id
+                                   AND e.type = 'premature_claim')) AS rejected,
+                    COALESCE((SELECT array_agg(p.name ORDER BY p.name)
+                              FROM module_deps d JOIN modules p ON p.id = d.depends_on
+                              WHERE d.module_id = m.id AND p.status <> 'done'),
+                             '{}') AS waiting_on
+             FROM modules m
+             JOIN features f ON f.id = m.feature_id
+             WHERE f.status <> 'done'
+               AND (m.status = 'blocked'
+                    OR (m.status <> 'done' AND m.claimed_by IS NULL
+                        AND EXISTS (SELECT 1 FROM events e
+                                    WHERE e.subject_id = m.id
+                                      AND e.type = 'premature_claim')))
+             ORDER BY rejected DESC, f.created_at, m.name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AttentionItem {
+                kind: if r.get::<bool, _>("rejected") { "rejected" } else { "blocked" }.to_string(),
+                feature_id: r.get("feature_id"),
+                feature_name: r.get("feature_name"),
+                module_id: r.get("module_id"),
+                module_name: r.get("module_name"),
+                waiting_on: r.get("waiting_on"),
             })
             .collect())
     }
@@ -2099,8 +2158,9 @@ impl Store {
 
         // Re-read in capture order (select_wants sorts newest-first).
         let mut wants = self
-            .select_wants("", WantFilter::All, &[], &ids, None, ids.len() as i64)
-            .await?;
+            .select_wants("", WantFilter::All, &[], &ids, None, 0, ids.len() as i64)
+            .await?
+            .0;
         wants.sort_by_key(|w| ids.iter().position(|id| *id == w.id).unwrap_or(usize::MAX));
         Ok(wants)
     }
@@ -2164,8 +2224,9 @@ impl Store {
     /// Read one want by id.
     /// Read one want by id.
     pub async fn get_want(&self, id: &str) -> Result<Want> {
-        self.select_wants("", WantFilter::All, &[], &[id.to_string()], None, 1)
+        self.select_wants("", WantFilter::All, &[], &[id.to_string()], None, 0, 1)
             .await?
+            .0
             .pop()
             .ok_or_else(|| McpmError::not_found("want", id))
     }
@@ -2180,7 +2241,29 @@ impl Store {
         tags: &[String],
         limit: i64,
     ) -> Result<WantPool> {
-        let wants = self.select_wants(query, filter, tags, &[], None, limit).await?;
+        let (wants, _) = self.select_wants(query, filter, tags, &[], None, 0, limit).await?;
+        let counts = self.want_counts().await?;
+        let open = counts.open;
+        let note = if open == 0 {
+            "No open wants. Nothing to compose right now.".to_string()
+        } else {
+            format!(
+                "{open} open want(s). Read them for THEMES, not one-to-one: several wants \
+                 usually compose into one feature, and one want can inform several. When a \
+                 group coheres, call promote_wants with that group and the plan it becomes.",
+            )
+        };
+        Ok(WantPool {
+            open,
+            promoted: counts.promoted,
+            declined: counts.declined,
+            wants,
+            note,
+        })
+    }
+
+    /// How many ideas sit in each state, project-wide.
+    pub async fn want_counts(&self) -> Result<WantCounts> {
         let counts = sqlx::query(
             "SELECT
                COUNT(*) FILTER (WHERE w.state = 'open' AND NOT EXISTS
@@ -2193,29 +2276,45 @@ impl Store {
         )
         .fetch_one(&self.pool)
         .await?;
-        let open: i64 = counts.get("open");
-        let note = if open == 0 {
-            "No open wants. Nothing to compose right now.".to_string()
-        } else {
-            format!(
-                "{open} open want(s). Read them for THEMES, not one-to-one: several wants \
-                 usually compose into one feature, and one want can inform several. When a \
-                 group coheres, call promote_wants with that group and the plan it becomes.",
-            )
-        };
-        Ok(WantPool {
-            open,
+        Ok(WantCounts {
+            open: counts.get("open"),
             promoted: counts.get("promoted"),
             declined: counts.get("declined"),
-            wants,
-            note,
         })
+    }
+
+    /// One page of the pool under the same filters as [`Self::list_wants`],
+    /// with what the filters matched in total — the console's read,
+    /// which pages where an agent takes the top of the list.
+    pub async fn search_wants(
+        &self,
+        query: &str,
+        filter: WantFilter,
+        tags: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<WantSearch> {
+        let (wants, mut total) = self
+            .select_wants(query, filter, tags, &[], None, offset.max(0), limit)
+            .await?;
+        // A page past the end has no row to read the window count off,
+        // and "zero" there would tell a pager the pool had emptied when
+        // the reader had only outrun it. Page one always knows.
+        if wants.is_empty() && offset > 0 {
+            total = self
+                .select_wants(query, filter, tags, &[], None, 0, 1)
+                .await?
+                .1;
+        }
+        Ok(WantSearch { wants, total })
     }
 
     /// Every want a feature was composed from (oldest link first).
     pub async fn wants_of_feature(&self, feature_id: &str) -> Result<Vec<Want>> {
-        self.select_wants("", WantFilter::All, &[], &[], Some(feature_id), 200)
-            .await
+        Ok(self
+            .select_wants("", WantFilter::All, &[], &[], Some(feature_id), 0, 200)
+            .await?
+            .0)
     }
 
     /// Revise a want: sharpen the wording, retag, decline it with a
@@ -2376,8 +2475,9 @@ impl Store {
         // refused whole, before anything is written.
         let ids: Vec<String> = req.wants.iter().map(|w| w.id.clone()).collect();
         let found = self
-            .select_wants("", WantFilter::All, &[], &ids, None, ids.len() as i64)
-            .await?;
+            .select_wants("", WantFilter::All, &[], &ids, None, 0, ids.len() as i64)
+            .await?
+            .0;
         let missing: Vec<&String> = ids
             .iter()
             .filter(|id| !found.iter().any(|w| &&w.id == id))
@@ -2492,8 +2592,9 @@ impl Store {
         tx.commit().await?;
 
         let linked = self
-            .select_wants("", WantFilter::All, &[], &ids, None, ids.len() as i64)
-            .await?;
+            .select_wants("", WantFilter::All, &[], &ids, None, 0, ids.len() as i64)
+            .await?
+            .0;
         Ok(Promotion {
             feature: self.feature_tree(&feature_id).await?,
             linked,
@@ -2518,8 +2619,9 @@ impl Store {
         tags: &[String],
         ids: &[String],
         feature_id: Option<&str>,
+        offset: i64,
         limit: i64,
-    ) -> Result<Vec<Want>> {
+    ) -> Result<(Vec<Want>, i64)> {
         let rows = sqlx::query(
             "WITH linked AS (
                SELECT wf.want_id,
@@ -2541,7 +2643,8 @@ impl Store {
                FROM wants w LEFT JOIN linked l ON l.want_id = w.id
              )
              SELECT id, body, tags, author, created_at, updated_at, decline_reason, status,
-                    feature_ids, feature_names, rationales
+                    feature_ids, feature_names, rationales,
+                    COUNT(*) OVER () AS total
              FROM pool p
              WHERE ($1 = '' OR p.tsv @@ websearch_to_tsquery('english', $1))
                AND (cardinality($2::text[]) = 0 OR p.tags && $2)
@@ -2551,7 +2654,7 @@ impl Store {
              ORDER BY CASE WHEN $1 = '' THEN 0
                            ELSE ts_rank(p.tsv, websearch_to_tsquery('english', $1)) END DESC,
                       p.created_at DESC
-             LIMIT $6",
+             LIMIT $6 OFFSET $7",
         )
         .bind(query)
         .bind(tags)
@@ -2559,9 +2662,15 @@ impl Store {
         .bind(ids)
         .bind(feature_id)
         .bind(limit.clamp(1, 500))
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
+        // The window count is the same on every row; a page past the
+        // end has no rows to read it off, and then the total is zero
+        // only if nothing matched — a caller that paged too far gets
+        // the count back from page one.
+        let total: i64 = rows.first().map(|r| r.get("total")).unwrap_or(0);
+        let wants = rows
             .into_iter()
             .map(|r| {
                 let feature_ids: Vec<String> = r.get("feature_ids");
@@ -2588,7 +2697,8 @@ impl Store {
                         .collect(),
                 }
             })
-            .collect())
+            .collect();
+        Ok((wants, total))
     }
 
     // -----------------------------------------------------------------
@@ -2606,18 +2716,113 @@ impl Store {
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| Event {
-                seq: r.get("seq"),
-                ts: r.get("ts"),
-                kind: r.get("type"),
-                feature_id: r.get("feature_id"),
-                subject_id: r.get("subject_id"),
-                agent: r.get("agent"),
-                payload: r.get("payload"),
-            })
-            .collect())
+        Ok(rows.iter().map(map_event).collect())
+    }
+
+    /// One page of the ledger, newest first: the whole project's when
+    /// `feature_id` is `None`, one feature's otherwise. `before` is the
+    /// paging cursor — the oldest `seq` the reader already has — and
+    /// `more` in the result says whether an older page exists.
+    ///
+    /// Newest first because that is the only order a reader can start
+    /// from without knowing how long the ledger is; `get_events` (the
+    /// agents' cursor-forward read) stays ascending.
+    pub async fn events_page(
+        &self,
+        feature_id: Option<&str>,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<Event>, bool)> {
+        let limit = limit.clamp(1, 200);
+        let rows = sqlx::query(
+            "SELECT seq, ts, type, feature_id, subject_id, agent, payload FROM events
+             WHERE ($1::text IS NULL OR feature_id = $1)
+               AND ($2::bigint IS NULL OR seq < $2)
+             ORDER BY seq DESC LIMIT $3",
+        )
+        .bind(feature_id)
+        .bind(before)
+        // One past the page: the cheapest way to know if there is more
+        // without a second count query per page.
+        .bind(limit + 1)
+        .fetch_all(&self.pool)
+        .await?;
+        let more = rows.len() as i64 > limit;
+        Ok((rows.iter().take(limit as usize).map(map_event).collect(), more))
+    }
+
+    /// Every ledger entry whose subject is one module (or task), oldest
+    /// first — the drawer's history. Capped at the NEWEST `limit`: a
+    /// module that has outlived the cap loses its earliest rows, not
+    /// the ones that say what state it is in now.
+    pub async fn events_of_subject(&self, subject_id: &str, limit: i64) -> Result<Vec<Event>> {
+        let rows = sqlx::query(
+            "SELECT seq, ts, type, feature_id, subject_id, agent, payload FROM events
+             WHERE subject_id = $1 ORDER BY seq DESC LIMIT $2",
+        )
+        .bind(subject_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut events: Vec<Event> = rows.iter().map(map_event).collect();
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Per module of one feature, the ledger entries that fix what the
+    /// console shows on its card: when it was first claimed, the latest
+    /// rejection at the gate, the latest blocker. Three rows per module
+    /// at most, however long the module's history is — which is what
+    /// lets a feature's tree be read without its ledger.
+    pub async fn module_milestones(&self, feature_id: &str) -> Result<Vec<ModuleMilestones>> {
+        let latest = sqlx::query(
+            "SELECT DISTINCT ON (subject_id, type)
+                    seq, ts, type, feature_id, subject_id, agent, payload
+             FROM events
+             WHERE feature_id = $1 AND type IN ('premature_claim', 'blocker_reported')
+             ORDER BY subject_id, type, seq DESC",
+        )
+        .bind(feature_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let claims = sqlx::query(
+            "SELECT DISTINCT ON (subject_id) subject_id, ts
+             FROM events
+             WHERE feature_id = $1 AND type = 'module_claimed'
+             ORDER BY subject_id, seq ASC",
+        )
+        .bind(feature_id)
+        .fetch_all(&self.pool)
+        .await?;
+        fn slot(out: &mut Vec<ModuleMilestones>, module_id: String) -> &mut ModuleMilestones {
+            let i = match out.iter().position(|m| m.module_id == module_id) {
+                Some(i) => i,
+                None => {
+                    out.push(ModuleMilestones {
+                        module_id,
+                        first_claim: None,
+                        last_rejection: None,
+                        last_blocker: None,
+                    });
+                    out.len() - 1
+                }
+            };
+            &mut out[i]
+        }
+        let mut out: Vec<ModuleMilestones> = Vec::new();
+        for r in &claims {
+            slot(&mut out, r.get("subject_id")).first_claim = Some(r.get("ts"));
+        }
+        for r in &latest {
+            let e = map_event(r);
+            let Some(subject) = e.subject_id.clone() else { continue };
+            let m = slot(&mut out, subject);
+            match e.kind.as_str() {
+                "premature_claim" => m.last_rejection = Some(e),
+                _ => m.last_blocker = Some(e),
+            }
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------
@@ -4041,6 +4246,20 @@ const DOCUMENT_FIELDS: &str = "
 const DOCUMENT_JOINS: &str = "
     LEFT JOIN features f ON doc.level = 'feature' AND f.id = doc.subject_id
     LEFT JOIN modules m  ON doc.level = 'module'  AND m.id = doc.subject_id";
+
+/// One ledger row. Every read of `events` goes through this so the
+/// column list and the struct cannot drift apart per query.
+fn map_event(r: &sqlx::postgres::PgRow) -> Event {
+    Event {
+        seq: r.get("seq"),
+        ts: r.get("ts"),
+        kind: r.get("type"),
+        feature_id: r.get("feature_id"),
+        subject_id: r.get("subject_id"),
+        agent: r.get("agent"),
+        payload: r.get("payload"),
+    }
+}
 
 fn map_document(r: &sqlx::postgres::PgRow) -> DocumentView {
     DocumentView {

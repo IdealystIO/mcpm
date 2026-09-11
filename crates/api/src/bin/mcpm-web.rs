@@ -71,7 +71,7 @@ async fn main() {
     // or the linker dead-strips its `inventory::submit!` route statics
     // and every /_srv/<fn> 404s with no build error (see the framework's
     // server-fn demo). This touch is that reference.
-    let _ = api::Snapshot::default();
+    let _ = api::Board::default();
 
     let app: axum::Router = server::router().layer(cors(require_auth));
 

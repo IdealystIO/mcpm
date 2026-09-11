@@ -17,7 +17,7 @@ use runtime_core::{
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
 use crate::components::document::DocumentView;
-use crate::model::{features, wants};
+use crate::model::{features, module_detail, want_by_id};
 use crate::state::Console;
 use crate::styles::{MonoTextSize, MonoTextTone, SectionLabel};
 
@@ -105,23 +105,34 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
         m.tasks.iter().map(|t| (t.label.to_string(), t.done, t.added)).collect();
     let summary = m.summary.clone().unwrap_or_default();
     let has_summary = !summary.is_empty();
-    let (handoff_present, handoff_body, handoff_meta) = match &m.handoff {
-        Some(d) => (true, d.body.clone(), d.meta()),
-        None => (false, String::new(), String::new()),
-    };
-    let history: Vec<(String, String, String, String, bool)> = m
-        .history
-        .iter()
-        .map(|h| {
-            (
-                h.title.to_string(),
-                h.body.to_string(),
-                h.at.to_string(),
-                h.from.to_string(),
-                h.from == "server.gate",
-            )
+    // The handoff and history are their own read, fetched when the
+    // drawer opens; until it lands both sections say so rather than
+    // claiming there is nothing.
+    let detail = module_detail(&m.id);
+    let detail_loaded = detail.is_some();
+    let (handoff_present, handoff_body, handoff_meta) =
+        match detail.as_ref().and_then(|d| d.handoff.as_ref()) {
+            Some(d) => (true, d.body.clone(), d.meta()),
+            None => (false, String::new(), String::new()),
+        };
+    let handoff_empty = if detail_loaded { "No handoff written." } else { "Loading\u{2026}" };
+    let history: Vec<(String, String, String, String, bool)> = detail
+        .as_ref()
+        .map(|d| {
+            d.history
+                .iter()
+                .map(|h| {
+                    (
+                        h.title.to_string(),
+                        h.body.to_string(),
+                        h.at.to_string(),
+                        h.from.to_string(),
+                        h.from == "server.gate",
+                    )
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     let has_history = !history.is_empty();
 
     let close = pressable(
@@ -214,7 +225,7 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                                 present = handoff_present,
                                 body = handoff_body,
                                 meta = handoff_meta,
-                                empty = "No handoff written.",
+                                empty = handoff_empty,
                             )
                         }
 
@@ -259,6 +270,7 @@ pub fn PrereqRow(props: &PrereqRowProps) -> Element {
     let name = m.name.clone();
     let status = m.status;
     let waiting = props.waiting;
+    let id = m.id.clone();
 
     let inner: Element = ui! {
         view(style = PrereqInner()) {
@@ -273,7 +285,7 @@ pub fn PrereqRow(props: &PrereqRowProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || console.open_module(index))
+    pressable(vec![inner], move || console.open_module(&id))
         .with_style(StyleApplication::new(prereq_box_style()))
         .into_element()
 }
@@ -283,21 +295,22 @@ pub fn PrereqRow(props: &PrereqRowProps) -> Element {
 pub struct WantDrawerProps {
     /// Console state handles.
     pub console: Console,
-    /// Index into [`crate::model::wants`], resolved from the held id by
-    /// `app()` on every rebuild.
-    pub want: usize,
+    /// The want's id. Resolved through [`crate::model::want_by_id`] on
+    /// every rebuild — the pool is paged under the reader, so nothing
+    /// here holds a position in it.
+    pub want: String,
 }
 
 /// The want drawer overlay: backdrop plus the sliding panel.
 #[component]
 pub fn WantDrawer(props: &WantDrawerProps) -> Element {
     let console = props.console;
-    let index = props.want;
+    let id = props.want.clone();
     let backdrop = pressable(Vec::new(), move || console.close_drawer())
         .with_style(StyleApplication::new(backdrop_sheet_style()))
         .into_element();
     let panel = panel_motion(
-        move || ui! { WantPanel(console = console, want = index) },
+        move || ui! { WantPanel(console = console, want = id.clone()) },
         move || console.want.get().is_some(),
     );
     ui! {
@@ -313,8 +326,8 @@ pub fn WantDrawer(props: &WantDrawerProps) -> Element {
 pub struct WantPanelProps {
     /// Console state handles.
     pub console: Console,
-    /// Index into [`crate::model::wants`].
-    pub want: usize,
+    /// The want's id.
+    pub want: String,
 }
 
 /// Everything about one loose idea, so the lists that point at it (the
@@ -322,10 +335,14 @@ pub struct WantPanelProps {
 #[component]
 pub fn WantPanel(props: &WantPanelProps) -> Element {
     let console = props.console;
-    let index = props.want;
-    let pool = wants();
-    let w = &pool[index];
+    let Some(w) = want_by_id(&props.want) else {
+        return ui! { view {} };
+    };
     let id = w.id.clone();
+    // The rows below re-read the want by id inside `Fn` closures —
+    // one clone per for-each, since each closure takes its own.
+    let tag_id = id.clone();
+    let link_id = id.clone();
     let body = w.body.clone();
     let state = w.state;
     let status = state.status();
@@ -373,7 +390,7 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
                         if tag_count > 0 {
                             view(style = WantTagRow()) {
                                 for i in 0..tag_count {
-                                    WantDrawerTag(want = index, index = i)
+                                    WantDrawerTag(want = tag_id.clone(), index = i)
                                 }
                             }
                         }
@@ -394,7 +411,7 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
                             view(style = SectionCol()) {
                                 text(style = SectionLabel()) { "Composed into" }
                                 for i in 0..link_count {
-                                    WantLinkRow(want = index, index = i)
+                                    WantLinkRow(want = link_id.clone(), index = i)
                                 }
                             }
                         }
@@ -407,8 +424,8 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
 /// Props for [`WantDrawerTag`].
 #[derive(Default, IdealystSchema)]
 pub struct WantDrawerTagProps {
-    /// Index into [`crate::model::wants`].
-    pub want: usize,
+    /// The want's id.
+    pub want: String,
     /// Index into that want's tag list.
     pub index: usize,
 }
@@ -417,8 +434,9 @@ pub struct WantDrawerTagProps {
 /// body is an `Fn` closure and cannot consume a captured `String`.
 #[component]
 pub fn WantDrawerTag(props: &WantDrawerTagProps) -> Element {
-    let pool = wants();
-    let tag = pool[props.want].tags[props.index].clone();
+    let tag = want_by_id(&props.want)
+        .and_then(|w| w.tags.get(props.index).cloned())
+        .unwrap_or_default();
     ui! {
         Tag(label = tag, tone = tone::Neutral, variant = variant::Soft)
     }
@@ -427,8 +445,8 @@ pub fn WantDrawerTag(props: &WantDrawerTagProps) -> Element {
 /// Props for [`WantLinkRow`].
 #[derive(Default, IdealystSchema)]
 pub struct WantLinkRowProps {
-    /// Index into [`crate::model::wants`].
-    pub want: usize,
+    /// The want's id.
+    pub want: String,
     /// Index into that want's feature links.
     pub index: usize,
 }
@@ -438,10 +456,9 @@ pub struct WantLinkRowProps {
 /// that way. This is the only place that rationale is spelled out.
 #[component]
 pub fn WantLinkRow(props: &WantLinkRowProps) -> Element {
-    let pool = wants();
-    let (name, rationale) = &pool[props.want].features[props.index];
-    let name = name.clone();
-    let rationale = rationale.clone();
+    let (name, rationale) = want_by_id(&props.want)
+        .and_then(|w| w.features.get(props.index).cloned())
+        .unwrap_or_default();
     let has_rationale = !rationale.is_empty();
     ui! {
         view(style = WantLinkBox()) {

@@ -105,7 +105,7 @@ connect over HTTP instead — see below.
 ### Verifying
 
 ```bash
-curl -s -X POST http://127.0.0.1:3210/_srv/load_snapshot \
+curl -s -X POST http://127.0.0.1:3210/_srv/load_board \
   -H 'content-type: application/json' -d 'null' | head -c 200
 ```
 
@@ -251,18 +251,28 @@ spelling it was first typed with. Agents read the list through
 ## Staying live
 
 The console does not poll for changes. Every committed row in the event
-ledger fires the `events_notify` trigger, which `pg_notify`s its `seq`.
-`mcpm-web` holds a `PgListener` on that channel and streams a `Tick` to
-each connected console over a WebSocket (`#[subscription] watch_events`).
-The console answers a tick by refetching the snapshot. The tick carries
-no data beyond the sequence number, so `apply_snapshot` stays the one
-place the client model is written.
+ledger fires the `events_notify` trigger, which `pg_notify`s the row's
+`seq`, type and feature. `mcpm-web` holds a `PgListener` on that channel
+and streams a `Tick` to each connected console over a WebSocket
+(`#[subscription] watch_events`).
+
+The console reads in tiers, and a tick says which tier to refetch.
+`load_board` is the one global read — a row of counts per feature, the
+attention list, the newest few events, the roster, the tags, the pool's
+counts — and every tick refetches it, because it never grows past the
+feature count. The selected feature's tree (`load_feature`), the open
+module's handoff and history (`load_module`) and the visible activity
+feed (`load_events`, newest first, paged) are refetched only when the
+tick names that feature; the want pool is paged by `search_wants` and
+refetched on a want or tag event. The tick carries nothing the console
+renders — it re-reads the store rather than trusting a payload.
 
 The route matters. The MCP server writes in a *different process* from
 the web host, so the notification has to cross the database. An
 in-process broadcast would only ever carry the console's own captures.
 
-A 30 second snapshot poll remains as the fallback for a dropped socket.
+A 30 second poll of everything on screen remains as the fallback for a
+dropped socket.
 
 ## Deploying it as a service
 
