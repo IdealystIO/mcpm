@@ -86,11 +86,18 @@ pub fn Sidebar(props: &SidebarProps) -> Element {
                     NavItem(
                         console = console,
                         id = "wants",
-                        glyph = "\u{270e}",
+                        glyph = "\u{25cb}",
                         label = "Want pool",
                         count = loose,
                         urgent = true,
                         selected = pane == "wants",
+                    )
+                    NavItem(
+                        console = console,
+                        id = "capture",
+                        glyph = "\u{270e}",
+                        label = "Capture",
+                        selected = pane == "capture",
                     )
                     NavItem(
                         console = console,
@@ -209,6 +216,7 @@ pub fn NavItem(props: &NavItemProps) -> Element {
             "overview" => console.show_overview(),
             "features" => console.show_features(),
             "wants" => console.show_wants(),
+            "capture" => console.show_capture(),
             _ => console.show_knowledge(),
         }
         dismiss_if_drawer(console);

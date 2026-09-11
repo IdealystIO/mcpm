@@ -3,12 +3,14 @@
 //! console polls the mcpm-web server (which reads the same Postgres
 //! store the MCP tools write) and re-renders whenever the data changes.
 
-use idea_ui::{dark_theme, install_idea_theme_reactive, light_theme, IdeaThemeRef};
+use idea_ui::{dark_theme, install_idea_theme_reactive, light_theme, IdeaThemeRef, ToastHost,
+    ToastPlacement};
 use idea_ui_nav::AppShell;
 use runtime_core::{presence, raf_loop_scoped, spawn_then, stylesheet, switch, ui, Breakpoint,
     Easing, Element, FlexDirection, IntoElement, Position, PresenceAnim};
 
 use crate::components::drawer::{Drawer, WantDrawer};
+use crate::components::edits::{ActionRunner, EditHost};
 use crate::components::gate::KeyGate;
 use crate::components::header::Header;
 use crate::components::knowledge::KnowledgeDrawer;
@@ -196,6 +198,12 @@ pub fn app() -> Element {
             drawer_host
             want_host
             knowledge_host
+            // Manual edits: the one modal every form renders in, the
+            // hole their requests run in, and where their outcomes
+            // are announced.
+            EditHost(console = console)
+            ActionRunner(console = console)
+            ToastHost(placement = ToastPlacement::BottomRight)
             sync
         }
     }
@@ -225,7 +233,7 @@ struct Wanted {
 #[derive(Clone, PartialEq, Eq, Default)]
 struct PoolKey {
     query: String,
-    status: String,
+    statuses: Vec<String>,
     tags: Vec<String>,
     page: usize,
 }
@@ -308,7 +316,7 @@ fn start_sync(console: Console, key: String) {
                 .flatten(),
             pool: (pane == "wants").then(|| PoolKey {
                 query: console.pool_query.get(),
-                status: console.pool_status.get(),
+                statuses: console.pool_status.get(),
                 tags: console.pool_tags.get(),
                 page: console.pool_page.get(),
             }),
@@ -334,13 +342,16 @@ fn start_sync(console: Console, key: String) {
                 }
             }
         }
-        // A local write (the capture composer) bumps `refresh` so its
-        // result shows up without waiting for the round trip.
+        // A local write (a capture, a plan edit) bumps `refresh` so its
+        // result shows up without waiting for the round trip. It may
+        // have touched anything on screen, so everything is stale.
         let nudge = console.refresh.get();
         if nudge != seen_nudge {
             seen_nudge = nudge;
             stale_board = true;
+            stale_feature = true;
             stale_pool = true;
+            stale_want = true;
         }
         // The fallback poll refreshes everything, as a tick naming all
         // of it would.
@@ -407,6 +418,14 @@ fn start_sync(console: Console, key: String) {
                             }
                             bump(true);
                         }
+                        // A plan the console just created: open it as
+                        // soon as the board knows it.
+                        if let Some(id) = console.open_after.get() {
+                            if let Some(at) = model::features().iter().position(|f| f.id == id) {
+                                console.open_after.set(None);
+                                console.select_feature(at);
+                            }
+                        }
                     }
                     // A refusal is a condition the reader can act on —
                     // it ends when they paste a working key — so it
@@ -472,7 +491,7 @@ fn start_sync(console: Console, key: String) {
                 let release = done("pool".into());
                 let asked = key.page;
                 spawn_then(
-                    api::search_wants(key.query, key.status, key.tags, key.page as i64),
+                    api::search_wants(key.query, key.statuses, key.tags, key.page as i64),
                     move |result| {
                         release();
                         match result {

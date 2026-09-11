@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use idea_ui::{typography_kind, Field, IdeaThemeRef, Popover, Spacer, Tab, Tabs, Typography};
+use idea_ui::{typography_kind, Button, Field, IdeaThemeRef, Popover, Spacer, Tab, Tabs, Typography};
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
     component, presence, pressable, signal, stylesheet, switch, ui, AlignItems, Easing, Element,
@@ -16,12 +16,14 @@ use runtime_core::{
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
 use crate::components::document::DocumentView;
+use crate::components::edits::{feature_entries, ActionMenu};
 use crate::components::feature_list::FeaturesView;
 use crate::components::feed::FeedView;
 use crate::components::graph::GraphView;
 use crate::components::knowledge::KnowledgeView;
 use crate::components::overview::OverviewView;
-use crate::components::wants::WantsView;
+use crate::components::plan_editor::PlanEditor;
+use crate::components::wants::{CaptureView, WantsView};
 use crate::model::features;
 use crate::state::Console;
 use crate::styles::MonoTextSize;
@@ -49,7 +51,7 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             // rebuilding them from this one would recreate the field
             // the user is typing into every time a poll landed.
             let rev = if pane == "wants" || pane == "features" || pane == "knowledge"
-                || pane == "overview"
+                || pane == "overview" || pane == "capture" || pane == "plan"
             {
                 0
             } else {
@@ -70,6 +72,12 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             if pane == "wants" {
                 return ui! { WantsView(console = console) };
             }
+            if pane == "capture" {
+                return ui! { CaptureView(console = console) };
+            }
+            if pane == "plan" {
+                return ui! { PlanEditor(console = console) };
+            }
             if pane == "features" {
                 return ui! { FeaturesView(console = console) };
             }
@@ -77,7 +85,7 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
                 return ui! { KnowledgeView(console = console) };
             }
             if features().get(fi).is_none() {
-                return empty_pane();
+                return empty_pane(console);
             }
             pane_body(console, fi, active_view)
         },
@@ -86,11 +94,12 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
 
 /// Shown before the first snapshot lands, or when the store holds no
 /// features yet.
-fn empty_pane() -> Element {
-    let (title, body) = if crate::model::loaded() {
+fn empty_pane(console: Console) -> Element {
+    let loaded = crate::model::loaded();
+    let (title, body) = if loaded {
         (
             "No features yet",
-            "Connect to the `mcpm` MCP server and call plan_feature to plan the first one.",
+            "Plan the first one here, or connect an agent to the `mcpm` MCP server and call plan_feature.",
         )
     } else {
         (
@@ -98,10 +107,14 @@ fn empty_pane() -> Element {
             "Start the API host: cargo run -p api --bin mcpm-web --features server",
         )
     };
+    let new_plan: Rc<dyn Fn()> = Rc::new(move || console.show_plan_editor());
     ui! {
         view(style = EmptyPane()) {
             Typography(content = title, kind = typography_kind::H2, weight = Some(FontWeight::SemiBold))
             Typography(content = body, kind = typography_kind::Body, muted = true)
+            if loaded {
+                Button(label = "New plan", on_click = new_plan)
+            }
         }
     }
 }
@@ -235,6 +248,7 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
     let console = props.console;
     let feats = features();
     let f = &feats[props.feature];
+    let feature_id = f.id.clone();
     let name = f.name.clone();
     let status = f.status;
     let agent = f.agent.to_string();
@@ -270,6 +284,7 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
                 }
                 Spacer()
                 FeatureSwitcher(console = console)
+                ActionMenu(console = console, id = "feature".to_string(), entries = feature_entries(&feature_id))
             }
             view(style = HeadMetaRow()) {
                 view(style = HeadTitleSlot()) {

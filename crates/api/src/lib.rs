@@ -187,6 +187,59 @@ pub struct WantPage {
     pub total: i64,
 }
 
+/// A plan as the console's editor composes it. Modules name their
+/// prerequisites by NAME within the draft — ids do not exist yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PlanDraft {
+    pub name: String,
+    pub description: String,
+    /// The plan as prose, or empty for none.
+    pub whitepaper: String,
+    pub modules: Vec<ModuleDraft>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModuleDraft {
+    pub name: String,
+    pub description: String,
+    pub tasks: Vec<String>,
+    /// Prerequisites, by module name within the draft.
+    pub depends_on: Vec<String>,
+    pub owns: Vec<String>,
+}
+
+/// One plan-surgery operation, mirroring `mcpm_core::PlanOp` on the
+/// wire so the console can send exactly what an agent's `revise_plan`
+/// can. Applied in a batch, atomically or not at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PlanOpDto {
+    AddModule {
+        name: String,
+        description: String,
+        tasks: Vec<String>,
+        /// Prerequisites by module id.
+        depends_on: Vec<String>,
+        owns: Vec<String>,
+    },
+    AddTask { module_id: String, name: String },
+    AddDependency { module_id: String, depends_on: String },
+    RemoveDependency { module_id: String, depends_on: String },
+    UpdateModule { id: String, description: String, owns: Vec<String> },
+    UpdateFeature { description: String },
+    Rename { id: String, name: String },
+    Remove { id: String },
+}
+
+/// What one console write did, in a line the screen can show.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WriteResult {
+    pub message: String,
+    /// The id the write produced or touched, when there is one — a
+    /// new plan's feature id, say, so the console can open it.
+    pub id: String,
+}
+
 /// One current document revision: a feature's whitepaper or a
 /// module's handoff. Markdown in `body`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -769,9 +822,9 @@ pub async fn load_events(
     })
 }
 
-/// One page of the pool. `status` is one of all / open / promoted /
-/// declined; every tag in `tags` must be present; `query` is a
-/// full-text search, ranked when non-empty.
+/// One page of the pool. `statuses` is any set of open / promoted /
+/// declined (empty means every state); every tag in `tags` must be
+/// present; `query` is a full-text search, ranked when non-empty.
 ///
 /// Paged server-side for the same reason the knowledge base is: the
 /// pool grows without bound, and the filter that makes it useful runs
@@ -780,21 +833,19 @@ pub async fn load_events(
 #[server]
 pub async fn search_wants(
     query: String,
-    status: String,
+    statuses: Vec<String>,
     tags: Vec<String>,
     page: i64,
 ) -> Result<WantPage, ServerError> {
     let store = server::use_state::<mcpm_core::Store>()
         .ok_or_else(|| ServerError::failed("Store not installed"))?;
     const PER_PAGE: i64 = 20;
-    let filter = match status.as_str() {
-        "open" => mcpm_core::WantFilter::Open,
-        "promoted" => mcpm_core::WantFilter::Promoted,
-        "declined" => mcpm_core::WantFilter::Declined,
-        _ => mcpm_core::WantFilter::All,
-    };
+    let statuses: Vec<String> = statuses
+        .into_iter()
+        .filter(|s| matches!(s.as_str(), "open" | "promoted" | "declined"))
+        .collect();
     let found = store
-        .search_wants(&query, filter, &tags, page.max(0) * PER_PAGE, PER_PAGE)
+        .search_wants(&query, &statuses, &tags, page.max(0) * PER_PAGE, PER_PAGE)
         .await
         .map_err(fail)?;
     Ok(WantPage {
@@ -810,6 +861,201 @@ pub async fn load_want(want_id: String) -> Result<WantDto, ServerError> {
     let store = server::use_state::<mcpm_core::Store>()
         .ok_or_else(|| ServerError::failed("Store not installed"))?;
     Ok(want_dto(&store.get_want(&want_id).await.map_err(fail)?))
+}
+
+// ---------------------------------------------------------------------
+// Writes from the console
+// ---------------------------------------------------------------------
+//
+// A person at the console plans, edits and deletes by hand. Every write
+// below goes through the same store methods the MCP tools use, so the
+// invariants (a plan's cycle and ownership checks, "history is not
+// deleted", a promoted want is frozen) hold for a click exactly as for
+// an agent — nothing is re-derived here.
+
+/// Who may plan from the console: a person (an open loopback host, or a
+/// console key) or a manager key. A worker key is refused — workers are
+/// dispatched, they do not plan — and that is the one rule this surface
+/// adds to the store's own.
+#[cfg(feature = "server")]
+fn require_planner(caller: &Caller) -> Result<(), ServerError> {
+    match caller.role {
+        Some(mcpm_core::KeyRole::Worker) => Err(ServerError::failed(
+            "A worker key cannot plan or edit from the console.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Plan a feature from the console's editor. Returns the new feature's
+/// id so the console can open it.
+#[server]
+pub async fn create_plan(
+    draft: PlanDraft,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let plan = mcpm_core::PlanFeature {
+        name: draft.name.trim().to_string(),
+        description: draft.description.trim().to_string(),
+        whitepaper: Some(draft.whitepaper.trim().to_string()).filter(|w| !w.is_empty()),
+        modules: draft
+            .modules
+            .into_iter()
+            .map(|m| mcpm_core::PlanModule {
+                name: m.name.trim().to_string(),
+                description: m.description.trim().to_string(),
+                tasks: m.tasks,
+                depends_on: m.depends_on,
+                owns: m.owns,
+            })
+            .collect(),
+        stages: Vec::new(),
+    };
+    let tree = store.plan_feature(&caller.name, plan).await.map_err(fail)?;
+    Ok(WriteResult {
+        message: format!("Planned '{}' with {} modules.", tree.name, tree.modules.len()),
+        id: tree.id,
+    })
+}
+
+/// Revise a plan: one or more operations, atomically or not at all.
+#[server]
+pub async fn revise_plan(
+    feature_id: String,
+    ops: Vec<PlanOpDto>,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ops: Vec<mcpm_core::PlanOp> = ops
+        .into_iter()
+        .map(|op| match op {
+            PlanOpDto::AddModule { name, description, tasks, depends_on, owns } => {
+                mcpm_core::PlanOp::AddModule { name, description, tasks, depends_on, owns }
+            }
+            PlanOpDto::AddTask { module_id, name } => {
+                mcpm_core::PlanOp::AddTask { module_id, name, note: None }
+            }
+            PlanOpDto::AddDependency { module_id, depends_on } => {
+                mcpm_core::PlanOp::AddDependency { module_id, depends_on }
+            }
+            PlanOpDto::RemoveDependency { module_id, depends_on } => {
+                mcpm_core::PlanOp::RemoveDependency { module_id, depends_on }
+            }
+            PlanOpDto::UpdateModule { id, description, owns } => mcpm_core::PlanOp::UpdateModule {
+                id,
+                description: Some(description),
+                owns: Some(owns),
+            },
+            PlanOpDto::UpdateFeature { description } => {
+                mcpm_core::PlanOp::UpdateFeature { description }
+            }
+            PlanOpDto::Rename { id, name } => mcpm_core::PlanOp::Rename { id, name },
+            PlanOpDto::Remove { id } => mcpm_core::PlanOp::Remove { id },
+        })
+        .collect();
+    let count = ops.len();
+    store.revise_plan(&caller.name, &feature_id, ops).await.map_err(fail)?;
+    Ok(WriteResult {
+        message: format!("Plan revised ({count} change{}).", if count == 1 { "" } else { "s" }),
+        id: feature_id,
+    })
+}
+
+/// Delete a plan nothing has been done in. See `Store::delete_feature`.
+#[server]
+pub async fn delete_plan(
+    feature_id: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ack = store.delete_feature(&caller.name, &feature_id).await.map_err(fail)?;
+    Ok(WriteResult { message: ack.message, id: String::new() })
+}
+
+/// Park a feature, or take it back off the shelf.
+#[server]
+pub async fn shelve_plan(
+    feature_id: String,
+    shelve: bool,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ack = store.shelve_feature(&caller.name, &feature_id, shelve).await.map_err(fail)?;
+    Ok(WriteResult { message: ack.message, id: feature_id })
+}
+
+/// Revise a want's wording and tags. Tags are the console's `#tag`
+/// syntax split out already; an empty `body` leaves the wording alone
+/// (a composed want's is frozen, and the form does not offer it).
+#[server]
+pub async fn edit_want(
+    want_id: String,
+    body: String,
+    tags: Vec<String>,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let current = store.get_want(&want_id).await.map_err(fail)?;
+    // Only what changed is sent on: the store refuses a body edit on a
+    // promoted want, and an unchanged body must not count as one.
+    let body = Some(body.trim().to_string()).filter(|b| !b.is_empty() && *b != current.body);
+    let tags = Some(tags).filter(|t| *t != current.tags);
+    if body.is_none() && tags.is_none() {
+        return Ok(WriteResult { message: "Nothing changed.".to_string(), id: want_id });
+    }
+    let edit = mcpm_core::WantEdit { body, tags, state: None, reason: None };
+    let want = store.update_want(&caller.name, &want_id, edit).await.map_err(fail)?;
+    Ok(WriteResult { message: "Want updated.".to_string(), id: want.id })
+}
+
+/// Decline a want (`declined`, with `reason`) or reopen it (`open`).
+#[server]
+pub async fn set_want_state(
+    want_id: String,
+    state: String,
+    reason: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let (state, message) = match state.as_str() {
+        "open" => (mcpm_core::WantState::Open, "Want reopened."),
+        "declined" => (mcpm_core::WantState::Declined, "Want declined."),
+        other => return Err(ServerError::failed(format!("Unknown want state '{other}'."))),
+    };
+    let edit = mcpm_core::WantEdit {
+        body: None,
+        tags: None,
+        state: Some(state),
+        reason: Some(reason).filter(|r| !r.trim().is_empty()),
+    };
+    let want = store.update_want(&caller.name, &want_id, edit).await.map_err(fail)?;
+    Ok(WriteResult { message: message.to_string(), id: want.id })
+}
+
+/// Remove a loose or declined want. See `Store::delete_want`.
+#[server]
+pub async fn delete_want(
+    want_id: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ack = store.delete_want(&caller.name, &want_id).await.map_err(fail)?;
+    Ok(WriteResult { message: ack.message, id: String::new() })
 }
 
 #[cfg(feature = "server")]
@@ -1190,6 +1436,10 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
             "Feature closed".to_string(),
             format!("'{}' completed every module.", s("name")),
         ),
+        "feature_deleted" => (format!("Plan deleted: {}", s("feature")), String::new()),
+        "feature_shelved" => (format!("Feature shelved: {}", s("feature")), String::new()),
+        "feature_unshelved" => (format!("Feature unshelved: {}", s("feature")), String::new()),
+        "want_deleted" => (format!("Want deleted: {}", s("body")), String::new()),
         "wants_promoted" => (
             format!(
                 "Composed from {} want(s)",

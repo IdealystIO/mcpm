@@ -226,6 +226,20 @@ of the `server` SDK, and only running one hides breakage in the other.
   body, 500 events per feature, on every tick), and it did not scale.
   A tick's `feature_id`/`kind` are what let the client skip the tree
   refetch, so the notify trigger must keep sending them.
+- **A console write is a server function that calls a store method,
+  and nothing else.** `create_plan`, `revise_plan`, `delete_plan`,
+  `shelve_plan`, `edit_want`, `set_want_state`, `delete_want` in
+  `crates/api` map their arguments onto `mcpm_core::PlanOp` and friends
+  and stop; the one rule they add is `require_planner` (a worker key
+  cannot plan). A check that only the console makes is a check an agent
+  never hits, and the two surfaces then disagree about what a plan may
+  be. On the console side every edit goes through `components/edits.rs`:
+  the form buffers live on `Console` (`form_*`, the plan editor's
+  slots), and the request runs in `ActionRunner`, a hole keyed on
+  `action_seq` — never from the button's own handler (UX_GUIDELINES
+  rule 25). A `#[server]` fn's arguments are sent as a JSON array on
+  the wire (`'["feat_x", true]'`), and the reply is `{"Ok": …}` /
+  `{"Err": …}` — what to send when you curl one.
 - **The capture syntax is defined once**, in `crates/api/src/capture.rs`,
   and used by both the editor's highlighting and the server function
   that writes. Never add a second parser — drift between them means the

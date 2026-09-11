@@ -60,6 +60,7 @@ impl Status {
 }
 
 pub struct Task {
+    pub id: String,
     pub label: String,
     pub done: bool,
     pub added: bool,
@@ -232,6 +233,9 @@ pub struct Feature {
     pub name: String,
     pub description: String,
     pub status: Status,
+    /// Parked. Shown as queued like any other idle feature; the menu
+    /// offers the reverse verb.
+    pub shelved: bool,
     pub agent: String,
     pub elapsed: String,
     pub modules_done: usize,
@@ -787,6 +791,7 @@ fn rebuild(cur: &mut Current) {
                 name: r.name.clone(),
                 description: detail.map(|d| d.description.clone()).unwrap_or_default(),
                 status,
+                shelved: r.status == "shelved",
                 agent: r.created_by.clone().unwrap_or_else(|| "\u{2014}".into()),
                 elapsed,
                 modules_done: r.modules_done.max(0) as usize,
@@ -878,6 +883,9 @@ fn event_display(kind: &str) -> (&'static str, Status) {
         "blocker_reported" => ("blocker", Status::Violation),
         "module_released" => ("module", Status::Queued),
         "feature_done" => ("feature", Status::Done),
+        "feature_deleted" | "feature_shelved" => ("feature", Status::Queued),
+        "feature_unshelved" => ("feature", Status::Planning),
+        "want_deleted" => ("want", Status::Queued),
         "memory_committed" => ("memory", Status::Running),
         "wants_promoted" => ("wants", Status::Planning),
         "want_added" | "want_updated" | "want_reopened" => ("want", Status::Planning),
@@ -961,6 +969,7 @@ fn map_module(m: &api::ModuleDto) -> Module {
             .tasks
             .iter()
             .map(|t| Task {
+                id: t.id.clone(),
                 label: t.name.clone(),
                 done: t.status == "done" || t.status == "skipped",
                 added: t.origin == "discovered",

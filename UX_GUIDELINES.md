@@ -468,3 +468,25 @@ the window.
 
 The tell is a screen that stopped scrolling without anyone touching its
 scroller — look up the tree, not at the `scroll_view`.
+
+### 28. A registry renders once per screen, and a filter over it is a menu
+
+A registry — tags, people, kinds — is the kind of list that grows into
+the hundreds. Laid out flat it is a wall, and laid out flat twice on
+one screen (once as the labels you can file with, once as the chips you
+can filter by) it is two walls that say the same thing and push the
+content they serve off the bottom.
+
+- The **whole** registry shows in at most one place per screen, and
+  only where the reader picks from it to *write* (filing a capture).
+  Put the writing surface and the reading surface on different
+  screens when both need it.
+- A **filter** over a registry lives in the toolbar's Filter menu
+  (rule 6): a searchable list of toggles, with the *active* picks
+  echoed as chips beside the search field. The chips are the only
+  part of the registry the list screen shows.
+- A set of states is the same shape: toggles in the menu, not a tab
+  strip. Tabs say "one of"; a reader who wants loose *and* declined
+  ideas together should not need a fourth tab named for that pair.
+  Default the set to what the screen is for (an inbox shows the
+  unread).

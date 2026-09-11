@@ -10,15 +10,16 @@
 use idea_ui::{tone, typography_kind, variant, Badge, Grid, IdeaThemeRef, Spacer, Stack,
     StackAlign, StackAxis, StackGap, Tag, Typography};
 use runtime_core::{
-    component, presence, pressable, stylesheet, ui, AlignItems, Easing, Element, FlexDirection,
-    FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, Position, PresenceAnim,
-    PresenceState, StyleApplication,
+    component, presence, pressable, stylesheet, ui, AlignItems, Cursor, Easing, Element,
+    FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, Position,
+    PresenceAnim, PresenceState, StyleApplication,
 };
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
 use crate::components::document::DocumentView;
+use crate::components::edits::{module_entries, want_entries, ActionMenu};
 use crate::model::{features, module_detail, want_by_id};
-use crate::state::Console;
+use crate::state::{Console, Edit};
 use crate::styles::{MonoTextSize, MonoTextTone, SectionLabel};
 
 /// Props for [`Drawer`].
@@ -76,6 +77,9 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
     let feats = features();
     let f = &feats[fi];
     let m = &f.modules[mi];
+    let feature_id = f.id.clone();
+    let module_id = m.id.clone();
+    let entries = module_entries(&feature_id, &module_id);
 
     let path = format!("{}  \u{25b8}  Module", f.name);
     let name = m.name.clone();
@@ -101,8 +105,11 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
     let has_prereqs = !prereqs.is_empty();
     let owns: Vec<String> = m.owns.clone();
     let has_owns = !owns.is_empty();
-    let tasks: Vec<(String, bool, bool)> =
-        m.tasks.iter().map(|t| (t.label.to_string(), t.done, t.added)).collect();
+    let tasks: Vec<(String, String, bool, bool)> = m
+        .tasks
+        .iter()
+        .map(|t| (t.id.clone(), t.label.to_string(), t.done, t.added))
+        .collect();
     let summary = m.summary.clone().unwrap_or_default();
     let has_summary = !summary.is_empty();
     // The handoff and history are their own read, fetched when the
@@ -160,6 +167,7 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                                 }
                             }
                             Spacer()
+                            ActionMenu(console = console, id = format!("module:{module_id}"), entries = entries.clone())
                             close
                         }
 
@@ -187,7 +195,13 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                                 Typography(content = "None.", kind = typography_kind::BodySm, muted = true)
                             }
                             for (index, waiting) in prereqs {
-                                PrereqRow(console = console, feature = fi, module = index, waiting = waiting)
+                                PrereqRow(
+                                    console = console,
+                                    feature = fi,
+                                    module = index,
+                                    waiting = waiting,
+                                    dependent = module_id.clone(),
+                                )
                             }
                         }
 
@@ -206,8 +220,15 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                                 Spacer()
                                 Typography(content = task_label, kind = typography_kind::Caption, muted = true)
                             }
-                            for (label, task_done, task_added) in tasks {
-                                TaskRow(label = label, done = task_done, added = task_added)
+                            for (task_id, label, task_done, task_added) in tasks {
+                                TaskRow(
+                                    console = console,
+                                    feature = feature_id.clone(),
+                                    task = task_id,
+                                    label = label,
+                                    done = task_done,
+                                    added = task_added,
+                                )
                             }
                         }
 
@@ -254,6 +275,8 @@ pub struct PrereqRowProps {
     pub module: usize,
     /// Whether this prerequisite is still holding the open module back.
     pub waiting: bool,
+    /// The open module — the one that waits — by id, for the remove.
+    pub dependent: String,
 }
 
 /// One prerequisite of the open module. Pressing it moves the drawer
@@ -271,6 +294,17 @@ pub fn PrereqRow(props: &PrereqRowProps) -> Element {
     let status = m.status;
     let waiting = props.waiting;
     let id = m.id.clone();
+    let edge = Edit::RemoveDependency {
+        feature: feats[props.feature].id.clone(),
+        module: props.dependent.clone(),
+        depends_on: id.clone(),
+    };
+    let remove = pressable(
+        vec![ui! { text(style = RemoveGlyph()) { "\u{d7}" } }],
+        move || crate::components::edits::choose(console, edge.clone()),
+    )
+    .with_style(StyleApplication::new(remove_box_style()))
+    .into_element();
 
     let inner: Element = ui! {
         view(style = PrereqInner()) {
@@ -284,10 +318,15 @@ pub fn PrereqRow(props: &PrereqRowProps) -> Element {
             text(style = PrereqChevron()) { "\u{203a}" }
         }
     };
-
-    pressable(vec![inner], move || console.open_module(&id))
+    let row = pressable(vec![inner], move || console.open_module(&id))
         .with_style(StyleApplication::new(prereq_box_style()))
-        .into_element()
+        .into_element();
+    ui! {
+        view(style = PrereqLine()) {
+            row
+            remove
+        }
+    }
 }
 
 /// Props for [`WantDrawer`].
@@ -358,6 +397,8 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
         crate::model::WantState::Promoted => "Composed",
         crate::model::WantState::Declined => "Declined",
     };
+    let entries = want_entries(&w);
+    let menu_id = format!("want:{id}");
 
     let close = pressable(
         vec![ui! { text(style = CloseGlyph()) { "\u{d7}" } }],
@@ -384,6 +425,7 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
                                 }
                             }
                             Spacer()
+                            ActionMenu(console = console, id = menu_id.clone(), entries = entries.clone())
                             close
                         }
 
@@ -529,6 +571,12 @@ pub fn StatCell(props: &StatCellProps) -> Element {
 /// Props for [`TaskRow`].
 #[derive(Default, IdealystSchema)]
 pub struct TaskRowProps {
+    /// Console state handles.
+    pub console: Console,
+    /// The feature the task's module is in.
+    pub feature: String,
+    /// The task's id.
+    pub task: String,
     /// Task text.
     pub label: String,
     /// Checked off?
@@ -540,9 +588,21 @@ pub struct TaskRowProps {
 /// One checklist row in the drawer.
 #[component]
 pub fn TaskRow(props: &TaskRowProps) -> Element {
+    let console = props.console;
     let label = props.label.clone();
     let done = props.done;
     let added = props.added;
+    // A resolved task is history and cannot be removed; the control
+    // is absent rather than present and refused.
+    let edit = Edit::RemoveTask { feature: props.feature.clone(), task: props.task.clone() };
+    let remove: Option<Element> = (!done).then(|| {
+        pressable(
+            vec![ui! { text(style = RemoveGlyph()) { "\u{d7}" } }],
+            move || crate::components::edits::choose(console, edit.clone()),
+        )
+        .with_style(StyleApplication::new(remove_box_style()))
+        .into_element()
+    });
     let box_style = TaskBoxSheet().done(if done { TaskBoxSheetDone::Yes } else { TaskBoxSheetDone::No });
     let text_style = TaskText().done(if done { TaskTextDone::Yes } else { TaskTextDone::No });
     ui! {
@@ -558,6 +618,48 @@ pub fn TaskRow(props: &TaskRowProps) -> Element {
             if added {
                 Badge(label = "agent-added", tone = tone::Info)
             }
+            if let Some(control) = remove {
+                control
+            }
+        }
+    }
+}
+
+stylesheet! {
+    pub PrereqLine<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            gap: t.spacing.xs(),
+        }
+    }
+}
+
+stylesheet! {
+    pub RemoveBox<IdeaThemeRef> {
+        base(t) {
+            width: 24,
+            height: 24,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            border_radius: t.radius.sm(),
+            cursor: Cursor::Pointer,
+            flex_shrink: 0.0,
+        }
+        transitions {
+            background: 120ms EaseOut,
+        }
+        state hovered(t) {
+            background: t.color.surface_alt(),
+        }
+    }
+}
+
+stylesheet! {
+    pub RemoveGlyph<IdeaThemeRef> {
+        base(t) {
+            font_size: 15,
+            color: t.color.text_muted(),
         }
     }
 }

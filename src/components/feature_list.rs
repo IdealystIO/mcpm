@@ -116,6 +116,7 @@ pub fn FeaturesView(props: &FeaturesViewProps) -> Element {
         },
     );
 
+    let new_plan: Rc<dyn Fn()> = Rc::new(move || console.show_plan_editor());
     ui! {
         view(style = ScreenBox()) {
             view(style = ScreenHead()) {
@@ -124,7 +125,10 @@ pub fn FeaturesView(props: &FeaturesViewProps) -> Element {
                     kind = typography_kind::H2,
                     weight = Some(FontWeight::SemiBold),
                 )
-                head
+                view(style = HeadActions()) {
+                    head
+                    Button(label = "New plan", on_click = new_plan, size = size::Sm)
+                }
             }
             scroll_view(style = ScreenScroll()) {
                 view(style = ScreenPad()) {
@@ -295,6 +299,17 @@ stylesheet! {
             border_bottom_width: 1.0,
             border_color: t.color.border(),
             background: t.color.surface(),
+        }
+    }
+}
+
+stylesheet! {
+    pub HeadActions<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::FlexEnd,
+            flex_wrap: FlexWrap::Wrap,
+            gap: t.spacing.xl(),
         }
     }
 }

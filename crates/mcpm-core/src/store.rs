@@ -492,6 +492,133 @@ impl Store {
         self.feature_tree(feature_id).await
     }
 
+    /// Remove a feature and its plan outright. Refused the moment any
+    /// work has happened in it — a claimed, blocked or completed
+    /// module, or a task checked off — because that work is history
+    /// and history is not deleted; shelve the feature instead.
+    ///
+    /// The wants it was composed from are released back to the pool by
+    /// the link table's cascade. Its documents go with it: a whitepaper
+    /// for a plan that never started is the plan, not a record of work.
+    /// The ledger keeps its rows — an event's feature reference is a
+    /// plain text column, so the deletion is itself recorded against
+    /// the id and the earlier planning events stay readable.
+    pub async fn delete_feature(&self, agent: &str, feature_id: &str) -> Result<Ack> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id, name FROM features WHERE id = $1 FOR UPDATE")
+            .bind(feature_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| McpmError::not_found("feature", feature_id))?;
+        let name: String = row.get("name");
+        let worked: i64 = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM modules m
+                     WHERE m.feature_id = $1 AND m.status <> 'todo')
+                  + (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
+                     WHERE m.feature_id = $1 AND t.status <> 'open') AS worked",
+        )
+        .bind(feature_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("worked");
+        if worked > 0 {
+            return Err(plan_conflict(
+                "Work has happened in this feature — a module was claimed or a task checked \
+                 off — and that is history. Shelve the feature instead of deleting it.",
+            ));
+        }
+        sqlx::query(
+            "DELETE FROM documents d
+             WHERE (d.level = 'feature' AND d.subject_id = $1)
+                OR (d.level = 'module' AND d.subject_id IN
+                    (SELECT id FROM modules WHERE feature_id = $1))",
+        )
+        .bind(feature_id)
+        .execute(&mut *tx)
+        .await?;
+        // Modules, tasks, edges and want links cascade from the row.
+        sqlx::query("DELETE FROM features WHERE id = $1")
+            .bind(feature_id)
+            .execute(&mut *tx)
+            .await?;
+        record_event(
+            &mut tx,
+            "feature_deleted",
+            Some(feature_id),
+            Some(feature_id),
+            Some(agent),
+            json!({ "feature": name }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Ack {
+            ok: true,
+            message: format!("Feature '{name}' deleted; its wants are loose again."),
+            data: serde_json::Value::Null,
+        })
+    }
+
+    /// Park a feature (`shelved`) or take it back off the shelf
+    /// (`planning`). Refused while a module is held: a shelf is for
+    /// work nobody is doing, and an agent mid-module would otherwise
+    /// finish into a feature that says it is parked.
+    pub async fn shelve_feature(&self, agent: &str, feature_id: &str, shelve: bool) -> Result<Ack> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT id, name, status FROM features WHERE id = $1 FOR UPDATE")
+            .bind(feature_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| McpmError::not_found("feature", feature_id))?;
+        let name: String = row.get("name");
+        let status: String = row.get("status");
+        if status == "done" {
+            return Err(plan_conflict("A completed feature is history; it cannot be shelved."));
+        }
+        let held: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM modules WHERE feature_id = $1 AND status IN ('in_progress', 'blocked')",
+        )
+        .bind(feature_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .get(0);
+        if shelve && held > 0 {
+            return Err(plan_conflict(
+                "A module of this feature is still held by an agent. Wait for it to complete \
+                 or release, then shelve.",
+            ));
+        }
+        // Coming off the shelf lands in `planning`; the first claim
+        // moves it to `in_progress` exactly as it would a new plan.
+        let next = if shelve { "shelved" } else { "planning" };
+        if status == next {
+            return Ok(Ack {
+                ok: true,
+                message: format!("Feature '{name}' is already {next}."),
+                data: serde_json::Value::Null,
+            });
+        }
+        sqlx::query("UPDATE features SET status = $2 WHERE id = $1")
+            .bind(feature_id)
+            .bind(next)
+            .execute(&mut *tx)
+            .await?;
+        record_event(
+            &mut tx,
+            if shelve { "feature_shelved" } else { "feature_unshelved" },
+            Some(feature_id),
+            Some(feature_id),
+            Some(agent),
+            json!({ "feature": name }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Ack {
+            ok: true,
+            message: format!("Feature '{name}' is now {next}."),
+            data: serde_json::Value::Null,
+        })
+    }
+
     /// Close the feature. Refuses while any module is unfinished.
     pub async fn complete_feature(&self, agent: &str, feature_id: &str, summary: &str) -> Result<Ack> {
         let mut tx = self.pool.begin().await?;
@@ -2158,7 +2285,7 @@ impl Store {
 
         // Re-read in capture order (select_wants sorts newest-first).
         let mut wants = self
-            .select_wants("", WantFilter::All, &[], &ids, None, 0, ids.len() as i64)
+            .select_wants("", &[], &[], &ids, None, 0, ids.len() as i64)
             .await?
             .0;
         wants.sort_by_key(|w| ids.iter().position(|id| *id == w.id).unwrap_or(usize::MAX));
@@ -2224,7 +2351,7 @@ impl Store {
     /// Read one want by id.
     /// Read one want by id.
     pub async fn get_want(&self, id: &str) -> Result<Want> {
-        self.select_wants("", WantFilter::All, &[], &[id.to_string()], None, 0, 1)
+        self.select_wants("", &[], &[], &[id.to_string()], None, 0, 1)
             .await?
             .0
             .pop()
@@ -2241,7 +2368,9 @@ impl Store {
         tags: &[String],
         limit: i64,
     ) -> Result<WantPool> {
-        let (wants, _) = self.select_wants(query, filter, tags, &[], None, 0, limit).await?;
+        let (wants, _) = self
+            .select_wants(query, &filter.statuses(), tags, &[], None, 0, limit)
+            .await?;
         let counts = self.want_counts().await?;
         let open = counts.open;
         let note = if open == 0 {
@@ -2286,23 +2415,27 @@ impl Store {
     /// One page of the pool under the same filters as [`Self::list_wants`],
     /// with what the filters matched in total — the console's read,
     /// which pages where an agent takes the top of the list.
+    ///
+    /// `statuses` is a set — any of `open` / `promoted` / `declined` —
+    /// and an empty set means every state, so a reader can look at
+    /// loose and declined ideas together without a third filter word.
     pub async fn search_wants(
         &self,
         query: &str,
-        filter: WantFilter,
+        statuses: &[String],
         tags: &[String],
         offset: i64,
         limit: i64,
     ) -> Result<WantSearch> {
         let (wants, mut total) = self
-            .select_wants(query, filter, tags, &[], None, offset.max(0), limit)
+            .select_wants(query, statuses, tags, &[], None, offset.max(0), limit)
             .await?;
         // A page past the end has no row to read the window count off,
         // and "zero" there would tell a pager the pool had emptied when
         // the reader had only outrun it. Page one always knows.
         if wants.is_empty() && offset > 0 {
             total = self
-                .select_wants(query, filter, tags, &[], None, 0, 1)
+                .select_wants(query, statuses, tags, &[], None, 0, 1)
                 .await?
                 .1;
         }
@@ -2312,7 +2445,7 @@ impl Store {
     /// Every want a feature was composed from (oldest link first).
     pub async fn wants_of_feature(&self, feature_id: &str) -> Result<Vec<Want>> {
         Ok(self
-            .select_wants("", WantFilter::All, &[], &[], Some(feature_id), 0, 200)
+            .select_wants("", &[], &[], &[], Some(feature_id), 0, 200)
             .await?
             .0)
     }
@@ -2436,6 +2569,39 @@ impl Store {
         self.get_want(id).await
     }
 
+    /// Remove a want from the pool. Refused once a feature has absorbed
+    /// it — the plan quotes it, and the record of what was asked must
+    /// outlive the asking. A loose or declined idea is the author's to
+    /// take back.
+    pub async fn delete_want(&self, agent: &str, id: &str) -> Result<Ack> {
+        let current = self.get_want(id).await?;
+        if current.status == "promoted" {
+            return Err(want_promoted(
+                &current,
+                "A feature was composed from it, so deleting it would leave the plan quoting \
+                 nothing.",
+                "Leave it as the record of what was asked. If the work should not happen, \
+                 shelve or revise the FEATURE.",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM wants WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        record_event(
+            &mut tx,
+            "want_deleted",
+            None,
+            Some(id),
+            Some(agent),
+            json!({ "body": current.body }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Ack { ok: true, message: "Want deleted.".to_string(), data: serde_json::Value::Null })
+    }
+
     /// Compose wants into a feature — the one write that turns loose
     /// ideas into planned work.
     ///
@@ -2475,7 +2641,7 @@ impl Store {
         // refused whole, before anything is written.
         let ids: Vec<String> = req.wants.iter().map(|w| w.id.clone()).collect();
         let found = self
-            .select_wants("", WantFilter::All, &[], &ids, None, 0, ids.len() as i64)
+            .select_wants("", &[], &[], &ids, None, 0, ids.len() as i64)
             .await?
             .0;
         let missing: Vec<&String> = ids
@@ -2592,7 +2758,7 @@ impl Store {
         tx.commit().await?;
 
         let linked = self
-            .select_wants("", WantFilter::All, &[], &ids, None, 0, ids.len() as i64)
+            .select_wants("", &[], &[], &ids, None, 0, ids.len() as i64)
             .await?
             .0;
         Ok(Promotion {
@@ -2615,7 +2781,7 @@ impl Store {
     async fn select_wants(
         &self,
         query: &str,
-        filter: WantFilter,
+        statuses: &[String],
         tags: &[String],
         ids: &[String],
         feature_id: Option<&str>,
@@ -2648,7 +2814,7 @@ impl Store {
              FROM pool p
              WHERE ($1 = '' OR p.tsv @@ websearch_to_tsquery('english', $1))
                AND (cardinality($2::text[]) = 0 OR p.tags && $2)
-               AND ($3 = 'all' OR p.status = $3)
+               AND (cardinality($3::text[]) = 0 OR p.status = ANY($3))
                AND (cardinality($4::text[]) = 0 OR p.id = ANY($4))
                AND ($5::text IS NULL OR $5 = ANY(p.feature_ids))
              ORDER BY CASE WHEN $1 = '' THEN 0
@@ -2658,7 +2824,7 @@ impl Store {
         )
         .bind(query)
         .bind(tags)
-        .bind(filter.as_str())
+        .bind(statuses)
         .bind(ids)
         .bind(feature_id)
         .bind(limit.clamp(1, 500))
@@ -4399,6 +4565,14 @@ async fn apply_plan_op(
                 check_ownership(tx, feature_id).await?;
             }
             Ok(format!("update_module {id}"))
+        }
+        PlanOp::UpdateFeature { description } => {
+            sqlx::query("UPDATE features SET description = $2 WHERE id = $1")
+                .bind(feature_id)
+                .bind(description.trim())
+                .execute(&mut **tx)
+                .await?;
+            Ok(format!("update_feature {feature_id}"))
         }
         PlanOp::AddTask { module_id, name, note } => {
             let module = sqlx::query(

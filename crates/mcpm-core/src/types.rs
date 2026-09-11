@@ -99,6 +99,9 @@ pub enum PlanOp {
     },
     /// Rename any tree node by id.
     Rename { id: String, name: String },
+    /// Change the feature's own description. Its name goes through
+    /// `rename` with the feature id.
+    UpdateFeature { description: String },
     /// Remove a module/task. Refused when it holds completed or
     /// in-progress work. Removing a module drops its edges; a dependent
     /// simply loses that prerequisite.
@@ -958,6 +961,14 @@ pub enum WantFilter {
 }
 
 impl WantFilter {
+    /// The status set this filter names; empty for `All`.
+    pub fn statuses(self) -> Vec<String> {
+        match self {
+            WantFilter::All => Vec::new(),
+            other => vec![other.as_str().to_string()],
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             WantFilter::Open => "open",

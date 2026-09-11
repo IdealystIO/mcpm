@@ -221,8 +221,8 @@ The pool's invariants:
 
 ### Capturing from the console
 
-The want pool is the one place the console writes. Its capture card is a
-`code_editor` where **every line is its own want**. It highlights `#tag`
+The Capture screen is a `code_editor` where **every line is its own
+want**. It highlights `#tag`
 as you type: existing tags in the info tone, tags that do not exist yet
 in the success tone with a dotted underline, so "this will create a new
 tag" is visible before you commit. **Tab** completes the tag under the
@@ -238,6 +238,27 @@ That syntax is defined **once**, in `crates/api/src/capture.rs`, and
 used twice: the editor highlights with it, and the server function
 parses the same buffer with the same code when it writes. There is no
 second parser to drift, so what you saw colored is what lands.
+
+### Editing from the console
+
+A person at the console can do by hand what an agent does over MCP:
+plan a feature (the New plan screen — name, description, whitepaper,
+modules with tasks, prerequisites and owned paths), revise one (the
+`⋯` menu on a feature's header and in a module's drawer: rename,
+describe, add or remove modules, tasks and prerequisites, shelve),
+delete a plan, and edit, decline, reopen or delete a want (the `⋯` in
+the want drawer). Every one of these calls the same store method the
+matching tool does, so the rules are the store's: a plan with a cycle
+or overlapping owners is refused whole, a module that has been claimed
+cannot be removed, a feature with work in it cannot be deleted (shelve
+it), and a want a feature was composed from keeps its wording and cannot
+be declined or deleted. The refusal comes back in the store's own words
+and is shown in the form. A worker key cannot edit from the console;
+a console key, a manager key, or an open loopback host can.
+
+The pool itself is paged server-side and filtered by a menu: any set of
+states (loose by default — it is the inbox) and any set of tags,
+searched rather than listed.
 
 ### Tags
 
@@ -468,7 +489,7 @@ rotate or forget it.
 | `crates/mcpm-core` | Domain and Postgres store. The prerequisite gate, plan validation (cycles, ownership overlap), exclusive claims, checklist-proven completion, documents, the want pool, the append-only event ledger, and scoped memory search. Every invariant is enforced inside a transaction. |
 | `crates/mcpm-mcp` | The MCP server: 30 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, the `#[server]` functions and `#[subscription]` the console calls, plus the `mcpm-web` host binary (feature-gated). |
-| `src/` | The Idealyst console: want pool with capture composer, the module graph, the whitepaper, live feed, composed-from, and the module and want drawers. |
+| `src/` | The Idealyst console: the want pool and capture screens, the plan editor, the module graph, the whitepaper, live feed, composed-from, the module and want drawers, and the edit menus on each. |
 
 ## Development
 

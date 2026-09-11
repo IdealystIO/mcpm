@@ -1,22 +1,29 @@
-//! The want pool: the project-level inbox of loose ideas, and the
-//! record of which ones were composed into which features.
+//! The want pool and the capture screen.
 //!
-//! A filtered, paginated table — the pool grows without bound, so it
-//! gets a toolbar (text, status, tags) and pages rather than an
-//! ever-longer wall. Each row is a handle: the want in its author's
-//! words plus what you filter by, with every other property one click
-//! away in the want drawer.
+//! Two screens for two jobs. The **pool** is the project-level inbox
+//! of loose ideas and the record of which ones were composed into
+//! which features: a filtered, paginated table — the pool grows
+//! without bound, so it gets a search field, a filter menu and pages
+//! rather than an ever-longer wall. Each row is a handle: the want in
+//! its author's words plus what you filter by, with every other
+//! property one click away in the want drawer. The **capture** screen
+//! is the composer, with the tag registry beside it for filing.
 //!
-//! Capture is the one write here; composition and declines are MCP
-//! calls (`promote_wants`, `update_want`).
+//! They were one screen once, and the tag registry rendered twice on
+//! it — once as filing labels for the composer, once as filter chips
+//! for the table — a hundred chips each. The filter's tags now live in
+//! the filter menu, searchable, and the composer's rail is the only
+//! place the whole registry shows.
 
 use std::rc::Rc;
 
-use idea_ui::{tone, typography_kind, variant, Button, Field, IdeaThemeRef, SegmentOption,
-    SegmentedControl, Spacer, Table, TableCell, TableRow, Tag, Typography};
+use idea_ui::{size, tone, typography_kind, variant, Button, Field, IdeaThemeRef, Menu,
+    MenuItem, MenuLabel, MenuSeparator, Spacer, Table, TableCell, TableRow, Tag, Typography};
+use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    component, pressable, rx, stylesheet, switch, ui, AlignItems, Element, FlexDirection,
-    FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, StyleApplication,
+    component, pressable, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
+    FontWeight, IdealystSchema, IntoElement, JustifyContent, PressableHandle, Ref,
+    StyleApplication,
 };
 
 use crate::components::bits::{Pager, StatusDot};
@@ -29,6 +36,17 @@ use crate::styles::SectionLabel;
 /// not render unbounded.
 const PAGE_SIZE: usize = crate::app::POOL_PAGE;
 
+/// The three states a want can be in, as the filter names them.
+const STATES: [(&str, &str); 3] = [
+    ("open", "Loose"),
+    ("promoted", "Composed"),
+    ("declined", "Declined"),
+];
+
+fn state_label(status: &str) -> &'static str {
+    STATES.iter().find(|(id, _)| *id == status).map(|(_, l)| *l).unwrap_or("")
+}
+
 /// Props for [`WantsView`].
 #[derive(Default, IdealystSchema)]
 pub struct WantsViewProps {
@@ -36,15 +54,11 @@ pub struct WantsViewProps {
     pub console: Console,
 }
 
-/// The pool: capture card, toolbar, table, pager.
-///
-/// The data-dependent parts sit inside `switch`es keyed on the poll
-/// revision and the filters; the [`Composer`] deliberately does not, so
-/// an agent's write landing mid-sentence cannot rebuild the text node
-/// you are typing into.
+/// The pool: counts, toolbar, table, pager.
 #[component]
 pub fn WantsView(props: &WantsViewProps) -> Element {
     let console = props.console;
+    let to_capture: Rc<dyn Fn()> = Rc::new(move || console.show_capture());
 
     let head = switch(
         move || console.rev.get(),
@@ -61,18 +75,10 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
     );
 
     let table = switch(
-        move || {
-            (
-                console.rev.get(),
-                console.pool_query.get(),
-                console.pool_status.get(),
-                console.pool_tags.get(),
-                console.pool_page.get(),
-            )
-        },
-        move |state: &(u64, String, String, Vec<String>, usize)| {
-            let (_rev, _query, _status, _tags, page) = state.clone();
-            // The page on screen is whatever the server sent for these
+        move || (console.rev.get(), console.pool_page.get()),
+        move |state: &(u64, usize)| {
+            let (_rev, page) = *state;
+            // The page on screen is whatever the server sent for the
             // filters — paged there, against the text index, because
             // the pool grows without bound (see `api::search_wants`).
             let total = want_total();
@@ -82,7 +88,6 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
             let page = page.min(pages - 1);
             let start = page * PAGE_SIZE;
             let shown = wants().len();
-            let visible: Vec<usize> = (0..shown).collect();
             let empty = shown == 0;
             let summary = if total == 0 {
                 "No wants match".to_string()
@@ -98,6 +103,8 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
                             TableCell(header = true, text = Some("State".to_string()))
                             TableCell(header = true, text = Some("Captured".to_string()))
                         }
+                        // The blank state goes INSIDE the table shell,
+                        // never a lone sentence where the table was.
                         if empty {
                             TableRow {
                                 TableCell(text = Some("No wants match".to_string()))
@@ -107,7 +114,7 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
                             }
                         }
                         for i in 0..shown {
-                            WantRow(console = console, want = visible[i])
+                            WantRow(console = console, want = i)
                         }
                     }
                     Pager(
@@ -125,18 +132,61 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
     ui! {
         view(style = PoolBox()) {
             view(style = PoolHead()) {
-                Typography(
-                    content = "Want pool",
-                    kind = typography_kind::H2,
-                    weight = Some(FontWeight::SemiBold),
-                )
-                head
+                view(style = HeadLeft()) {
+                    Typography(
+                        content = "Want pool",
+                        kind = typography_kind::H2,
+                        weight = Some(FontWeight::SemiBold),
+                    )
+                }
+                view(style = HeadRight()) {
+                    head
+                    Button(label = "Capture wants", on_click = to_capture, size = size::Sm)
+                }
+            }
+            scroll_view(style = PoolScroll()) {
+                view(style = PoolPad()) {
+                    Toolbar(console = console)
+                    table
+                }
+            }
+        }
+    }
+}
+
+/// Props for [`CaptureView`].
+#[derive(Default, IdealystSchema)]
+pub struct CaptureViewProps {
+    /// Console state handles.
+    pub console: Console,
+}
+
+/// The capture screen: the composer, and the way back to the pool.
+///
+/// The [`Composer`] deliberately sits in no `switch` keyed on the poll
+/// revision, so an agent's write landing mid-sentence cannot rebuild
+/// the text node you are typing into.
+#[component]
+pub fn CaptureView(props: &CaptureViewProps) -> Element {
+    let console = props.console;
+    let to_pool: Rc<dyn Fn()> = Rc::new(move || console.show_wants());
+    ui! {
+        view(style = PoolBox()) {
+            view(style = PoolHead()) {
+                view(style = HeadLeft()) {
+                    Typography(
+                        content = "Capture",
+                        kind = typography_kind::H2,
+                        weight = Some(FontWeight::SemiBold),
+                    )
+                }
+                view(style = HeadRight()) {
+                    Button(label = "Open the pool", on_click = to_pool, size = size::Sm, variant = variant::Soft)
+                }
             }
             scroll_view(style = PoolScroll()) {
                 view(style = PoolPad()) {
                     Composer(console = console)
-                    Toolbar(console = console)
-                    table
                 }
             }
         }
@@ -150,26 +200,26 @@ pub struct ToolbarProps {
     pub console: Console,
 }
 
-/// Text, status and tag filters over the pool. Text and status hold
-/// their own signals, so only the tag rail is rebuilt on a poll.
+/// Search, then the filter menu, then the active filters as chips —
+/// the one toolbar grammar (UX_GUIDELINES rule 6). The search field
+/// holds its own signal, so only the chips rebuild on a change.
 #[component]
 pub fn Toolbar(props: &ToolbarProps) -> Element {
     let console = props.console;
     let on_query: Rc<dyn Fn(String)> = Rc::new(move |t| console.set_pool_query(t));
-    let on_status: Rc<dyn Fn(String)> = Rc::new(move |id| console.set_pool_status(id));
 
-    let tag_row = switch(
-        move || (console.rev.get(), console.pool_tags.get()),
-        move |state: &(u64, Vec<String>)| {
-            let (_rev, active) = state.clone();
-            let count = crate::model::tags().len();
-            if count == 0 {
-                return ui! { view {} };
-            }
+    let chips = switch(
+        move || (console.pool_status.get(), console.pool_tags.get()),
+        move |state: &(Vec<String>, Vec<String>)| {
+            let (statuses, tags) = state.clone();
+            let (ns, nt) = (statuses.len(), tags.len());
             ui! {
-                view(style = FilterTags()) {
-                    for i in 0..count {
-                        FilterTag(console = console, index = i, active = active.clone())
+                view(style = ChipRow()) {
+                    for i in 0..ns {
+                        ActiveChip(console = console, id = statuses[i].clone(), label = state_label(&statuses[i]).to_string(), tag = false)
+                    }
+                    for i in 0..nt {
+                        ActiveChip(console = console, id = tags[i].clone(), label = format!("#{}", tags[i]), tag = true)
                     }
                 }
             }
@@ -184,10 +234,10 @@ pub fn Toolbar(props: &ToolbarProps) -> Element {
                 console.pool_tags.get(),
             )
         },
-        move |state: &(String, String, Vec<String>)| {
-            let (query, status, tags) = state.clone();
-            let filtered = !query.is_empty() || status != "all" || !tags.is_empty();
-            if !filtered {
+        move |state: &(String, Vec<String>, Vec<String>)| {
+            let (query, statuses, tags) = state.clone();
+            let default = statuses == vec!["open".to_string()];
+            if query.is_empty() && default && tags.is_empty() {
                 return ui! { view {} };
             }
             let on_click: Rc<dyn Fn()> = Rc::new(move || console.clear_pool_filters());
@@ -195,7 +245,7 @@ pub fn Toolbar(props: &ToolbarProps) -> Element {
                 Button(
                     label = "Clear filters",
                     on_click = on_click,
-                    size = idea_ui::size::Sm,
+                    size = size::Sm,
                     variant = variant::Ghost,
                 )
             }
@@ -203,36 +253,162 @@ pub fn Toolbar(props: &ToolbarProps) -> Element {
     );
 
     ui! {
-        view(style = ToolbarBox()) {
-            view(style = ToolbarRow()) {
-                view(style = SearchSlot()) {
-                    Field(
-                        value = console.pool_query,
-                        on_change = on_query,
-                        placeholder = Some("Search wants".to_string()),
-                    )
-                }
-                SegmentedControl(
-                    value = rx!(console.pool_status.get()),
-                    on_change = on_status,
-                    options = vec![
-                        SegmentOption::new("all", "All"),
-                        SegmentOption::new("open", "Loose"),
-                        SegmentOption::new("promoted", "Composed"),
-                        SegmentOption::new("declined", "Declined"),
-                    ],
+        view(style = ToolbarRow()) {
+            view(style = SearchSlot()) {
+                Field(
+                    value = console.pool_query,
+                    on_change = on_query,
+                    placeholder = Some("Search wants".to_string()),
                 )
-                Spacer()
-                clear
             }
-            tag_row
+            FilterMenu(console = console)
+            chips
+            Spacer()
+            clear
         }
     }
 }
 
-/// Props for [`FilterTag`].
+/// Props for [`FilterMenu`].
 #[derive(Default, IdealystSchema)]
-pub struct FilterTagProps {
+pub struct FilterMenuProps {
+    /// Console state handles.
+    pub console: Console,
+}
+
+/// The Filter button and its menu: the three states as toggles, then
+/// the tag registry, searchable. Toggling keeps the menu open — a
+/// reader narrowing to two tags should not have to reopen it between
+/// them.
+#[component]
+pub fn FilterMenu(props: &FilterMenuProps) -> Element {
+    let console = props.console;
+    let trigger: Ref<PressableHandle> = Ref::new();
+    let on_open: Rc<dyn Fn()> = Rc::new(move || {
+        console.pool_tag_query.set(String::new());
+        console.pool_filter_open.update(|open| !open);
+    });
+    let button: Element = ui! {
+        Button(
+            label = "Filter",
+            on_click = on_open,
+            size = size::Sm,
+            variant = variant::Soft,
+            bind_to = Some(trigger),
+        )
+    };
+
+    // The state toggles rebuild as the set changes; the tag rows sit
+    // in their own switch on the search, so typing into the search
+    // field rebuilds the rows and never the field.
+    let menu = switch(
+        move || (console.pool_filter_open.get(), console.pool_status.get()),
+        move |state: &(bool, Vec<String>)| {
+            let (open, statuses) = state.clone();
+            if !open {
+                return ui! { view {} };
+            }
+            let dismiss: Rc<dyn Fn()> = Rc::new(move || console.pool_filter_open.set(false));
+            let on_tag_query: Rc<dyn Fn(String)> = Rc::new(move |t| console.pool_tag_query.set(t));
+            let tag_rows = switch(
+                move || (console.pool_tag_query.get(), console.pool_tags.get(), console.rev.get()),
+                move |state: &(String, Vec<String>, u64)| {
+                    let (query, active, _rev) = state.clone();
+                    let needle = query.trim().to_lowercase();
+                    let tags = crate::model::tags();
+                    let matched: Vec<usize> = tags
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| needle.is_empty() || t.name.contains(&needle))
+                        .map(|(i, _)| i)
+                        // A menu, not a wall: the search is how the
+                        // rest are reached.
+                        .take(12)
+                        .collect();
+                    let n = matched.len();
+                    ui! {
+                        view(style = MenuRows()) {
+                            if n == 0 {
+                                view(style = MenuBlank()) {
+                                    Typography(content = "No tags match.", kind = typography_kind::Caption, muted = true)
+                                }
+                            }
+                            for i in 0..n {
+                                TagToggle(console = console, index = matched[i], active = active.clone())
+                            }
+                        }
+                    }
+                },
+            );
+            ui! {
+                Menu(
+                    target = Some(AnchorTarget::from(trigger)),
+                    on_dismiss = Some(dismiss.clone()),
+                    side = ElementSide::Below,
+                    align = ElementAlign::Start,
+                ) {
+                    MenuLabel(text = "State")
+                    for i in 0..STATES.len() {
+                        StateToggle(
+                            console = console,
+                            id = STATES[i].0,
+                            label = STATES[i].1,
+                            active = statuses.iter().any(|s| s == STATES[i].0),
+                        )
+                    }
+                    MenuSeparator()
+                    MenuLabel(text = "Tags")
+                    view(style = MenuSearch()) {
+                        Field(
+                            value = console.pool_tag_query,
+                            on_change = on_tag_query,
+                            placeholder = Some("Find a tag".to_string()),
+                            size = idea_ui::FieldSize::Sm,
+                        )
+                    }
+                    tag_rows
+                }
+            }
+        },
+    );
+
+    ui! {
+        view(style = FilterAnchor()) {
+            button
+            menu
+        }
+    }
+}
+
+/// Props for [`StateToggle`].
+#[derive(Default, IdealystSchema)]
+pub struct StateToggleProps {
+    /// Console state handles.
+    pub console: Console,
+    /// The status id.
+    pub id: &'static str,
+    /// Its label.
+    pub label: &'static str,
+    /// Whether it is in the filter.
+    pub active: bool,
+}
+
+/// One state row in the filter menu.
+#[component]
+pub fn StateToggle(props: &StateToggleProps) -> Element {
+    let console = props.console;
+    let id = props.id;
+    let active = props.active;
+    let on_select: Rc<dyn Fn()> = Rc::new(move || console.toggle_pool_status(id));
+    let leading: Option<Element> = Some(check_mark(active));
+    ui! {
+        MenuItem(label = props.label.to_string(), on_select = on_select, leading = leading, active = active)
+    }
+}
+
+/// Props for [`TagToggle`].
+#[derive(Default, IdealystSchema)]
+pub struct TagToggleProps {
     /// Console state handles.
     pub console: Console,
     /// Index into [`crate::model::tags`].
@@ -241,24 +417,62 @@ pub struct FilterTagProps {
     pub active: Vec<String>,
 }
 
-/// One tag in the filter rail. Solid means it is narrowing the table.
+/// One tag row in the filter menu.
 #[component]
-pub fn FilterTag(props: &FilterTagProps) -> Element {
+pub fn TagToggle(props: &TagToggleProps) -> Element {
     let console = props.console;
     let tags = crate::model::tags();
-    let tag = &tags[props.index];
+    let Some(tag) = tags.get(props.index) else {
+        return ui! { view {} };
+    };
     let name = tag.name.clone();
     let on = props.active.iter().any(|t| *t == name);
-    let label = tag.label.clone();
-    let inner: Element = if on {
-        ui! { Tag(label = label, tone = tone::Primary, variant = variant::Solid) }
-    } else {
-        ui! { Tag(label = label, tone = tone::Neutral, variant = variant::Soft) }
-    };
+    let label = format!("{} \u{b7} {}", tag.label, tag.uses);
     let pick = name.clone();
-    pressable(vec![inner], move || console.toggle_pool_tag(&pick))
-        .with_style(StyleApplication::new(chip_press_style()))
-        .into_element()
+    let on_select: Rc<dyn Fn()> = Rc::new(move || console.toggle_pool_tag(&pick));
+    let leading: Option<Element> = Some(check_mark(on));
+    ui! {
+        MenuItem(label = label, on_select = on_select, leading = leading, active = on)
+    }
+}
+
+/// The toggle's mark: a check when on, the same width of nothing when
+/// off, so rows do not shift as they are toggled.
+fn check_mark(on: bool) -> Element {
+    let glyph = if on { "\u{2713}" } else { "" };
+    ui! { text(style = CheckMark()) { glyph } }
+}
+
+/// Props for [`ActiveChip`].
+#[derive(Default, IdealystSchema)]
+pub struct ActiveChipProps {
+    /// Console state handles.
+    pub console: Console,
+    /// The status id or tag slug.
+    pub id: String,
+    /// What the chip says.
+    pub label: String,
+    /// A tag (true) or a state (false).
+    pub tag: bool,
+}
+
+/// One active filter. Pressing it removes it.
+#[component]
+pub fn ActiveChip(props: &ActiveChipProps) -> Element {
+    let console = props.console;
+    let id = props.id.clone();
+    let label = format!("{} \u{d7}", props.label);
+    let is_tag = props.tag;
+    let inner: Element = ui! { Tag(label = label, tone = tone::Primary, variant = variant::Soft) };
+    pressable(vec![inner], move || {
+        if is_tag {
+            console.toggle_pool_tag(&id);
+        } else {
+            console.toggle_pool_status(&id);
+        }
+    })
+    .with_style(StyleApplication::new(chip_press_style()))
+    .into_element()
 }
 
 /// Props for [`WantRow`].
@@ -278,7 +492,9 @@ pub fn WantRow(props: &WantRowProps) -> Element {
     let console = props.console;
     let index = props.want;
     let pool = wants();
-    let w = &pool[index];
+    let Some(w) = pool.get(index) else {
+        return ui! { view {} };
+    };
     let id = w.id.clone();
     let body = w.body.clone();
     let captured = w.captured.clone();
@@ -327,7 +543,11 @@ pub struct WantTagProps {
 #[component]
 pub fn WantTag(props: &WantTagProps) -> Element {
     let pool = wants();
-    let tag = pool[props.want].tags[props.index].clone();
+    let tag = pool
+        .get(props.want)
+        .and_then(|w| w.tags.get(props.index))
+        .cloned()
+        .unwrap_or_default();
     ui! {
         Tag(label = tag, tone = tone::Neutral, variant = variant::Soft)
     }
@@ -400,6 +620,17 @@ stylesheet! {
 }
 
 stylesheet! {
+    pub HeadRight<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::FlexEnd,
+            flex_wrap: FlexWrap::Wrap,
+            gap: t.spacing.xl(),
+        }
+    }
+}
+
+stylesheet! {
     pub StatRow<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
@@ -422,7 +653,7 @@ stylesheet! {
 
 stylesheet! {
     pub PoolScroll<IdeaThemeRef> {
-        base(t) {
+        base(_t) {
             flex_grow: 1.0,
             min_height: 0,
         }
@@ -439,26 +670,12 @@ stylesheet! {
     }
 }
 
-
-
-
-
-
 stylesheet! {
     pub TagRow<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::Wrap,
             gap: t.spacing.xs(),
-        }
-    }
-}
-
-stylesheet! {
-    pub ToolbarBox<IdeaThemeRef> {
-        base(t) {
-            flex_direction: FlexDirection::Column,
-            gap: t.spacing.sm(),
         }
     }
 }
@@ -476,7 +693,7 @@ stylesheet! {
 
 stylesheet! {
     pub SearchSlot<IdeaThemeRef> {
-        base(t) {
+        base(_t) {
             width: 260,
             flex_shrink: 0.0,
         }
@@ -484,10 +701,21 @@ stylesheet! {
 }
 
 stylesheet! {
-    pub FilterTags<IdeaThemeRef> {
+    pub FilterAnchor<IdeaThemeRef> {
+        base(_t) {
+            position: runtime_core::Position::Relative,
+            flex_direction: FlexDirection::Row,
+            flex_shrink: 0.0,
+        }
+    }
+}
+
+stylesheet! {
+    pub ChipRow<IdeaThemeRef> {
         base(t) {
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Center,
             gap: t.spacing.xs(),
         }
     }
@@ -498,6 +726,45 @@ stylesheet! {
         base(t) {
             border_radius: t.radius.sm(),
             cursor: runtime_core::Cursor::Pointer,
+        }
+    }
+}
+
+// Popovers stay tight (rule 2): the search sits in the menu's own
+// gutter, and the rows keep the menu's row rhythm.
+stylesheet! {
+    pub MenuSearch<IdeaThemeRef> {
+        base(t) {
+            padding_horizontal: t.spacing.sm(),
+            padding_vertical: t.spacing.xs(),
+            width: 240,
+        }
+    }
+}
+
+stylesheet! {
+    pub MenuRows<IdeaThemeRef> {
+        base(_t) {
+            flex_direction: FlexDirection::Column,
+        }
+    }
+}
+
+stylesheet! {
+    pub MenuBlank<IdeaThemeRef> {
+        base(t) {
+            padding_horizontal: t.spacing.sm(),
+            padding_vertical: t.spacing.xs(),
+        }
+    }
+}
+
+stylesheet! {
+    pub CheckMark<IdeaThemeRef> {
+        base(t) {
+            width: 14,
+            font_size: t.typography.body_sm_size(),
+            color: t.intent.primary.fg(),
         }
     }
 }
@@ -523,32 +790,38 @@ stylesheet! {
 
 #[cfg(test)]
 mod tests {
-    use super::WantsView;
+    use super::{CaptureView, WantsView};
     use crate::state::use_console;
 
-    /// Regression: the pool must MOUNT.
+    /// Regression: both want screens must MOUNT.
     ///
-    /// It is the only view that renders scene-registry payloads — the
-    /// composer's `code_editor` and `idea_ui::Table` — and a payload
-    /// whose handler was never registered panics at realize with "no
-    /// handler registered for item payload". Nothing catches that at
-    /// compile time: it type-checks, links, and then aborts on screen.
+    /// They are the views that render scene-registry payloads — the
+    /// composer's `code_editor` on the capture screen and
+    /// `idea_ui::Table` on the pool — and a payload whose handler was
+    /// never registered panics at realize with "no handler registered
+    /// for item payload". Nothing catches that at compile time: it
+    /// type-checks, links, and then aborts on screen.
     ///
-    /// So this mounts the real view through the real `realize` against a
-    /// mock host, with the app's own `register_scene_extensions` as the
-    /// boot seam — the same registry the CLI wrapper installs. Drop
+    /// So this mounts the real views through the real `realize` against
+    /// a mock host, with the app's own `register_scene_extensions` as
+    /// the boot seam — the same registry the CLI wrapper installs. Drop
     /// `codeblock::register` and this fails with the browser's panic.
     ///
     /// It does NOT cover the table: see the test below for why.
     #[test]
-    fn the_pool_mounts_with_the_apps_registrations() {
+    fn the_want_screens_mount_with_the_apps_registrations() {
         let harness = host_mock::Harness::with_registry(crate::register_scene_extensions);
         let tree = harness.world.enter(|| {
             // Inside the world: installing the theme injects an ambient,
             // and `use_console` creates signals.
             idea_ui::install_idea_theme(idea_ui::light_theme());
             let console = use_console();
-            runtime_core::ui! { WantsView(console = console) }
+            runtime_core::ui! {
+                view {
+                    WantsView(console = console)
+                    CaptureView(console = console)
+                }
+            }
         });
         harness.mount(tree);
         harness.flush();

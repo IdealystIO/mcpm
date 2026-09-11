@@ -7,11 +7,89 @@
 
 use runtime_core::{signal, Signal};
 
+/// How many module slots the plan editor holds. A slot is a set of
+/// text-field signals, and a signal belongs to the render scope that
+/// creates it — so the slots are created once, with the console, rather
+/// than minted as the reader presses "add module". A plan that needs
+/// more than this starts with these and grows through "Add module" on
+/// its own board.
+pub const PLAN_SLOTS: usize = 12;
+
+/// One module of the plan being composed: its fields as the editor's
+/// text buffers.
+#[derive(Clone, Copy)]
+pub struct ModuleSlot {
+    pub name: Signal<String>,
+    pub description: Signal<String>,
+    /// One task per line.
+    pub tasks: Signal<String>,
+    /// One path prefix per line.
+    pub owns: Signal<String>,
+    /// Prerequisites, as indices of other slots.
+    pub deps: Signal<Vec<usize>>,
+}
+
+impl ModuleSlot {
+    fn new() -> ModuleSlot {
+        ModuleSlot {
+            name: signal(String::new()),
+            description: signal(String::new()),
+            tasks: signal(String::new()),
+            owns: signal(String::new()),
+            deps: signal(Vec::new()),
+        }
+    }
+
+    fn clear(&self) {
+        self.name.set(String::new());
+        self.description.set(String::new());
+        self.tasks.set(String::new());
+        self.owns.set(String::new());
+        self.deps.set(Vec::new());
+    }
+}
+
+/// An edit the console is in the middle of: which surface is open, and
+/// onto what. One at a time. The form's buffers live on [`Console`]
+/// (`form_*`), so a tick landing mid-edit cannot discard typed text.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub enum Edit {
+    #[default]
+    None,
+    /// Compose a new plan — the editor screen's submit, not a modal.
+    CreatePlan,
+    RenameFeature { feature: String },
+    DescribeFeature { feature: String },
+    ShelveFeature { feature: String, shelve: bool },
+    DeleteFeature { feature: String },
+    AddModule { feature: String },
+    RenameModule { feature: String, module: String },
+    EditModule { feature: String, module: String },
+    RemoveModule { feature: String, module: String },
+    AddTask { feature: String, module: String },
+    RemoveTask { feature: String, task: String },
+    AddDependency { feature: String, module: String },
+    RemoveDependency { feature: String, module: String, depends_on: String },
+    EditWant { want: String },
+    DeclineWant { want: String },
+    ReopenWant { want: String },
+    DeleteWant { want: String },
+}
+
+impl Edit {
+    /// Whether this edit takes a modal (a form or a confirm), as
+    /// opposed to running straight away or living on its own screen.
+    pub fn is_modal(&self) -> bool {
+        !matches!(self, Edit::None | Edit::CreatePlan | Edit::ReopenWant { .. })
+    }
+}
+
 /// Copy-able handle set for the console's interactive state.
 #[derive(Clone, Copy)]
 pub struct Console {
     /// Which top-level pane is showing: "overview" (the project home),
-    /// "feature" (the selected feature's board), "features", "wants",
+    /// "feature" (the selected feature's board), "features", "wants"
+    /// (the pool), "capture" (the composer), "plan" (the plan editor),
     /// "knowledge", or "key".
     pub pane: Signal<String>,
     /// Whether the left nav is showing as a drawer.
@@ -89,12 +167,57 @@ pub struct Console {
     // --- The want pool's toolbar ------------------------------------
     /// Free-text filter over want bodies.
     pub pool_query: Signal<String>,
-    /// Status filter: "all" | "open" | "promoted" | "declined".
-    pub pool_status: Signal<String>,
+    /// The states to show: any of "open" / "promoted" / "declined". A
+    /// set, not a tab: a reader can look at loose and declined ideas
+    /// together. Empty means every state. Starts on loose only — the
+    /// pool is the inbox, and the inbox shows what is unread.
+    pub pool_status: Signal<Vec<String>>,
     /// Tags a want must carry to show. Empty means no tag filter.
     pub pool_tags: Signal<Vec<String>>,
     /// Zero-based page of the filtered pool.
     pub pool_page: Signal<usize>,
+    /// Whether the pool's filter menu is open.
+    pub pool_filter_open: Signal<bool>,
+    /// The filter menu's tag search.
+    pub pool_tag_query: Signal<String>,
+
+    // --- Edits ------------------------------------------------------
+    /// The edit surface that is open, if any.
+    pub edit: Signal<Edit>,
+    /// The edit a submit sent, read by the runner. Distinct from `edit`
+    /// so a modal can close while its request is still in flight.
+    pub action: Signal<Edit>,
+    /// Request counter: bumped per submit, so the runner's hole is
+    /// keyed on the request and never on the control that made it
+    /// (UX_GUIDELINES rule 25).
+    pub action_seq: Signal<u64>,
+    /// A write is in flight.
+    pub form_busy: Signal<bool>,
+    /// What the last write was refused for, shown in the open form.
+    pub form_error: Signal<String>,
+    /// The form's buffers. Generic across every edit, reset on open:
+    /// a name, a longer text (description / reason / body), a list one
+    /// per line (tasks / owns), tags as `#tag` text, and a pick of ids.
+    pub form_name: Signal<String>,
+    pub form_text: Signal<String>,
+    pub form_lines: Signal<String>,
+    pub form_owns: Signal<String>,
+    pub form_tags: Signal<String>,
+    pub form_pick: Signal<Vec<String>>,
+    /// Which action menu is open, by its owner's id, so a tick that
+    /// rebuilds the surface around a menu does not close it.
+    pub menu_open: Signal<Option<String>>,
+    /// A feature id to select once the board has caught up with a
+    /// write that created or changed it.
+    pub open_after: Signal<Option<String>>,
+
+    // --- The plan editor --------------------------------------------
+    pub plan_name: Signal<String>,
+    pub plan_description: Signal<String>,
+    pub plan_whitepaper: Signal<String>,
+    /// The module slots in use: the first `plan_count` of `plan_modules`.
+    pub plan_count: Signal<usize>,
+    pub plan_modules: [ModuleSlot; PLAN_SLOTS],
 
     // --- The all-features screen's toolbar --------------------------
     /// Free-text filter over feature names.
@@ -173,9 +296,29 @@ pub fn use_console() -> Console {
         feed_older: signal(None),
         connected: signal(false),
         pool_query: signal(String::new()),
-        pool_status: signal("all".to_string()),
+        pool_status: signal(vec!["open".to_string()]),
         pool_tags: signal(Vec::new()),
         pool_page: signal(0),
+        pool_filter_open: signal(false),
+        pool_tag_query: signal(String::new()),
+        edit: signal(Edit::None),
+        action: signal(Edit::None),
+        action_seq: signal(0),
+        form_busy: signal(false),
+        form_error: signal(String::new()),
+        form_name: signal(String::new()),
+        form_text: signal(String::new()),
+        form_lines: signal(String::new()),
+        form_owns: signal(String::new()),
+        form_tags: signal(String::new()),
+        form_pick: signal(Vec::new()),
+        menu_open: signal(None),
+        open_after: signal(None),
+        plan_name: signal(String::new()),
+        plan_description: signal(String::new()),
+        plan_whitepaper: signal(String::new()),
+        plan_count: signal(1),
+        plan_modules: std::array::from_fn(|_| ModuleSlot::new()),
         api_key: signal(String::new()),
         denied: signal(false),
         key_open: signal(false),
@@ -281,6 +424,122 @@ impl Console {
     pub fn show_wants(&self) {
         self.pane.set("wants".to_string());
         self.close_drawer();
+    }
+
+    /// Show the capture screen.
+    pub fn show_capture(&self) {
+        self.pane.set("capture".to_string());
+        self.close_drawer();
+    }
+
+    /// Open the plan editor on a blank plan.
+    pub fn show_plan_editor(&self) {
+        self.reset_plan_draft();
+        self.pane.set("plan".to_string());
+        self.close_drawer();
+    }
+
+    /// Empty every plan-editor buffer.
+    pub fn reset_plan_draft(&self) {
+        self.plan_name.set(String::new());
+        self.plan_description.set(String::new());
+        self.plan_whitepaper.set(String::new());
+        for slot in &self.plan_modules {
+            slot.clear();
+        }
+        self.plan_count.set(1);
+        self.form_error.set(String::new());
+    }
+
+    /// Add a module slot to the plan being composed, up to the cap.
+    pub fn add_plan_module(&self) {
+        self.plan_count.update(|n| (n + 1).min(PLAN_SLOTS));
+    }
+
+    /// Drop one module slot, shifting the ones after it down so the
+    /// editor never shows a hole. Dependencies on it are dropped and
+    /// the ones past it renumbered.
+    pub fn remove_plan_module(&self, at: usize) {
+        let count = self.plan_count.get();
+        if at >= count {
+            return;
+        }
+        for i in at..count.saturating_sub(1) {
+            let (to, from) = (self.plan_modules[i], self.plan_modules[i + 1]);
+            to.name.set(from.name.get());
+            to.description.set(from.description.get());
+            to.tasks.set(from.tasks.get());
+            to.owns.set(from.owns.get());
+            to.deps.set(from.deps.get());
+        }
+        self.plan_modules[count - 1].clear();
+        for slot in &self.plan_modules[..count.saturating_sub(1)] {
+            slot.deps.update(|deps| {
+                deps.iter()
+                    .filter(|&&d| d != at)
+                    .map(|&d| if d > at { d - 1 } else { d })
+                    .collect()
+            });
+        }
+        self.plan_count.set(count.saturating_sub(1).max(1));
+    }
+
+    /// Open an edit surface, with fresh buffers seeded by the caller.
+    pub fn open_edit(&self, edit: Edit) {
+        self.menu_open.set(None);
+        self.form_error.set(String::new());
+        self.edit.set(edit);
+    }
+
+    /// Close the open edit surface without submitting.
+    pub fn close_edit(&self) {
+        self.edit.set(Edit::None);
+        self.form_error.set(String::new());
+    }
+
+    /// Send an edit to the server. The runner in `app()` picks it up
+    /// off the request counter.
+    pub fn submit(&self, edit: Edit) {
+        self.form_error.set(String::new());
+        self.form_busy.set(true);
+        self.action.set(edit);
+        self.action_seq.update(|n| n + 1);
+    }
+
+    /// Seed the form's buffers before opening a form.
+    pub fn seed_form(&self, name: &str, text: &str, lines: &str, owns: &str, tags: &str) {
+        self.form_name.set(name.to_string());
+        self.form_text.set(text.to_string());
+        self.form_lines.set(lines.to_string());
+        self.form_owns.set(owns.to_string());
+        self.form_tags.set(tags.to_string());
+        self.form_pick.set(Vec::new());
+    }
+
+    /// Open or close one action menu by its owner's id.
+    pub fn toggle_menu(&self, id: &str) {
+        self.menu_open.update(|open| {
+            if open.as_deref() == Some(id) {
+                None
+            } else {
+                Some(id.to_string())
+            }
+        });
+    }
+
+    /// Add or remove one status from the pool filter.
+    pub fn toggle_pool_status(&self, status: &str) {
+        self.pool_status.update(|set| {
+            let mut next = set.clone();
+            match next.iter().position(|s| s == status) {
+                Some(at) => {
+                    next.remove(at);
+                }
+                None => next.push(status.to_string()),
+            }
+            next
+        });
+        self.pool_page.set(0);
     }
 
     /// Show the knowledge base.
@@ -427,12 +686,6 @@ impl Console {
         self.pool_page.set(0);
     }
 
-    /// Narrow the pool to one status (or "all").
-    pub fn set_pool_status(&self, status: String) {
-        self.pool_status.set(status);
-        self.pool_page.set(0);
-    }
-
     /// Add or remove one tag from the pool filter.
     pub fn toggle_pool_tag(&self, tag: &str) {
         self.pool_tags.update(|tags| {
@@ -448,10 +701,10 @@ impl Console {
         self.pool_page.set(0);
     }
 
-    /// Drop every pool filter at once.
+    /// Drop every pool filter at once, back to the inbox view.
     pub fn clear_pool_filters(&self) {
         self.pool_query.set(String::new());
-        self.pool_status.set("all".to_string());
+        self.pool_status.set(vec!["open".to_string()]);
         self.pool_tags.set(Vec::new());
         self.pool_page.set(0);
     }

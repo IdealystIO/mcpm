@@ -104,12 +104,12 @@ fn tree_tools() -> Value {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "op": { "type": "string", "enum": ["add_module", "add_task", "add_dependency", "remove_dependency", "update_module", "rename", "remove"] },
+                                "op": { "type": "string", "enum": ["add_module", "add_task", "add_dependency", "remove_dependency", "update_module", "update_feature", "rename", "remove"] },
                                 "name": { "type": "string", "description": "add_module / add_task / rename: the name." },
                                 "module_id": { "type": "string", "description": "add_task: target module. add_dependency / remove_dependency: the module that waits." },
                                 "depends_on": { "description": "add_module: array of module ids this one waits on. add_dependency / remove_dependency: the single module id waited on." },
                                 "owns": { "type": "array", "items": { "type": "string" }, "description": "add_module / update_module: path prefixes the module writes to." },
-                                "description": { "type": "string", "description": "add_module / update_module." },
+                                "description": { "type": "string", "description": "add_module / update_module / update_feature." },
                                 "tasks": { "type": "array", "items": { "type": "string" }, "description": "add_module: the checklist." },
                                 "note": { "type": "string", "description": "add_task: why the plan missed it." },
                                 "id": { "type": "string", "description": "rename / remove / update_module: the tree id (feat_/mod_/tsk_)." }
