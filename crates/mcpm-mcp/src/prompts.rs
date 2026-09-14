@@ -119,7 +119,15 @@ add_module, update_module, remove), re-dispatch, or escalate to the human. A \
 premature_claim event means YOUR dispatch was early.\n\
 5. When every module is done: complete_feature(feature_id, summary). The summary becomes \
 a feature-scope memory. Keep the whitepaper true as the plan moves: write_document \
-(kind='whitepaper') appends a revision.\n\n\
+(kind='whitepaper') appends a revision. Files a person attached from the console (a \
+design, a spec, a data sample) arrive in every briefing with the description they were \
+given; read them once (read_attachment) and, if the description undersells what a \
+worker needs from a file, sharpen it with describe_attachment before you dispatch. \
+QUESTIONS HOLD WORK: get_context lists the questions owed by you (a worker's blocker \
+is one; so is anything a person asked of you on the console) — answer them with \
+answer_question before dispatching anything, and when YOU need a decision from a \
+person, ask_question on the feature with their name, then poll: nothing in that \
+feature is dispatchable until they answer, which is the point.\n\n\
 Record what the crew learns with commit_memory, at the narrowest scope it is actually \
 true at: kind='convention' or 'decision' at scope={{level:'project'}} for anything that \
 outlives this feature, at feature scope for what is only true here. Workers read both \
@@ -227,7 +235,13 @@ claim_module('{module_id}'{pass}). \
 The claim IS your briefing: it returns your checklist, the feature's whitepaper, the \
 memories recorded above your module, and the completed modules of the feature — your \
 prerequisites first, each with its summary and its handoff document (how to use what \
-it built). Read the handoffs before you read the code they describe.\n\
+it built) — and the feature's attachments, files a person pinned with a description \
+written for you — and the discussion: what people and agents have said about this \
+module and its feature. Read the handoffs before you read the code they describe; \
+fetch an attachment (read_attachment) only when its description says your module \
+needs it. PENDING_RESOLUTION from claim_module means a question on the module or \
+its feature is unanswered: if it is owed by you, answer_question and claim again; \
+otherwise report it to your manager and end your turn.\n\
    - If claim_module returns PREREQS_OPEN: STOP. Do no work. Report the error to your \
 manager and end your turn — the server has already recorded the premature_claim event.\n\
 2. Before writing code, search_memory(scope={{level:'module', id:'{module_id}'}}, \
@@ -250,7 +264,9 @@ handoff is what spares them re-reading your code.\n\
 5. Exit through exactly ONE door:\n\
    - complete_module(module_id, summary{pass}, handoff=...) — all tasks resolved; your \
 summary is the paragraph downstream workers read, the handoff is the page it links.\n\
-   - report_blocker(module_id, description{pass}) — you cannot proceed; keep the claim, stop.\n\
+   - report_blocker(module_id, description{pass}) — you cannot proceed; keep the claim, stop. \
+It opens a question owed by the planner; the module is held until the answer lands \
+(list_comments shows it), and a re-claim resumes you.\n\
    - release_module(module_id, reason{pass}) — you must abandon; task states survive you.\n\
 Never exit silently."
     );

@@ -25,14 +25,17 @@ use idea_ui::{push_toast, size, tone, typography_kind, variant, Button, Chip, Fi
     Menu, MenuItem, MenuSeparator, Modal, Spacer, Textarea, Typography};
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    component, pressable, rx, spawn_then, stylesheet, switch, ui, AlignItems, Cursor, Element,
+    component, rx, spawn_then, stylesheet, switch, ui, AlignItems, Cursor, Element,
     FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent,
     PressableHandle, Ref, StyleApplication,
 };
 
+use crate::components::attachments::{attach_form_body, attachment_name, multipart};
+use crate::components::discussion::comment_multipart;
 use crate::model::{self, features, want_by_id, Status};
 use crate::state::{Console, Edit};
 use crate::styles::SectionLabel;
+use crate::components::bits::tappable;
 
 // ---------------------------------------------------------------------
 // Action menus
@@ -83,7 +86,7 @@ pub fn ActionMenu(props: &ActionMenuProps) -> Element {
     let trigger: Ref<PressableHandle> = Ref::new();
 
     let press_id = id.clone();
-    let button = pressable(
+    let button = tappable(
         vec![ui! { text(style = KebabGlyph()) { "\u{22ef}" } }],
         move || console.toggle_menu(&press_id),
     )
@@ -195,6 +198,15 @@ pub fn choose(console: Console, edit: Edit) {
                 })
                 .unwrap_or_default();
             console.seed_form("", &body, "", "", &tags);
+        }
+        Edit::DescribeAttachment { attachment, .. } => {
+            let description =
+                model::attachment_by_id(attachment).map(|a| a.description).unwrap_or_default();
+            console.seed_form("", &description, "", "", "");
+        }
+        Edit::EditComment { comment, .. } => {
+            let body = model::comment_by_id(comment).map(|c| c.body).unwrap_or_default();
+            console.seed_form("", &body, "", "", "");
         }
         _ => console.seed_form("", "", "", "", ""),
     }
@@ -361,7 +373,57 @@ fn form_body(console: Console) -> Element {
                     Edit::DeleteWant { want },
                 )
             }
-            Edit::None | Edit::CreatePlan | Edit::ReopenWant { .. } => ui! { view {} },
+            Edit::AttachFile { subject } => frame(
+                console,
+                "Attach file",
+                attach_form_body(console),
+                "Attach",
+                false,
+                Edit::AttachFile { subject },
+                move || console.form_file.get().is_some() && !console.form_picking.get(),
+            ),
+            Edit::DescribeAttachment { subject, attachment } => text_form(
+                console,
+                "Describe file",
+                "Description",
+                "What this file is and what a reader should take from it.",
+                "Save",
+                Edit::DescribeAttachment { subject, attachment },
+            ),
+            Edit::RemoveAttachment { subject, attachment } => {
+                let name = attachment_name(&attachment);
+                confirm_form(
+                    console,
+                    "Remove file",
+                    format!("'{name}' will be removed, and its bytes with it."),
+                    "Remove file",
+                    true,
+                    Edit::RemoveAttachment { subject, attachment },
+                )
+            }
+            Edit::EditComment { subject, comment } => text_form(
+                console,
+                "Edit comment",
+                "Comment",
+                "Markdown.",
+                "Save",
+                Edit::EditComment { subject, comment },
+            ),
+            Edit::DeleteComment { subject, comment, question } => confirm_form(
+                console,
+                if question { "Withdraw question" } else { "Delete comment" },
+                if question {
+                    "The question comes off the record and whatever it held is released.".to_string()
+                } else {
+                    "The comment and any files it carried will be removed.".to_string()
+                },
+                if question { "Withdraw" } else { "Delete" },
+                true,
+                Edit::DeleteComment { subject, comment, question },
+            ),
+            Edit::None | Edit::CreatePlan | Edit::ReopenWant { .. } | Edit::PostComment { .. } => {
+                ui! { view {} }
+            }
         },
     )
 }
@@ -787,7 +849,72 @@ fn request(console: Console, edit: &Edit) -> Result<Pending, String> {
             Box::pin(api::set_want_state(want, "open".to_string(), String::new()))
         }
         Edit::DeleteWant { want } => Box::pin(api::delete_want(want)),
+        Edit::AttachFile { subject } => {
+            let Some(blob) = console.form_file.get() else {
+                return Err("Choose a file first.".into());
+            };
+            let (content_type, body) = multipart(&blob, &text);
+            Box::pin(upload(subject, console.api_key.get(), content_type, body))
+        }
+        Edit::DescribeAttachment { attachment, .. } => {
+            Box::pin(api::describe_attachment(attachment, text))
+        }
+        Edit::RemoveAttachment { attachment, .. } => Box::pin(api::remove_attachment(attachment)),
+        Edit::PostComment { subject } => {
+            let (content_type, body) = comment_multipart(console);
+            Box::pin(post_multipart(
+                api::comment_path(&subject),
+                console.api_key.get(),
+                content_type,
+                body,
+            ))
+        }
+        Edit::EditComment { comment, .. } => Box::pin(api::edit_comment(comment, text)),
+        Edit::DeleteComment { comment, .. } => Box::pin(api::delete_comment(comment)),
     })
+}
+
+/// POST a file to the host's upload route. Not a server function — a
+/// file is not a JSON argument — but it answers in the same shape, so
+/// the runner treats it as one: a `WriteResult` on success, the host's
+/// own refusal text otherwise.
+///
+/// The key rides an `Authorization` header exactly as the server-fn
+/// transport sends it, and is omitted when empty for the same reason
+/// (`start_sync` in `app`): an open loopback host asks for none, and
+/// an empty bearer would turn a fine request into a 401.
+async fn upload(
+    subject: String,
+    key: String,
+    content_type: String,
+    body: Vec<u8>,
+) -> Result<api::WriteResult, server::ServerError> {
+    post_multipart(api::upload_path(&subject), key, content_type, body).await
+}
+
+/// POST a multipart body to one of the host's file-carrying routes.
+async fn post_multipart(
+    path: String,
+    key: String,
+    content_type: String,
+    body: Vec<u8>,
+) -> Result<api::WriteResult, server::ServerError> {
+    let url = format!("{}{}", crate::app::API_ORIGIN, path);
+    let mut request = net::Client::new().post(url).header("content-type", content_type).body(body);
+    if !key.is_empty() {
+        request = request.header("authorization", format!("Bearer {key}"));
+    }
+    let response = request.send().await.map_err(|e| server::ServerError::Network(e.to_string()))?;
+    let status = response.status();
+    if response.is_success() {
+        response
+            .json::<api::WriteResult>()
+            .await
+            .map_err(|e| server::ServerError::Codec(e.to_string()))
+    } else {
+        let message = response.text().await.unwrap_or_default();
+        Err(server::ServerError::Server { status, message })
+    }
 }
 
 /// The plan editor's buffers as a draft, or the reason they are not
@@ -829,6 +956,20 @@ fn plan_draft(console: Console) -> Result<api::PlanDraft, String> {
 /// What happens when the server answers.
 fn finish(console: Console, edit: Edit, result: Result<api::WriteResult, server::ServerError>) {
     console.form_busy.set(false);
+    // The composer is its own surface with its own busy flag and
+    // refusal line; the modal's are left alone.
+    if let Edit::PostComment { .. } = edit {
+        console.comment_busy.set(false);
+        match result {
+            Ok(done) => {
+                push_toast(done.message, tone::Success);
+                console.reset_composer();
+                console.refresh.update(|n| n + 1);
+            }
+            Err(err) => console.comment_error.set(refusal(&err)),
+        }
+        return;
+    }
     match result {
         Ok(done) => {
             push_toast(done.message, tone::Success);
@@ -950,15 +1091,24 @@ pub fn module_entries(feature: &str, module: &str) -> Vec<MenuEntry> {
 /// offered on it.
 pub fn want_entries(want: &model::Want) -> Vec<MenuEntry> {
     let id = want.id.clone();
+    // A file may be attached in any state: a composed want's files
+    // reach the feature it informs, and a declined one's stay with
+    // the record of what was asked.
+    let attach = MenuEntry::new("Attach file", Edit::AttachFile { subject: id.clone() });
     match want.state {
-        model::WantState::Promoted => vec![MenuEntry::new("Edit tags", Edit::EditWant { want: id })],
+        model::WantState::Promoted => vec![
+            MenuEntry::new("Edit tags", Edit::EditWant { want: id }),
+            attach,
+        ],
         model::WantState::Declined => vec![
             MenuEntry::new("Edit", Edit::EditWant { want: id.clone() }),
+            attach,
             MenuEntry::new("Reopen", Edit::ReopenWant { want: id.clone() }),
             MenuEntry::danger("Delete", Edit::DeleteWant { want: id }),
         ],
         model::WantState::Open => vec![
             MenuEntry::new("Edit", Edit::EditWant { want: id.clone() }),
+            attach,
             MenuEntry::new("Decline\u{2026}", Edit::DeclineWant { want: id.clone() }),
             MenuEntry::danger("Delete", Edit::DeleteWant { want: id }),
         ],

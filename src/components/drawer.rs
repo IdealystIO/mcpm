@@ -10,12 +10,14 @@
 use idea_ui::{tone, typography_kind, variant, Badge, Grid, IdeaThemeRef, Spacer, Stack,
     StackAlign, StackAxis, StackGap, Tag, Typography};
 use runtime_core::{
-    component, presence, pressable, stylesheet, ui, AlignItems, Cursor, Easing, Element,
+    component, stylesheet, ui, AlignItems, Cursor, Easing, Element,
     FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, Position,
     PresenceAnim, PresenceState, StyleApplication,
 };
 
-use crate::components::bits::{Mono, StatusBadge, StatusDot};
+use crate::components::attachments::FilesSection;
+use crate::components::discussion::Discussion;
+use crate::components::bits::{Mono, StatusBadge, StatusDot, tappable};
 use crate::components::document::DocumentView;
 use crate::components::edits::{module_entries, want_entries, ActionMenu};
 use crate::model::{features, module_detail, want_by_id};
@@ -39,7 +41,7 @@ pub struct DrawerProps {
 pub fn Drawer(props: &DrawerProps) -> Element {
     let console = props.console;
     let (fi, mi) = (props.feature, props.module);
-    let backdrop = pressable(Vec::new(), move || console.close_drawer())
+    let backdrop = tappable(Vec::new(), move || console.close_drawer())
         .with_style(StyleApplication::new(backdrop_sheet_style()))
         .into_element();
     let panel = panel_motion(
@@ -141,8 +143,9 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
         })
         .unwrap_or_default();
     let has_history = !history.is_empty();
+    let discussion_id = module_id.clone();
 
-    let close = pressable(
+    let close = tappable(
         vec![ui! { text(style = CloseGlyph()) { "\u{d7}" } }],
         move || console.close_drawer(),
     )
@@ -250,6 +253,8 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                             )
                         }
 
+                        Discussion(console = console, subject = discussion_id.clone(), compact = true)
+
                         if has_history {
                             view(style = SectionCol()) {
                                 text(style = SectionLabel()) { "History" }
@@ -299,7 +304,7 @@ pub fn PrereqRow(props: &PrereqRowProps) -> Element {
         module: props.dependent.clone(),
         depends_on: id.clone(),
     };
-    let remove = pressable(
+    let remove = tappable(
         vec![ui! { text(style = RemoveGlyph()) { "\u{d7}" } }],
         move || crate::components::edits::choose(console, edge.clone()),
     )
@@ -318,7 +323,7 @@ pub fn PrereqRow(props: &PrereqRowProps) -> Element {
             text(style = PrereqChevron()) { "\u{203a}" }
         }
     };
-    let row = pressable(vec![inner], move || console.open_module(&id))
+    let row = tappable(vec![inner], move || console.open_module(&id))
         .with_style(StyleApplication::new(prereq_box_style()))
         .into_element();
     ui! {
@@ -345,7 +350,7 @@ pub struct WantDrawerProps {
 pub fn WantDrawer(props: &WantDrawerProps) -> Element {
     let console = props.console;
     let id = props.want.clone();
-    let backdrop = pressable(Vec::new(), move || console.close_drawer())
+    let backdrop = tappable(Vec::new(), move || console.close_drawer())
         .with_style(StyleApplication::new(backdrop_sheet_style()))
         .into_element();
     let panel = panel_motion(
@@ -382,6 +387,8 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
     // one clone per for-each, since each closure takes its own.
     let tag_id = id.clone();
     let link_id = id.clone();
+    let files_id = id.clone();
+    let discussion_want = id.clone();
     let body = w.body.clone();
     let state = w.state;
     let status = state.status();
@@ -400,7 +407,7 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
     let entries = want_entries(&w);
     let menu_id = format!("want:{id}");
 
-    let close = pressable(
+    let close = tappable(
         vec![ui! { text(style = CloseGlyph()) { "\u{d7}" } }],
         move || console.close_drawer(),
     )
@@ -457,6 +464,10 @@ pub fn WantPanel(props: &WantPanelProps) -> Element {
                                 }
                             }
                         }
+
+                        FilesSection(console = console, want = files_id.clone())
+
+                        Discussion(console = console, subject = discussion_want.clone(), compact = true)
                     }
                 }
         }
@@ -519,23 +530,29 @@ pub fn WantLinkRow(props: &WantLinkRowProps) -> Element {
 /// Wrap a drawer panel in its slide-in motion. The backdrop is left to
 /// the host's fade — a full-bleed sheet that translates would show a
 /// bare strip down one edge while it moves.
+// The braces are the macro's child-expression form, not Rust's.
+#[allow(unused_braces)]
 fn panel_motion(
     build: impl Fn() -> Element + 'static,
     present: impl Fn() -> bool + 'static,
 ) -> Element {
-    presence(build)
-        .present(present)
-        .enter(PresenceAnim::new(
-            PresenceState::rest().translate_x(PANEL_SLIDE_PX).opacity(0.0),
-            crate::app::BACKDROP_IN_MS,
-            Easing::EaseOut,
-        ))
-        .exit(PresenceAnim::new(
-            PresenceState::rest().translate_x(PANEL_SLIDE_PX).opacity(0.0),
-            crate::app::BACKDROP_OUT_MS,
-            Easing::EaseIn,
-        ))
-        .into_element()
+    ui! {
+        presence(
+            present = present,
+            enter = PresenceAnim::new(
+                PresenceState::rest().translate_x(PANEL_SLIDE_PX).opacity(0.0),
+                crate::app::BACKDROP_IN_MS,
+                Easing::EaseOut,
+            ),
+            exit = PresenceAnim::new(
+                PresenceState::rest().translate_x(PANEL_SLIDE_PX).opacity(0.0),
+                crate::app::BACKDROP_OUT_MS,
+                Easing::EaseIn,
+            ),
+        ) {
+            { build() }
+        }
+    }
 }
 
 /// How far the panel travels on its way in, in px. Enough to read as
@@ -596,7 +613,7 @@ pub fn TaskRow(props: &TaskRowProps) -> Element {
     // is absent rather than present and refused.
     let edit = Edit::RemoveTask { feature: props.feature.clone(), task: props.task.clone() };
     let remove: Option<Element> = (!done).then(|| {
-        pressable(
+        tappable(
             vec![ui! { text(style = RemoveGlyph()) { "\u{d7}" } }],
             move || crate::components::edits::choose(console, edit.clone()),
         )

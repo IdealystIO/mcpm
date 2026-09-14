@@ -1,4 +1,4 @@
-//! The 30 tool definitions (architecture doc §5). Descriptions are the
+//! The 39 tool definitions (architecture doc §5). Descriptions are the
 //! agent UX: they say what the tool does, who calls it, and what the
 //! caller should do with the answer.
 
@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 pub fn tool_defs() -> Value {
     let mut tools: Vec<Value> = tree_tools().as_array().cloned().unwrap_or_default();
     tools.extend(document_tools().as_array().cloned().unwrap_or_default());
+    tools.extend(attachment_tools().as_array().cloned().unwrap_or_default());
+    tools.extend(discussion_tools().as_array().cloned().unwrap_or_default());
     tools.extend(want_tools().as_array().cloned().unwrap_or_default());
     Value::Array(tools)
 }
@@ -610,6 +612,188 @@ fn document_tools() -> Value {
                     "subject_id": { "type": "string", "description": "The feature id for a whitepaper, the module id for a handoff." }
                 },
                 "required": ["kind", "subject_id"]
+            }
+        }
+    ])
+}
+
+/// Files attached to a feature or a want from the console, each with a
+/// description written for the agent that reads it. Agents read them
+/// and may sharpen a description; the bytes arrive from a person at
+/// the console, which is the surface that can pick a file.
+fn attachment_tools() -> Value {
+    json!([
+        {
+            "name": "list_attachments",
+            "description": "ANY AGENT. The files attached to a feature or a want, with the \
+                description each was given: name, type, size, who attached it and what it is \
+                for. A feature's list includes the files of the wants it was composed from, \
+                each marked `via_want`. Your claim briefing already carries your feature's \
+                list; use this for another feature, for a want you are composing, or to \
+                re-read after somebody described a file. Descriptions only — fetch a file \
+                with read_attachment.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject_id": { "type": "string", "description": "A feature id (feat_…) or a want id (want_…)." }
+                },
+                "required": ["subject_id"]
+            }
+        },
+        {
+            "name": "read_attachment",
+            "description": "ANY AGENT. Fetch one attachment by id. Text-like files (text/*, \
+                JSON, CSV, Markdown, source) under 512 KiB come back inline as `text`; every \
+                file comes back with a `url` good for an hour that curl or a subagent can \
+                fetch without credentials, when the server can mint one. Read the \
+                description first (list_attachments / your briefing) and fetch only what \
+                your module needs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": { "type": "string", "description": "att_… from a listing or a briefing." }
+                },
+                "required": ["attachment_id"]
+            }
+        },
+        {
+            "name": "attach_file",
+            "description": "ANY AGENT (not a delegated subagent). Attach a file of your own to a \
+                feature or a want — a report you generated, a data sample, a diagram source, \
+                a screenshot from a run — with a description written for whoever reads it \
+                next. Send text as `content` (stored as UTF-8) or anything else as \
+                `content_base64`; one or the other. Up to 8 MiB decoded per call: what an \
+                agent hands over is an artifact, not an archive — for a bigger file, attach a \
+                summary or a sample and say where the rest is. The description is what every \
+                later reader sees before deciding whether to fetch the file, so say what it \
+                is and what to take from it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject_id": { "type": "string", "description": "A feature id (feat_…) or a want id (want_…)." },
+                    "name": { "type": "string", "description": "The file name, e.g. 'results.csv'. A display name and the download name; not a path." },
+                    "description": { "type": "string", "description": "What the file is and what a reader should take from it." },
+                    "content": { "type": "string", "description": "The file as text. Stored as text/plain unless content_type says otherwise." },
+                    "content_base64": { "type": "string", "description": "The file's bytes as standard base64, for anything that is not text." },
+                    "content_type": { "type": "string", "description": "Optional MIME type, e.g. 'text/csv', 'image/png'. Defaults to text/plain for `content` and application/octet-stream for `content_base64`." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one — and then the call is refused: attachments belong to the feature, so ask the agent that minted you." }
+                },
+                "required": ["subject_id", "name"]
+            }
+        },
+        {
+            "name": "describe_attachment",
+            "description": "ANY AGENT (not a delegated subagent). Rewrite what an attachment is \
+                for. The description is what every later reader sees before deciding whether \
+                to fetch the file, so when you have read a file and can say what in it matters \
+                — which sheet, which section, which column is the total — say it here rather \
+                than leaving the next agent to rediscover it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": { "type": "string" },
+                    "description": { "type": "string", "description": "What the file is and what a reader should take from it." }
+                },
+                "required": ["attachment_id", "description"]
+            }
+        }
+    ])
+}
+
+/// Discussion: notes, questions and answers on a feature, a want or a
+/// module — where people and agents talk about the work beside the
+/// work, and where a question holds the work until it is answered.
+fn discussion_tools() -> Value {
+    let files = json!({
+        "type": "array",
+        "description": "Files to post with the comment, each shaped like attach_file's arguments. Up to 8 MiB decoded in one call.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "content": { "type": "string", "description": "Text, stored as UTF-8." },
+                "content_base64": { "type": "string", "description": "Standard base64, for anything that is not text." },
+                "content_type": { "type": "string" },
+                "description": { "type": "string", "description": "What the file is; the comment's own words serve when this is empty." }
+            },
+            "required": ["name"]
+        }
+    });
+    json!([
+        {
+            "name": "list_comments",
+            "description": "ANY AGENT. The discussion on a feature, a want or a module: notes, \
+                questions (with who owes the answer and whether it has landed) and answers, \
+                oldest first, with the files each carried. Your claim briefing carries the \
+                newest of your module's and feature's; use this for the rest, for another \
+                subject, or with `since` to read only what landed after a comment you have \
+                seen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject_id": { "type": "string", "description": "feat_…, want_… or mod_…" },
+                    "since": { "type": "string", "description": "A comment id; only comments after it are returned." },
+                    "limit": { "type": "integer", "description": "Newest N (default 100, max 500)." }
+                },
+                "required": ["subject_id"]
+            }
+        },
+        {
+            "name": "add_comment",
+            "description": "ANY AGENT. Put a note on a feature, a want or a module: what you \
+                found, what you decided, a result — with files if there are any (a report, a \
+                screenshot, a sample). A note blocks nothing. Markdown. A delegated subagent \
+                may post only on its own module.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject_id": { "type": "string", "description": "feat_…, want_… or mod_…" },
+                    "body": { "type": "string", "description": "Markdown. May be empty when files are given." },
+                    "files": files,
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one." }
+                },
+                "required": ["subject_id"]
+            }
+        },
+        {
+            "name": "ask_question",
+            "description": "ANY AGENT. Ask something of somebody, on the record, and HOLD the \
+                work until they answer. `assigned_to` names who owes the answer — a person's \
+                name as the console records it, the manager agent, a worker — or nobody, in \
+                which case anyone may answer. On a module: its worker sees `blocked` and \
+                nobody can claim it; on a feature: nothing in it is dispatchable; on a want: \
+                it cannot be promoted. The hold lifts when answer_question lands (or the \
+                asker withdraws). Ask when the answer changes what gets built; for a remark, \
+                add_comment. report_blocker is this, owed by the feature's planner.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject_id": { "type": "string", "description": "feat_…, want_… or mod_…" },
+                    "body": { "type": "string", "description": "The question. Say what you would do with each possible answer." },
+                    "assigned_to": { "type": "string", "description": "Agent or person name that owes the answer. Omit for anyone." },
+                    "files": files,
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one." }
+                },
+                "required": ["subject_id", "body"]
+            }
+        },
+        {
+            "name": "answer_question",
+            "description": "ANY AGENT. Answer an open question, which resolves it and releases \
+                whatever it held. Who may: the agent it was assigned to; the asker (to answer \
+                their own or withdraw it); anyone, if it was assigned to nobody; and a person \
+                at the console, whoever it names. get_context lists the ones owed by you — \
+                answer them first, because work is waiting on each. The answer is Markdown \
+                and may carry files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question_id": { "type": "string", "description": "cmt_… of the question." },
+                    "body": { "type": "string", "description": "The answer." },
+                    "files": files,
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one." }
+                },
+                "required": ["question_id", "body"]
             }
         }
     ])

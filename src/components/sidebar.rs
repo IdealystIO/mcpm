@@ -21,11 +21,11 @@
 use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, ProgressCap, Spacer, Typography};
 use idea_ui_nav::sidebar_pinned;
 use runtime_core::{
-    component, pressable, stylesheet, switch, ui, AlignItems, Breakpoint, Element, FlexDirection,
+    component, stylesheet, switch, ui, AlignItems, Breakpoint, Element, FlexDirection,
     FontWeight, IdealystSchema, IntoElement, StyleApplication,
 };
 
-use crate::components::bits::{Mono, StatusDot};
+use crate::components::bits::{Mono, StatusDot, tappable};
 use crate::model::{completed_count, features, in_play, rail_features, want_counts};
 use crate::state::Console;
 use crate::styles::{status_tone, MonoTextSize, SectionLabel};
@@ -211,7 +211,7 @@ pub fn NavItem(props: &NavItemProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || {
+    tappable(vec![inner], move || {
         match id {
             "overview" => console.show_overview(),
             "features" => console.show_features(),
@@ -284,7 +284,7 @@ pub fn RailFeature(props: &RailFeatureProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || {
+    tappable(vec![inner], move || {
         console.select_feature(index);
         dismiss_if_drawer(console);
     })
@@ -319,7 +319,7 @@ pub fn AllFeaturesLink(props: &AllFeaturesLinkProps) -> Element {
     let inner: Element = ui! {
         text(style = QuietLink()) { label }
     };
-    pressable(vec![inner], move || {
+    tappable(vec![inner], move || {
         console.show_features();
         dismiss_if_drawer(console);
     })

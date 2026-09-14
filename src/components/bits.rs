@@ -4,13 +4,29 @@
 use std::rc::Rc;
 
 use idea_ui::{typography_kind, Badge, Spacer, Tooltip, Typography};
-use runtime_core::{component, pressable, ui, Element, IdealystSchema, IntoElement,
-    StyleApplication};
+use runtime_core::{component, pressable, ui, Element, GluePressable, IdealystSchema,
+    IntoElement, StyleApplication};
 
 use crate::model::Status;
 use crate::styles::{
     status_dot, status_tone, Dot, MonoText, MonoTextSize, MonoTextTone, Tick, TickState,
 };
+
+/// A tappable custom surface — a row, a chip, a close glyph — with no
+/// native chrome. Chain `.with_style(…)`, `.bind(…)`, then
+/// `.into_element()`.
+///
+/// This is the raw `pressable` primitive, and it is called by hand in
+/// exactly one place — here — for a reason the linter cannot know:
+/// `pressable` has no `ui!` tag (the macro's primitive table omits it)
+/// and idea-ui ships no wrapper for it, so "write it as a tag" cannot
+/// compile. Every tappable surface in the console goes through this
+/// function so that fact is stated once, and a new hand-built element
+/// anywhere else still trips `prefer-ui-macro` as it should.
+pub fn tappable(children: Vec<Element>, on_press: impl Fn() + 'static) -> GluePressable {
+    // idealyst-lint-disable-next-line prefer-ui-macro
+    pressable(children, on_press)
+}
 
 /// Props for [`StatusDot`].
 #[derive(Default, IdealystSchema)]
@@ -199,7 +215,7 @@ pub fn Pager(props: &PagerProps) -> Element {
     let back_arm = Chevron().live(if back_on { ChevronLive::Yes } else { ChevronLive::No });
     let next_arm = Chevron().live(if next_on { ChevronLive::Yes } else { ChevronLive::No });
     let back_step = step.clone();
-    let back = pressable(
+    let back = tappable(
         vec![ui! { text(style = back_arm) { "\u{2039}" } }],
         move || {
             if let (true, Some(step)) = (page > 0, back_step.as_ref()) {
@@ -210,7 +226,7 @@ pub fn Pager(props: &PagerProps) -> Element {
     .with_style(StyleApplication::new(pager_button_style()))
     .into_element();
     let next_step = step;
-    let next = pressable(
+    let next = tappable(
         vec![ui! { text(style = next_arm) { "\u{203a}" } }],
         move || {
             if let (true, Some(step)) = (page + 1 < pages, next_step.as_ref()) {

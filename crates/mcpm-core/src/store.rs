@@ -29,8 +29,10 @@ use tokio::sync::{broadcast, OnceCell};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{McpmError, ErrorCode};
+use crate::files::{self, FileProvider};
 use crate::ids::{
-    id_level, new_document_id, new_id, new_memory_id, new_want_id, normalize_tag, Level,
+    id_level, new_attachment_id, new_comment_id, new_document_id, new_id, new_memory_id,
+    new_want_id, normalize_tag, Level,
 };
 use crate::keys::{
     Actor, ApiKeyInfo, Delegation, IssuedKey, KeyIdentity, KeyRole, MintRequest, MintedWorker,
@@ -77,6 +79,15 @@ const CLAIM_GUIDANCE: &str = "Tick each task as you finish it. A task ticked whe
      get there. On a spot instance the replacement sees your checklist, not your \
      intentions.";
 
+/// The most an attachment may weigh. Attachments are briefs — a design,
+/// a screenshot, a spec, a data sample — not a media library, and the
+/// console holds the whole file in the browser while it uploads.
+pub const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+/// How long a presigned attachment link stays valid. Long enough to
+/// paste into a prompt and have a subagent fetch it; short enough that
+/// a link in a transcript is not a standing grant.
+pub const ATTACHMENT_LINK_TTL_SECS: u32 = 3600;
+
 type Result<T> = std::result::Result<T, McpmError>;
 type Tx<'a> = Transaction<'a, Postgres>;
 
@@ -93,6 +104,11 @@ pub struct Store {
     /// use. One Postgres connection serves every subscriber, however
     /// many consoles are open.
     events: Arc<OnceCell<broadcast::Sender<EventNotice>>>,
+    /// Where attachment bytes go. `None` on a server with no object
+    /// store configured: attachment records can still be READ (their
+    /// descriptions are what a briefing carries), but nothing can be
+    /// attached or fetched until one is installed.
+    files: Option<Arc<dyn FileProvider>>,
 }
 
 impl Store {
@@ -128,7 +144,19 @@ impl Store {
             pool,
             url: database_url.to_string(),
             events: Arc::new(OnceCell::new()),
+            files: None,
         })
+    }
+
+    /// Install the object store attachments are written to.
+    pub fn with_files(mut self, files: Arc<dyn FileProvider>) -> Store {
+        self.files = Some(files);
+        self
+    }
+
+    /// Whether this store can hold attachment bytes.
+    pub fn has_files(&self) -> bool {
+        self.files.is_some()
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -230,6 +258,7 @@ impl Store {
 
         let features = self.feature_rollups().await?;
         let your_claims = self.claims_of(agent).await?;
+        let awaiting_you = self.questions_awaiting(agent).await?;
         let open_wants: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wants w WHERE w.state = 'open'
                AND NOT EXISTS (SELECT 1 FROM want_features wf WHERE wf.want_id = w.id)",
@@ -237,7 +266,17 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
 
-        let suggested_next = if let Some(c) = your_claims.first() {
+        let suggested_next = if let Some(q) = awaiting_you.first() {
+            format!(
+                "{} question(s) await your answer and block work until you give it. First: \
+                 {} on {} asked '{}' — answer_question('{}', ...).",
+                awaiting_you.len(),
+                q.author,
+                q.subject_name,
+                excerpt(&q.body, 120),
+                q.id
+            )
+        } else if let Some(c) = your_claims.first() {
             format!(
                 "You hold a claim on '{}' ({}) with {} open task(s) — resume it: work the \
                  checklist with complete_task, then complete_module.",
@@ -274,6 +313,7 @@ impl Store {
             features,
             your_claims,
             open_wants,
+            awaiting_you,
             suggested_next,
         })
     }
@@ -475,8 +515,10 @@ impl Store {
             return Err(McpmError::not_found("feature", feature_id));
         }
         let mut summaries: Vec<String> = Vec::new();
+        // Objects whose rows a removal deleted, discarded after commit.
+        let mut discards: Vec<String> = Vec::new();
         for op in ops {
-            let summary = apply_plan_op(&mut tx, agent, feature_id, op).await?;
+            let summary = apply_plan_op(&mut tx, agent, feature_id, op, &mut discards).await?;
             summaries.push(summary);
         }
         record_event(
@@ -489,6 +531,7 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        self.discard_objects(&discards).await;
         self.feature_tree(feature_id).await
     }
 
@@ -536,6 +579,20 @@ impl Store {
         .bind(feature_id)
         .execute(&mut *tx)
         .await?;
+        // The feature's OWN files go with it, and its modules', and its
+        // discussion. Files that reached it through its wants stay with
+        // the wants, which are loose again.
+        let mut orphaned = delete_attachment_rows(&mut tx, "feature", feature_id).await?;
+        let module_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM modules WHERE feature_id = $1")
+                .bind(feature_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for mid in &module_ids {
+            orphaned.extend(delete_attachment_rows(&mut tx, "module", mid).await?);
+            delete_comment_rows(&mut tx, "module", mid).await?;
+        }
+        delete_comment_rows(&mut tx, "feature", feature_id).await?;
         // Modules, tasks, edges and want links cascade from the row.
         sqlx::query("DELETE FROM features WHERE id = $1")
             .bind(feature_id)
@@ -551,6 +608,7 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        self.discard_objects(&orphaned).await;
         Ok(Ack {
             ok: true,
             message: format!("Feature '{name}' deleted; its wants are loose again."),
@@ -715,6 +773,10 @@ impl Store {
         let mut dispatchable = Vec::new();
         let mut in_flight = Vec::new();
         let mut blocked = Vec::new();
+        let mut pending: Vec<QuestionRef> = tree.open_questions.clone();
+        for module in &tree.modules {
+            pending.extend(module.open_questions.iter().cloned());
+        }
         let mem_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM memories WHERE level = 'feature' AND subject_id = $1",
         )
@@ -768,6 +830,25 @@ impl Store {
             )
         } else if tree.status == "done" {
             "The feature is complete — nothing to dispatch.".to_string()
+        } else if !pending.is_empty() {
+            let owed: Vec<String> = pending
+                .iter()
+                .map(|q| {
+                    format!(
+                        "{} on {} (asked by {}, owed by {})",
+                        q.id,
+                        q.subject_name,
+                        q.author,
+                        q.assigned_to.as_deref().unwrap_or("anyone")
+                    )
+                })
+                .collect();
+            format!(
+                "Nothing is dispatchable: {} open question(s) block this feature — {}. Answer \
+                 the ones owed by you with answer_question; the rest wait on whoever they name.",
+                pending.len(),
+                owed.join("; ")
+            )
         } else if !blocked.is_empty() {
             "Nothing is dispatchable: blocked modules need your attention (revise the plan, \
              clear the blocker, or release the module)."
@@ -786,6 +867,7 @@ impl Store {
             dispatchable,
             in_flight,
             blocked,
+            pending,
             note,
         })
     }
@@ -896,6 +978,41 @@ impl Store {
             ));
         }
 
+        // The gate's other half: an open question on this module or on
+        // its feature. A person or an agent owes an answer, and until
+        // it lands the work is not to start — that is what asking was
+        // for. Checked here, inside the claiming transaction, beside
+        // the prerequisite check, so `dispatchable` and this cannot
+        // drift. No event: the question itself is already on the
+        // record, and its assignee is who it is waiting on.
+        let pending = open_questions_tx(&mut tx, &feature_id, Some(module_id)).await?;
+        if !pending.is_empty() {
+            let owed: Vec<String> = pending
+                .iter()
+                .map(|q| {
+                    format!(
+                        "{} on {} (owed by {})",
+                        q.id,
+                        q.subject_name,
+                        q.assigned_to.as_deref().unwrap_or("anyone")
+                    )
+                })
+                .collect();
+            return Err(McpmError::new(
+                ErrorCode::PendingResolution,
+                format!(
+                    "Module '{module_name}' ({module_id}) of '{feature_name}' is pending \
+                     resolution: {} open question(s) — {}.",
+                    pending.len(),
+                    owed.join("; ")
+                ),
+                json!({ "pending": pending }),
+                "Do not begin work. If a question is owed by you, answer it with \
+                 answer_question and claim again; otherwise report PENDING_RESOLUTION to your \
+                 manager and end your turn.",
+            ));
+        }
+
         // --- Claim states --------------------------------------------
         match (status.as_str(), claimed_by.as_deref()) {
             ("done", _) => {
@@ -1002,11 +1119,15 @@ impl Store {
         let whitepaper = self
             .current_document(DocumentKind::Whitepaper, &feature_id)
             .await?;
+        let attachments = self.feature_attachments(&feature_id).await?;
+        let discussion = self.briefing_discussion(&feature_id, module_id).await?;
         Ok(Briefing {
             module,
             feature_id,
             feature_name,
             whitepaper,
+            attachments,
+            discussion,
             ancestor_memories,
             upstream_summaries: upstream
                 .into_iter()
@@ -1382,6 +1503,26 @@ impl Store {
             .bind(module_id)
             .execute(&mut *tx)
             .await?;
+        // A blocker is a question with the planner's name on it. That
+        // is what gives it a resolution: the answer (from the planner,
+        // or a human) is what clears `blocked`, and until then the
+        // module is not dispatchable to anyone else either.
+        let planner: Option<String> =
+            sqlx::query_scalar("SELECT created_by FROM features WHERE id = $1")
+                .bind(&feature_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let question_id = insert_comment(
+            &mut tx,
+            "module",
+            module_id,
+            CommentKind::Question,
+            description,
+            agent,
+            planner.as_deref(),
+            None,
+        )
+        .await?;
         insert_memory(
             &mut tx,
             Level::Module,
@@ -1399,13 +1540,20 @@ impl Store {
             Some(&feature_id),
             Some(module_id),
             Some(agent),
-            json!({ "module": module_name, "description": description }),
+            json!({
+                "module": module_name,
+                "description": description,
+                "question_id": question_id,
+                "assigned_to": planner,
+            }),
         )
         .await?;
         tx.commit().await?;
         Ok(Ack::new(format!(
-            "Blocker recorded on '{module_name}'. Your claim is kept; the manager will see \
-             blocker_reported on its next poll. Stop work until it responds."
+            "Blocker recorded on '{module_name}' as question {question_id}, owed by {}. Your \
+             claim is kept; the module unblocks when the answer lands (it will be in the \
+             discussion — list_comments). Stop work until then.",
+            planner.as_deref().unwrap_or("whoever answers first")
         )))
     }
 
@@ -1601,6 +1749,865 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(map_document))
+    }
+
+    // -----------------------------------------------------------------
+    // Attachments
+    // -----------------------------------------------------------------
+
+    /// Attach a file to a feature or a want.
+    ///
+    /// The bytes go to the object store FIRST and the row is written
+    /// after, so a failure in either direction leaves nothing that
+    /// claims a file it does not have: a put that fails writes no row,
+    /// and a row that fails to write takes its object back down. An
+    /// orphaned object is a few wasted bytes; an orphaned row is a
+    /// briefing that promises a file nobody can fetch.
+    ///
+    /// Any undelegated agent may attach. A delegated identity is
+    /// confined to one module, and a file rides a feature or a want —
+    /// the same line the whitepaper draws.
+    pub async fn attach_file(
+        &self,
+        actor: impl Into<Actor>,
+        subject_id: &str,
+        name: &str,
+        description: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<AttachmentView> {
+        let actor = actor.into();
+        let files = self.files.as_ref().ok_or_else(files::no_provider)?;
+        require_undelegated(&actor, "attach a file")?;
+        let name = clean_file_name(name)?;
+        if bytes.is_empty() {
+            return Err(attachment_invalid("The file is empty."));
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(attachment_invalid(format!(
+                "The file is {} bytes; the limit is {} MiB.",
+                bytes.len(),
+                MAX_ATTACHMENT_BYTES / (1024 * 1024)
+            )));
+        }
+        let content_type = clean_content_type(content_type);
+        let size = bytes.len() as i64;
+        let sha256 = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&bytes))
+        };
+        let (level, subject_name) = self.attachment_subject(subject_id).await?;
+        let id = new_attachment_id();
+        let object_key = format!("attachments/{}/{subject_id}/{id}/{name}", level.as_str());
+
+        files.put(&object_key, bytes, &content_type).await?;
+
+        let written: Result<()> = async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                "INSERT INTO attachments
+                    (id, level, subject_id, name, description, content_type, size_bytes,
+                     object_key, sha256, added_by)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(&id)
+            .bind(level.as_str())
+            .bind(subject_id)
+            .bind(&name)
+            .bind(description.trim())
+            .bind(&content_type)
+            .bind(size)
+            .bind(&object_key)
+            .bind(&sha256)
+            .bind(&actor.name)
+            .execute(&mut *tx)
+            .await?;
+            record_event(
+                &mut tx,
+                "attachment_added",
+                attachment_feature(level, subject_id),
+                Some(subject_id),
+                Some(&actor.name),
+                json!({
+                    "attachment_id": id,
+                    "level": level.as_str(),
+                    "subject": subject_name,
+                    "name": name,
+                    "size_bytes": size,
+                    "content_type": content_type,
+                    "description": description.trim(),
+                }),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = written {
+            // Best effort: the row never landed, so the object is
+            // already an orphan. Failing to remove it is not a second
+            // error worth reporting over the first.
+            let _ = files.delete(&object_key).await;
+            return Err(err);
+        }
+        self.attachment(&id).await
+    }
+
+    /// Rewrite what an attachment is for. The description is the part
+    /// an agent reads, so a manager who has looked at a file and can
+    /// say what matters in it should be able to say so on the record.
+    pub async fn describe_attachment(
+        &self,
+        actor: impl Into<Actor>,
+        id: &str,
+        description: &str,
+    ) -> Result<AttachmentView> {
+        let actor = actor.into();
+        require_undelegated(&actor, "describe an attachment")?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "UPDATE attachments SET description = $2, updated_at = now()
+             WHERE id = $1 RETURNING level, subject_id, name",
+        )
+        .bind(id)
+        .bind(description.trim())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| McpmError::not_found("attachment", id))?;
+        let level: String = row.get("level");
+        let subject_id: String = row.get("subject_id");
+        let level = attachment_level(&level);
+        record_event(
+            &mut tx,
+            "attachment_described",
+            attachment_feature(level, &subject_id),
+            Some(&subject_id),
+            Some(&actor.name),
+            json!({
+                "attachment_id": id,
+                "name": row.get::<String, _>("name"),
+                "description": description.trim(),
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        self.attachment(id).await
+    }
+
+    /// Remove an attachment: the row in the transaction, the object
+    /// after it commits. The order is the same argument as
+    /// `attach_file`'s, run backwards — a row that outlived its object
+    /// would be a promise the store cannot keep, and an object that
+    /// outlives its row is only storage.
+    pub async fn remove_attachment(&self, actor: impl Into<Actor>, id: &str) -> Result<Ack> {
+        let actor = actor.into();
+        require_undelegated(&actor, "remove an attachment")?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "DELETE FROM attachments WHERE id = $1
+             RETURNING level, subject_id, name, object_key",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| McpmError::not_found("attachment", id))?;
+        let level: String = row.get("level");
+        let subject_id: String = row.get("subject_id");
+        let name: String = row.get("name");
+        let object_key: String = row.get("object_key");
+        let level = attachment_level(&level);
+        record_event(
+            &mut tx,
+            "attachment_removed",
+            attachment_feature(level, &subject_id),
+            Some(&subject_id),
+            Some(&actor.name),
+            json!({ "attachment_id": id, "name": name }),
+        )
+        .await?;
+        tx.commit().await?;
+        self.discard_objects(&[object_key]).await;
+        Ok(Ack {
+            ok: true,
+            message: format!("Removed '{name}'."),
+            data: serde_json::Value::Null,
+        })
+    }
+
+    /// One attachment's record.
+    pub async fn attachment(&self, id: &str) -> Result<AttachmentView> {
+        let row = sqlx::query(&format!(
+            "SELECT {ATTACHMENT_FIELDS}, NULL::text AS via_want_id, NULL::text AS via_want_body,
+                    NULL::text AS via_module_id, NULL::text AS via_module_name
+             FROM attachments a {ATTACHMENT_JOINS} WHERE a.id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| McpmError::not_found("attachment", id))?;
+        Ok(map_attachment(&row))
+    }
+
+    /// The files of one subject. For a feature that is its own files
+    /// PLUS those of the wants it was composed from (see
+    /// [`Store::feature_attachments`]); for a want, its own.
+    pub async fn attachments_of(&self, subject_id: &str) -> Result<Vec<AttachmentView>> {
+        match id_level(subject_id) {
+            Some(Level::Feature) => self.feature_attachments(subject_id).await,
+            Some(Level::Module) => self.own_attachments("module", subject_id).await,
+            _ if subject_id.starts_with("want_") => self.own_attachments("want", subject_id).await,
+            _ => Err(McpmError::new(
+                ErrorCode::NotFound,
+                format!("{subject_id} is not a feature, a want, or a module."),
+                json!({ "subject_id": subject_id }),
+                "Attachments ride features (feat_…), wants (want_…) and modules (mod_…).",
+            )),
+        }
+    }
+
+    /// A feature's files: its own, then its modules', then the files of
+    /// every want it was composed from — each marked with where it
+    /// came in. Derived at read time through `modules` and
+    /// `want_features`, so promoting a want copies nothing and
+    /// un-linking it takes its files with it.
+    pub async fn feature_attachments(&self, feature_id: &str) -> Result<Vec<AttachmentView>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ATTACHMENT_FIELDS}, NULL::text AS via_want_id, NULL::text AS via_want_body,
+                    NULL::text AS via_module_id, NULL::text AS via_module_name, 0 AS rank
+               FROM attachments a {ATTACHMENT_JOINS}
+              WHERE a.level = 'feature' AND a.subject_id = $1
+             UNION ALL
+             SELECT {ATTACHMENT_FIELDS}, NULL::text AS via_want_id, NULL::text AS via_want_body,
+                    mm.id AS via_module_id, mm.name AS via_module_name, 1 AS rank
+               FROM attachments a {ATTACHMENT_JOINS}
+               JOIN modules mm ON mm.id = a.subject_id AND mm.feature_id = $1
+              WHERE a.level = 'module'
+             UNION ALL
+             SELECT {ATTACHMENT_FIELDS}, w.id AS via_want_id, w.body AS via_want_body,
+                    NULL::text AS via_module_id, NULL::text AS via_module_name, 2 AS rank
+               FROM attachments a {ATTACHMENT_JOINS}
+               JOIN want_features wf ON wf.want_id = a.subject_id AND wf.feature_id = $1
+               JOIN wants w ON w.id = wf.want_id
+              WHERE a.level = 'want'
+             ORDER BY rank, created_at, id"
+        ))
+        .bind(feature_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(map_attachment).collect())
+    }
+
+    async fn own_attachments(&self, level: &str, subject_id: &str) -> Result<Vec<AttachmentView>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ATTACHMENT_FIELDS}, NULL::text AS via_want_id, NULL::text AS via_want_body,
+                    NULL::text AS via_module_id, NULL::text AS via_module_name
+               FROM attachments a {ATTACHMENT_JOINS}
+              WHERE a.level = $1 AND a.subject_id = $2
+              ORDER BY a.created_at, a.id"
+        ))
+        .bind(level)
+        .bind(subject_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(map_attachment).collect())
+    }
+
+    /// A link that fetches the file without credentials for
+    /// [`ATTACHMENT_LINK_TTL_SECS`], or `None` when the provider cannot
+    /// mint one and the caller must serve the bytes itself.
+    pub async fn attachment_link(&self, id: &str) -> Result<Option<String>> {
+        let files = self.files.as_ref().ok_or_else(files::no_provider)?;
+        let (key, name) = self.object_of(id).await?;
+        files.presign_get(&key, ATTACHMENT_LINK_TTL_SECS, &name).await
+    }
+
+    /// The whole file, with its record.
+    pub async fn attachment_bytes(&self, id: &str) -> Result<(AttachmentView, Vec<u8>)> {
+        let files = self.files.as_ref().ok_or_else(files::no_provider)?;
+        let view = self.attachment(id).await?;
+        let (key, _) = self.object_of(id).await?;
+        let bytes = files.get(&key).await?;
+        Ok((view, bytes))
+    }
+
+    async fn object_of(&self, id: &str) -> Result<(String, String)> {
+        let row = sqlx::query("SELECT object_key, name FROM attachments WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| McpmError::not_found("attachment", id))?;
+        Ok((row.get("object_key"), row.get("name")))
+    }
+
+    /// Which level a subject id names, and its display name — refusing
+    /// a subject that does not exist before any bytes move.
+    async fn attachment_subject(&self, subject_id: &str) -> Result<(AttachmentLevel, String)> {
+        if subject_id.starts_with("want_") {
+            let row = sqlx::query("SELECT body FROM wants WHERE id = $1")
+                .bind(subject_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| McpmError::not_found("want", subject_id))?;
+            return Ok((AttachmentLevel::Want, row.get("body")));
+        }
+        if id_level(subject_id) == Some(Level::Feature) {
+            let row = sqlx::query("SELECT name FROM features WHERE id = $1")
+                .bind(subject_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| McpmError::not_found("feature", subject_id))?;
+            return Ok((AttachmentLevel::Feature, row.get("name")));
+        }
+        if id_level(subject_id) == Some(Level::Module) {
+            let row = sqlx::query("SELECT name FROM modules WHERE id = $1")
+                .bind(subject_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| McpmError::not_found("module", subject_id))?;
+            return Ok((AttachmentLevel::Module, row.get("name")));
+        }
+        Err(McpmError::new(
+            ErrorCode::NotFound,
+            format!("{subject_id} is not a feature, a want, or a module."),
+            json!({ "subject_id": subject_id }),
+            "Attach files to a feature (feat_…), a want (want_…), or a module (mod_…).",
+        ))
+    }
+
+    /// Delete objects whose rows are already gone. Best effort and
+    /// after the commit, on purpose: the rows are the record, and a
+    /// storage hiccup here leaves an orphaned object, not a lie.
+    async fn discard_objects(&self, keys: &[String]) {
+        let Some(files) = self.files.as_ref() else { return };
+        for key in keys {
+            if let Err(err) = files.delete(key).await {
+                eprintln!("mcpm: could not delete object {key} after its record was removed: {err}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Discussion
+    // -----------------------------------------------------------------
+
+    /// A note on a feature, a want, or a module, with any files it
+    /// carries. Any agent may comment; a delegated identity only on
+    /// the module it was minted for.
+    pub async fn add_comment(
+        &self,
+        actor: impl Into<Actor>,
+        subject_id: &str,
+        body: &str,
+        files: Vec<InlineFile>,
+    ) -> Result<CommentView> {
+        let actor = actor.into();
+        self.post_comment(&actor, subject_id, CommentKind::Note, body, None, None, files)
+            .await
+    }
+
+    /// Ask something of somebody, on the record, and hold the work
+    /// until they answer. `assigned_to` is an agent name (a person's
+    /// key name, the manager agent, a worker) or `None` for anyone.
+    ///
+    /// On a module the worker holding it — if any — sees `blocked`
+    /// until the answer lands, and nobody can claim it; on a feature
+    /// nothing in it is dispatchable; on a want it cannot be promoted.
+    pub async fn ask_question(
+        &self,
+        actor: impl Into<Actor>,
+        subject_id: &str,
+        body: &str,
+        assigned_to: Option<&str>,
+        files: Vec<InlineFile>,
+    ) -> Result<CommentView> {
+        let actor = actor.into();
+        let assigned_to = assigned_to.map(str::trim).filter(|a| !a.is_empty());
+        self.post_comment(&actor, subject_id, CommentKind::Question, body, assigned_to, None, files)
+            .await
+    }
+
+    /// Answer a question, which resolves it and releases whatever it
+    /// held. Who may: the assignee; the asker (withdrawing, or
+    /// answering their own); anyone, if it was assigned to nobody; and
+    /// a human at the console, whoever it was assigned to — a person
+    /// outranks an assignment, which is what "in the loop" means.
+    pub async fn answer_question(
+        &self,
+        actor: impl Into<Actor>,
+        question_id: &str,
+        body: &str,
+        files: Vec<InlineFile>,
+    ) -> Result<CommentView> {
+        let actor = actor.into();
+        let q = self.comment(question_id).await?;
+        if q.kind != CommentKind::Question {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                format!("{question_id} is a {}, not a question.", q.kind.as_str()),
+                json!({ "comment_id": question_id }),
+                "Reply to a note with add_comment; answer_question takes a question id.",
+            ));
+        }
+        if q.resolved {
+            return Err(McpmError::new(
+                ErrorCode::PlanConflict,
+                format!(
+                    "{question_id} was already answered by {}.",
+                    q.resolved_by.as_deref().unwrap_or("someone")
+                ),
+                json!({ "comment_id": question_id }),
+                "Add what you have to say with add_comment; the question is closed.",
+            ));
+        }
+        let may = actor.human
+            || q.author == actor.name
+            || match q.assigned_to.as_deref() {
+                Some(owner) => owner == actor.name,
+                None => true,
+            };
+        if !may {
+            return Err(McpmError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "{question_id} is owed by '{}', not by you.",
+                    q.assigned_to.as_deref().unwrap_or("")
+                ),
+                json!({ "comment_id": question_id, "assigned_to": q.assigned_to }),
+                "Add your view with add_comment; the assignee (or a person at the console) \
+                 gives the answer that releases the work.",
+            ));
+        }
+        self.post_comment(
+            &actor,
+            &q.subject_id,
+            CommentKind::Answer,
+            body,
+            None,
+            Some(question_id),
+            files,
+        )
+        .await
+    }
+
+    /// Every kind of post goes through here: the files first (an
+    /// orphaned object is storage; an orphaned row is a lie), then
+    /// one transaction for the comment, its attachment rows, the
+    /// question's resolution and the module's status, and the event.
+    async fn post_comment(
+        &self,
+        actor: &Actor,
+        subject_id: &str,
+        kind: CommentKind,
+        body: &str,
+        assigned_to: Option<&str>,
+        answers: Option<&str>,
+        files: Vec<InlineFile>,
+    ) -> Result<CommentView> {
+        let body = body.trim();
+        if body.is_empty() && files.is_empty() {
+            return Err(attachment_invalid("A comment needs a body or a file."));
+        }
+        let (level, subject_name, feature_id) = self.comment_subject(subject_id).await?;
+        require_comment_scope(actor, level, subject_id)?;
+
+        // Files: validated and put before anything is written.
+        let mut staged: Vec<(InlineFile, String, String, String, String)> = Vec::new();
+        for f in files {
+            let name = clean_file_name(&f.name)?;
+            if f.bytes.is_empty() {
+                return Err(attachment_invalid(format!("'{name}' is empty.")));
+            }
+            if f.bytes.len() > MAX_ATTACHMENT_BYTES {
+                return Err(attachment_invalid(format!(
+                    "'{name}' is {} bytes; the limit is {} MiB.",
+                    f.bytes.len(),
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                )));
+            }
+            let content_type = clean_content_type(&f.content_type);
+            let id = new_attachment_id();
+            let key = format!("attachments/{}/{subject_id}/{id}/{name}", level.as_str());
+            staged.push((f, name, content_type, id, key));
+        }
+        let files_store = if staged.is_empty() {
+            None
+        } else {
+            Some(self.files.as_ref().ok_or_else(files::no_provider)?)
+        };
+        let mut put: Vec<String> = Vec::new();
+        if let Some(store) = files_store {
+            for (f, _, content_type, _, key) in &staged {
+                if let Err(err) = store.put(key, f.bytes.clone(), content_type).await {
+                    self.discard_objects(&put).await;
+                    return Err(err);
+                }
+                put.push(key.clone());
+            }
+        }
+
+        let written: Result<String> = async {
+            let mut tx = self.pool.begin().await?;
+            let id = insert_comment(
+                &mut tx,
+                level.as_str(),
+                subject_id,
+                kind,
+                body,
+                &actor.name,
+                assigned_to,
+                answers,
+            )
+            .await?;
+            for (f, name, content_type, att_id, key) in &staged {
+                let sha256 = {
+                    use sha2::Digest as _;
+                    hex::encode(sha2::Sha256::digest(&f.bytes))
+                };
+                sqlx::query(
+                    "INSERT INTO attachments
+                        (id, level, subject_id, name, description, content_type, size_bytes,
+                         object_key, sha256, added_by, comment_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                )
+                .bind(att_id)
+                .bind(level.as_str())
+                .bind(subject_id)
+                .bind(name)
+                .bind(f.description.trim())
+                .bind(content_type)
+                .bind(f.bytes.len() as i64)
+                .bind(key)
+                .bind(&sha256)
+                .bind(&actor.name)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let mut event = json!({
+                "comment_id": id,
+                "kind": kind.as_str(),
+                "level": level.as_str(),
+                "subject": subject_name,
+                "author": actor.name,
+                "excerpt": excerpt(body, 160),
+                "files": staged.len(),
+            });
+            let mut event_kind = "comment_added";
+            match kind {
+                CommentKind::Question => {
+                    event_kind = "question_asked";
+                    event["assigned_to"] = json!(assigned_to);
+                    // A claimed module waits on the answer.
+                    if level == AttachmentLevel::Module {
+                        sqlx::query(
+                            "UPDATE modules SET status = 'blocked'
+                             WHERE id = $1 AND status = 'in_progress'",
+                        )
+                        .bind(subject_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                CommentKind::Answer => {
+                    event_kind = "question_answered";
+                    let question = answers.expect("an answer names its question");
+                    sqlx::query(
+                        "UPDATE comments SET resolved_at = now(), resolved_by = $2
+                         WHERE id = $1 AND resolved_at IS NULL",
+                    )
+                    .bind(question)
+                    .bind(&actor.name)
+                    .execute(&mut *tx)
+                    .await?;
+                    event["question_id"] = json!(question);
+                    // The last open question on a blocked module clears
+                    // it: back to its worker if one still holds it.
+                    if level == AttachmentLevel::Module {
+                        let released = release_if_answered(&mut tx, subject_id).await?;
+                        event["released"] = json!(released);
+                    }
+                }
+                CommentKind::Note => {}
+            }
+            record_event(
+                &mut tx,
+                event_kind,
+                feature_id.as_deref(),
+                Some(subject_id),
+                Some(&actor.name),
+                event,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(id)
+        }
+        .await;
+        match written {
+            Ok(id) => self.comment(&id).await,
+            Err(err) => {
+                self.discard_objects(&put).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Rewrite a comment's body. The author's, and the author's only;
+    /// a question's assignment is not editable — ask a new one.
+    pub async fn edit_comment(
+        &self,
+        actor: impl Into<Actor>,
+        id: &str,
+        body: &str,
+    ) -> Result<CommentView> {
+        let actor = actor.into();
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(attachment_invalid("A comment needs a body — delete it instead."));
+        }
+        let current = self.comment(id).await?;
+        require_comment_author(&actor, &current, "edit")?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE comments SET body = $2, edited_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(body)
+            .execute(&mut *tx)
+            .await?;
+        record_event(
+            &mut tx,
+            "comment_edited",
+            comment_feature(&current).as_deref(),
+            Some(&current.subject_id),
+            Some(&actor.name),
+            json!({
+                "comment_id": id,
+                "kind": current.kind.as_str(),
+                "subject": current.subject_name,
+                "excerpt": excerpt(body, 160),
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        self.comment(id).await
+    }
+
+    /// Delete a note, or withdraw an open question — the author's act.
+    /// An answer and an answered question are history and stay.
+    /// Withdrawing a question releases what it held, like an answer.
+    pub async fn delete_comment(&self, actor: impl Into<Actor>, id: &str) -> Result<Ack> {
+        let actor = actor.into();
+        let current = self.comment(id).await?;
+        require_comment_author(&actor, &current, "delete")?;
+        match current.kind {
+            CommentKind::Answer => {
+                return Err(plan_conflict(
+                    "An answer is what released the work; it stays on the record.",
+                ))
+            }
+            CommentKind::Question if current.resolved => {
+                return Err(plan_conflict(
+                    "An answered question is history; it stays on the record.",
+                ))
+            }
+            _ => {}
+        }
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query("DELETE FROM attachments WHERE comment_id = $1 RETURNING object_key")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+        let orphaned: Vec<String> = rows.iter().map(|r| r.get::<String, _>("object_key")).collect();
+        sqlx::query("DELETE FROM comments WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let mut event = json!({
+            "comment_id": id,
+            "kind": current.kind.as_str(),
+            "subject": current.subject_name,
+        });
+        if current.kind == CommentKind::Question && current.level == "module" {
+            let released = release_if_answered(&mut tx, &current.subject_id).await?;
+            event["released"] = json!(released);
+        }
+        record_event(
+            &mut tx,
+            if current.kind == CommentKind::Question { "question_withdrawn" } else { "comment_deleted" },
+            comment_feature(&current).as_deref(),
+            Some(&current.subject_id),
+            Some(&actor.name),
+            event,
+        )
+        .await?;
+        tx.commit().await?;
+        self.discard_objects(&orphaned).await;
+        Ok(Ack::new(if current.kind == CommentKind::Question {
+            "Question withdrawn.".to_string()
+        } else {
+            "Comment deleted.".to_string()
+        }))
+    }
+
+    /// One comment, with its files.
+    pub async fn comment(&self, id: &str) -> Result<CommentView> {
+        let row = sqlx::query(&format!(
+            "SELECT {COMMENT_FIELDS} FROM comments c {COMMENT_JOINS} WHERE c.id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| McpmError::not_found("comment", id))?;
+        let mut view = map_comment(&row);
+        view.attachments = self.comment_files(&[id.to_string()]).await?.remove(id).unwrap_or_default();
+        Ok(view)
+    }
+
+    /// The discussion on one subject, oldest first, at most `limit`
+    /// newest comments. `since` (a comment id) returns only what landed
+    /// after it — an agent re-reading a thread it has seen.
+    pub async fn comments_of(
+        &self,
+        subject_id: &str,
+        since: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<CommentView>> {
+        let level = comment_level_of(subject_id)?;
+        let rows = sqlx::query(&format!(
+            "SELECT * FROM (
+                SELECT {COMMENT_FIELDS} FROM comments c {COMMENT_JOINS}
+                 WHERE c.level = $1 AND c.subject_id = $2
+                   AND ($3::text IS NULL OR c.created_at > (SELECT created_at FROM comments WHERE id = $3))
+                 ORDER BY c.created_at DESC, c.id DESC LIMIT $4
+             ) newest ORDER BY created_at, id"
+        ))
+        .bind(level.as_str())
+        .bind(subject_id)
+        .bind(since)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        self.attach_comment_files(rows.iter().map(map_comment).collect()).await
+    }
+
+    /// Open questions across the project, for the console's attention
+    /// list: oldest first, so the longest-waiting is at the top.
+    pub async fn open_questions(&self) -> Result<Vec<QuestionRef>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {QUESTION_FIELDS} FROM comments c {COMMENT_JOINS}
+              WHERE c.kind = 'question' AND c.resolved_at IS NULL
+                AND (f.id IS NULL OR f.status <> 'done')
+                AND (mf.id IS NULL OR mf.status <> 'done')
+              ORDER BY c.created_at"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(map_question).collect())
+    }
+
+    /// Open questions owed by one agent.
+    pub async fn questions_awaiting(&self, agent: &str) -> Result<Vec<QuestionRef>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {QUESTION_FIELDS} FROM comments c {COMMENT_JOINS}
+              WHERE c.kind = 'question' AND c.resolved_at IS NULL AND c.assigned_to = $1
+              ORDER BY c.created_at"
+        ))
+        .bind(agent)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(map_question).collect())
+    }
+
+    /// Every open question in a feature: on it, or on any of its modules.
+    async fn open_questions_in(&self, feature_id: &str) -> Result<Vec<QuestionRef>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {QUESTION_FIELDS} FROM comments c {COMMENT_JOINS}
+              WHERE c.kind = 'question' AND c.resolved_at IS NULL
+                AND ((c.level = 'feature' AND c.subject_id = $1)
+                  OR (c.level = 'module' AND m.feature_id = $1))
+              ORDER BY c.created_at"
+        ))
+        .bind(feature_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(map_question).collect())
+    }
+
+    /// What a claim briefing carries: the newest comments on the
+    /// module and on its feature, oldest first.
+    async fn briefing_discussion(&self, feature_id: &str, module_id: &str) -> Result<Vec<CommentView>> {
+        let rows = sqlx::query(&format!(
+            "SELECT * FROM (
+                SELECT {COMMENT_FIELDS} FROM comments c {COMMENT_JOINS}
+                 WHERE (c.level = 'feature' AND c.subject_id = $1)
+                    OR (c.level = 'module' AND c.subject_id = $2)
+                 ORDER BY c.created_at DESC, c.id DESC LIMIT 30
+             ) newest ORDER BY created_at, id"
+        ))
+        .bind(feature_id)
+        .bind(module_id)
+        .fetch_all(&self.pool)
+        .await?;
+        self.attach_comment_files(rows.iter().map(map_comment).collect()).await
+    }
+
+    async fn attach_comment_files(&self, mut comments: Vec<CommentView>) -> Result<Vec<CommentView>> {
+        let ids: Vec<String> = comments.iter().map(|c| c.id.clone()).collect();
+        let mut files = self.comment_files(&ids).await?;
+        for c in &mut comments {
+            c.attachments = files.remove(&c.id).unwrap_or_default();
+        }
+        Ok(comments)
+    }
+
+    async fn comment_files(
+        &self,
+        comment_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<AttachmentView>>> {
+        let mut out: std::collections::HashMap<String, Vec<AttachmentView>> = Default::default();
+        if comment_ids.is_empty() {
+            return Ok(out);
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT {ATTACHMENT_FIELDS}, NULL::text AS via_want_id, NULL::text AS via_want_body,
+                    NULL::text AS via_module_id, NULL::text AS via_module_name
+               FROM attachments a {ATTACHMENT_JOINS}
+              WHERE a.comment_id = ANY($1)
+              ORDER BY a.created_at, a.id"
+        ))
+        .bind(comment_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        for r in &rows {
+            let cid: Option<String> = r.get("comment_id");
+            out.entry(cid.unwrap_or_default()).or_default().push(map_attachment(r));
+        }
+        Ok(out)
+    }
+
+    /// Which level a subject id names, its display name, and the
+    /// feature it belongs to (for the ledger).
+    async fn comment_subject(
+        &self,
+        subject_id: &str,
+    ) -> Result<(AttachmentLevel, String, Option<String>)> {
+        match comment_level_of(subject_id)? {
+            AttachmentLevel::Module => {
+                let row = sqlx::query("SELECT name, feature_id FROM modules WHERE id = $1")
+                    .bind(subject_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .ok_or_else(|| McpmError::not_found("module", subject_id))?;
+                Ok((AttachmentLevel::Module, row.get("name"), Some(row.get("feature_id"))))
+            }
+            level => {
+                let (lvl, name) = self.attachment_subject(subject_id).await?;
+                debug_assert!(lvl == level);
+                Ok((
+                    lvl,
+                    name,
+                    (lvl == AttachmentLevel::Feature).then(|| subject_id.to_string()),
+                ))
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -2585,6 +3592,8 @@ impl Store {
             ));
         }
         let mut tx = self.pool.begin().await?;
+        let orphaned = delete_attachment_rows(&mut tx, "want", id).await?;
+        delete_comment_rows(&mut tx, "want", id).await?;
         sqlx::query("DELETE FROM wants WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -2599,6 +3608,7 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        self.discard_objects(&orphaned).await;
         Ok(Ack { ok: true, message: "Want deleted.".to_string(), data: serde_json::Value::Null })
     }
 
@@ -2671,6 +3681,33 @@ impl Store {
         }
 
         let mut tx = self.pool.begin().await?;
+        // A want with an open question is scope nobody has settled:
+        // composing it into a plan would answer the question by fiat.
+        let mut unsettled: Vec<QuestionRef> = Vec::new();
+        for id in &ids {
+            unsettled.extend(open_questions_on(&mut tx, "want", id).await?);
+        }
+        if !unsettled.is_empty() {
+            return Err(McpmError::new(
+                ErrorCode::PendingResolution,
+                format!(
+                    "{} open question(s) on these wants: {}. Nothing was written.",
+                    unsettled.len(),
+                    unsettled
+                        .iter()
+                        .map(|q| format!(
+                            "{} on {} (owed by {})",
+                            q.id,
+                            q.subject_id,
+                            q.assigned_to.as_deref().unwrap_or("anyone")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                json!({ "pending": unsettled }),
+                "Answer them (answer_question) or leave those wants out of this promotion.",
+            ));
+        }
         let feature_id = match (&req.plan, &req.feature_id) {
             (Some(plan), _) => {
                 let modules = lowered.as_deref().expect("validated above");
@@ -3028,6 +4065,14 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
 
+        // Every open question in the feature, on it or on a module,
+        // in one read: the gate's other half, derived here so
+        // `dispatchable` cannot disagree with `claim_module`.
+        let questions = self.open_questions_in(feature_id).await?;
+        let feature_questions: Vec<QuestionRef> =
+            questions.iter().filter(|q| q.level == "feature").cloned().collect();
+        let feature_open = !feature_questions.is_empty();
+
         let edges: Vec<(String, String)> = edge_rows
             .iter()
             .map(|r| (r.get("module_id"), r.get("depends_on")))
@@ -3081,8 +4126,18 @@ impl Store {
                 .filter(|d| status_of(d) != "done")
                 .cloned()
                 .collect();
+            let open_questions: Vec<QuestionRef> = questions
+                .iter()
+                .filter(|q| q.level == "module" && q.subject_id == mid)
+                .cloned()
+                .collect();
             modules.push(ModuleView {
-                dispatchable: mstatus == "todo" && claimed.is_none() && waiting_on.is_empty(),
+                dispatchable: mstatus == "todo"
+                    && claimed.is_none()
+                    && waiting_on.is_empty()
+                    && !feature_open
+                    && open_questions.is_empty(),
+                open_questions,
                 id: mid.clone(),
                 name: m.get("name"),
                 description: m.get("description"),
@@ -3110,6 +4165,7 @@ impl Store {
             .current_document(DocumentKind::Whitepaper, feature_id)
             .await?;
 
+        let attachments = self.feature_attachments(feature_id).await?;
         Ok(FeatureTree {
             id: feature.get("id"),
             name: feature.get("name"),
@@ -3118,6 +4174,8 @@ impl Store {
             summary: feature.get("summary"),
             modules,
             whitepaper,
+            attachments,
+            open_questions: feature_questions,
         })
     }
 
@@ -4190,6 +5248,379 @@ async fn record_event(
     Ok(())
 }
 
+/// Delete every attachment row of one subject inside `tx`, returning
+/// the object keys the caller discards once the transaction commits.
+async fn delete_attachment_rows(
+    tx: &mut Tx<'_>,
+    level: &str,
+    subject_id: &str,
+) -> std::result::Result<Vec<String>, McpmError> {
+    let rows = sqlx::query(
+        "DELETE FROM attachments WHERE level = $1 AND subject_id = $2 RETURNING object_key",
+    )
+    .bind(level)
+    .bind(subject_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.iter().map(|r| r.get::<String, _>("object_key")).collect())
+}
+
+/// The three things an attachment — or a comment — can ride.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttachmentLevel {
+    Feature,
+    Want,
+    Module,
+}
+
+impl AttachmentLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            AttachmentLevel::Feature => "feature",
+            AttachmentLevel::Want => "want",
+            AttachmentLevel::Module => "module",
+        }
+    }
+}
+
+fn attachment_level(s: &str) -> AttachmentLevel {
+    match s {
+        "want" => AttachmentLevel::Want,
+        "module" => AttachmentLevel::Module,
+        _ => AttachmentLevel::Feature,
+    }
+}
+
+/// The level a subject id names, from its prefix — before any read.
+fn comment_level_of(subject_id: &str) -> std::result::Result<AttachmentLevel, McpmError> {
+    if subject_id.starts_with("want_") {
+        return Ok(AttachmentLevel::Want);
+    }
+    match id_level(subject_id) {
+        Some(Level::Feature) => Ok(AttachmentLevel::Feature),
+        Some(Level::Module) => Ok(AttachmentLevel::Module),
+        _ => Err(McpmError::new(
+            ErrorCode::NotFound,
+            format!("{subject_id} is not a feature, a want, or a module."),
+            json!({ "subject_id": subject_id }),
+            "Discussion happens on features (feat_…), wants (want_…) and modules (mod_…).",
+        )),
+    }
+}
+
+/// The `feature_id` an attachment event carries: the feature itself,
+/// or nothing for a want — which is what lets the console refetch the
+/// open feature for the one and the pool for the other. A module's is
+/// looked up by the caller that has it.
+fn attachment_feature(level: AttachmentLevel, subject_id: &str) -> Option<&str> {
+    match level {
+        AttachmentLevel::Feature => Some(subject_id),
+        AttachmentLevel::Want | AttachmentLevel::Module => None,
+    }
+}
+
+fn comment_feature(c: &CommentView) -> Option<String> {
+    match c.level.as_str() {
+        "feature" => Some(c.subject_id.clone()),
+        _ => None,
+    }
+}
+
+/// A delegated identity may talk only about the module it was minted
+/// for; everyone else may talk anywhere.
+fn require_comment_scope(
+    actor: &Actor,
+    level: AttachmentLevel,
+    subject_id: &str,
+) -> std::result::Result<(), McpmError> {
+    match &actor.scope {
+        Some(scope) if level != AttachmentLevel::Module || scope != subject_id => Err(McpmError::new(
+            ErrorCode::Forbidden,
+            format!(
+                "A delegated identity is confined to its module ({scope}) and cannot post on \
+                 {subject_id}."
+            ),
+            json!({ "subject_id": subject_id, "scope": scope }),
+            "Post on your own module, or ask the agent that minted you.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn require_comment_author(
+    actor: &Actor,
+    c: &CommentView,
+    action: &str,
+) -> std::result::Result<(), McpmError> {
+    if c.author == actor.name {
+        return Ok(());
+    }
+    Err(McpmError::new(
+        ErrorCode::Forbidden,
+        format!("Only its author ('{}') may {action} comment {}.", c.author, c.id),
+        json!({ "comment_id": c.id, "author": c.author }),
+        "Add your own comment instead.",
+    ))
+}
+
+/// Delete every comment of one subject inside `tx`. Their attachment
+/// rows cascade; the caller has already collected those object keys
+/// through `delete_attachment_rows` on the same subject (a comment's
+/// files are the subject's files).
+async fn delete_comment_rows(
+    tx: &mut Tx<'_>,
+    level: &str,
+    subject_id: &str,
+) -> std::result::Result<(), McpmError> {
+    sqlx::query("DELETE FROM comments WHERE level = $1 AND subject_id = $2")
+        .bind(level)
+        .bind(subject_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_comment(
+    tx: &mut Tx<'_>,
+    level: &str,
+    subject_id: &str,
+    kind: CommentKind,
+    body: &str,
+    author: &str,
+    assigned_to: Option<&str>,
+    answers: Option<&str>,
+) -> std::result::Result<String, McpmError> {
+    let id = new_comment_id();
+    sqlx::query(
+        "INSERT INTO comments (id, level, subject_id, kind, body, author, assigned_to, answers)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&id)
+    .bind(level)
+    .bind(subject_id)
+    .bind(kind.as_str())
+    .bind(body)
+    .bind(author)
+    .bind(assigned_to)
+    .bind(answers)
+    .execute(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
+/// Clear a module's `blocked` once no question on it is open: back to
+/// its worker if one still holds it, else to the queue. Returns
+/// whether anything changed.
+async fn release_if_answered(
+    tx: &mut Tx<'_>,
+    module_id: &str,
+) -> std::result::Result<bool, McpmError> {
+    let n = sqlx::query(
+        "UPDATE modules SET status = CASE WHEN claimed_by IS NULL THEN 'todo' ELSE 'in_progress' END
+          WHERE id = $1 AND status = 'blocked'
+            AND NOT EXISTS (SELECT 1 FROM comments q
+                             WHERE q.level = 'module' AND q.subject_id = $1
+                               AND q.kind = 'question' AND q.resolved_at IS NULL)",
+    )
+    .bind(module_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
+/// Open questions on one subject, inside a transaction.
+async fn open_questions_on(
+    tx: &mut Tx<'_>,
+    level: &str,
+    subject_id: &str,
+) -> std::result::Result<Vec<QuestionRef>, McpmError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {QUESTION_FIELDS} FROM comments c {COMMENT_JOINS}
+          WHERE c.kind = 'question' AND c.resolved_at IS NULL
+            AND c.level = $1 AND c.subject_id = $2
+          ORDER BY c.created_at"
+    ))
+    .bind(level)
+    .bind(subject_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.iter().map(map_question).collect())
+}
+
+/// Open questions on a feature and, when given, on one of its modules
+/// — what the claim gate reads.
+async fn open_questions_tx(
+    tx: &mut Tx<'_>,
+    feature_id: &str,
+    module_id: Option<&str>,
+) -> std::result::Result<Vec<QuestionRef>, McpmError> {
+    let mut out = open_questions_on(tx, "feature", feature_id).await?;
+    if let Some(m) = module_id {
+        out.extend(open_questions_on(tx, "module", m).await?);
+    }
+    Ok(out)
+}
+
+/// The first line or so of a body, for a ledger row or a hint.
+fn excerpt(body: &str, max: usize) -> String {
+    let first = body.trim().lines().next().unwrap_or("").trim();
+    let mut out: String = first.chars().take(max).collect();
+    if first.chars().count() > max || body.trim().lines().count() > 1 {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+const COMMENT_FIELDS: &str = "c.id, c.level, c.subject_id, c.kind, c.body, c.author, c.assigned_to, \
+    c.answers, c.resolved_at, c.resolved_by, c.created_at, c.edited_at, \
+    COALESCE(f.name, wnt.body, m.name, '') AS subject_name, \
+    COALESCE(f.id, m.feature_id) AS feature_id";
+const COMMENT_JOINS: &str = "LEFT JOIN features f ON c.level = 'feature' AND f.id = c.subject_id \
+    LEFT JOIN wants wnt ON c.level = 'want' AND wnt.id = c.subject_id \
+    LEFT JOIN modules m ON c.level = 'module' AND m.id = c.subject_id \
+    LEFT JOIN features mf ON mf.id = m.feature_id";
+const QUESTION_FIELDS: &str = "c.id, c.level, c.subject_id, c.body, c.author, c.assigned_to, \
+    c.created_at, COALESCE(f.name, wnt.body, m.name, '') AS subject_name, \
+    COALESCE(f.id, m.feature_id) AS feature_id";
+
+fn map_comment(r: &sqlx::postgres::PgRow) -> CommentView {
+    let resolved_at: Option<chrono::DateTime<chrono::Utc>> = r.get("resolved_at");
+    CommentView {
+        id: r.get("id"),
+        level: r.get("level"),
+        subject_id: r.get("subject_id"),
+        subject_name: r.get("subject_name"),
+        kind: CommentKind::parse(r.get::<String, _>("kind").as_str()).unwrap_or(CommentKind::Note),
+        body: r.get("body"),
+        author: r.get("author"),
+        assigned_to: r.get("assigned_to"),
+        answers: r.get("answers"),
+        resolved: resolved_at.is_some(),
+        resolved_by: r.get("resolved_by"),
+        resolved_at,
+        created_at: r.get("created_at"),
+        edited_at: r.get("edited_at"),
+        attachments: Vec::new(),
+    }
+}
+
+fn map_question(r: &sqlx::postgres::PgRow) -> QuestionRef {
+    QuestionRef {
+        id: r.get("id"),
+        level: r.get("level"),
+        subject_id: r.get("subject_id"),
+        subject_name: r.get("subject_name"),
+        feature_id: r.get("feature_id"),
+        body: r.get("body"),
+        author: r.get("author"),
+        assigned_to: r.get("assigned_to"),
+        created_at: r.get("created_at"),
+    }
+}
+
+/// A file name fit for a display name and the last segment of an
+/// object key: no path separators, no control characters, not empty,
+/// not absurdly long. The name is what a reader sees and what a
+/// presigned link downloads as; it is never used to locate anything
+/// on a filesystem.
+fn clean_file_name(raw: &str) -> std::result::Result<String, McpmError> {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let mut out: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == '?' || c == '#' { '_' } else { c })
+        .collect();
+    if out.chars().count() > 200 {
+        out = out.chars().take(200).collect();
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        return Err(attachment_invalid("The file needs a name."));
+    }
+    Ok(out)
+}
+
+/// A content type the store will record: the caller's, when it looks
+/// like one, else the octet-stream default.
+fn clean_content_type(raw: &str) -> String {
+    let t = raw.trim();
+    if t.contains('/') && t.len() <= 120 && t.chars().all(|c| !c.is_control()) {
+        t.to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+fn attachment_invalid(message: impl Into<String>) -> McpmError {
+    McpmError::new(
+        ErrorCode::PlanInvalid,
+        message,
+        serde_json::Value::Null,
+        "Nothing was stored. Fix the file or its name and attach again.",
+    )
+}
+
+/// The refusal for a delegated identity reaching outside its module.
+/// Attachments, like the whitepaper, ride the feature or the want, so
+/// a subagent may READ them (they arrive in its briefing) but not
+/// change what its manager attached.
+fn require_undelegated(actor: &Actor, action: &str) -> std::result::Result<(), McpmError> {
+    if actor.is_delegated() {
+        return Err(McpmError::new(
+            ErrorCode::Forbidden,
+            format!(
+                "A delegated identity is confined to its module and cannot {action}; \
+                 attachments belong to the feature or the want."
+            ),
+            serde_json::Value::Null,
+            "Ask the agent that minted you to do it, or put what you learned in your \
+             module's handoff.",
+        ));
+    }
+    Ok(())
+}
+
+const ATTACHMENT_FIELDS: &str = "a.id, a.level, a.subject_id, a.name, a.description, \
+    a.content_type, a.size_bytes, a.sha256, a.added_by, a.created_at, a.updated_at, \
+    a.comment_id, ac.author AS comment_author, ac.body AS comment_body, \
+    COALESCE(f.name, wnt.body, amod.name, '') AS subject_name";
+const ATTACHMENT_JOINS: &str = "LEFT JOIN features f ON a.level = 'feature' AND f.id = a.subject_id \
+    LEFT JOIN wants wnt ON a.level = 'want' AND wnt.id = a.subject_id \
+    LEFT JOIN modules amod ON a.level = 'module' AND amod.id = a.subject_id \
+    LEFT JOIN comments ac ON ac.id = a.comment_id";
+
+fn map_attachment(r: &sqlx::postgres::PgRow) -> AttachmentView {
+    let via_id: Option<String> = r.get("via_want_id");
+    let via_body: Option<String> = r.get("via_want_body");
+    let via_mid: Option<String> = r.get("via_module_id");
+    let via_mname: Option<String> = r.get("via_module_name");
+    let comment_id: Option<String> = r.get("comment_id");
+    let comment_author: Option<String> = r.get("comment_author");
+    let comment_body: Option<String> = r.get("comment_body");
+    AttachmentView {
+        id: r.get("id"),
+        level: r.get("level"),
+        subject_id: r.get("subject_id"),
+        subject_name: r.get("subject_name"),
+        name: r.get("name"),
+        description: r.get("description"),
+        content_type: r.get("content_type"),
+        size_bytes: r.get("size_bytes"),
+        sha256: r.get("sha256"),
+        added_by: r.get("added_by"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+        via_want: via_id.map(|id| WantOrigin { id, body: via_body.unwrap_or_default() }),
+        via_module: via_mid.map(|id| ModuleOrigin { id, name: via_mname.unwrap_or_default() }),
+        comment: comment_id.map(|id| CommentOrigin {
+            id,
+            author: comment_author.unwrap_or_default(),
+            excerpt: excerpt(&comment_body.unwrap_or_default(), 160),
+        }),
+    }
+}
+
 async fn insert_memory(
     tx: &mut Tx<'_>,
     level: Level,
@@ -4457,6 +5888,7 @@ async fn apply_plan_op(
     agent: &str,
     feature_id: &str,
     op: PlanOp,
+    discards: &mut Vec<String>,
 ) -> std::result::Result<String, McpmError> {
     match op {
         PlanOp::AddModule { name, description, tasks, depends_on, owns } => {
@@ -4659,8 +6091,11 @@ async fn apply_plan_op(
                              history.",
                         ));
                     }
-                    // Edges cascade with the row; a dependent simply
+                    // Its files and discussion go with it; edges
+                    // cascade with the row, and a dependent simply
                     // loses this prerequisite, which only loosens.
+                    discards.extend(delete_attachment_rows(tx, "module", &id).await?);
+                    delete_comment_rows(tx, "module", &id).await?;
                     sqlx::query("DELETE FROM modules WHERE id = $1")
                         .bind(&id)
                         .execute(&mut **tx)

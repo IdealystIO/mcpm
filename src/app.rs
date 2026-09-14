@@ -6,8 +6,8 @@
 use idea_ui::{dark_theme, install_idea_theme_reactive, light_theme, IdeaThemeRef, ToastHost,
     ToastPlacement};
 use idea_ui_nav::AppShell;
-use runtime_core::{presence, raf_loop_scoped, spawn_then, stylesheet, switch, ui, Breakpoint,
-    Easing, Element, FlexDirection, IntoElement, Position, PresenceAnim};
+use runtime_core::{raf_loop_scoped, spawn_then, stylesheet, switch, ui, Breakpoint, Easing,
+    Element, FlexDirection, Position, PresenceAnim};
 
 use crate::components::drawer::{Drawer, WantDrawer};
 use crate::components::edits::{ActionRunner, EditHost};
@@ -34,7 +34,7 @@ use crate::state::{use_console_live, Console};
 /// with no traffic. Set `MCPM_API_ORIGIN` to the deployment's own
 /// origin when building a hosted console; the devcontainer path needs
 /// nothing.
-const API_ORIGIN: &str = match option_env!("MCPM_API_ORIGIN") {
+pub const API_ORIGIN: &str = match option_env!("MCPM_API_ORIGIN") {
     Some(origin) => origin,
     None => "http://127.0.0.1:3210",
 };
@@ -100,42 +100,50 @@ pub fn app() -> Element {
     // loaded yet when the drawer is asked for (the home screen's
     // attention list opens into any feature), and it arrives a rev
     // later.
-    let drawer_host = presence(move || {
-        switch(
-            move || (console.feature.get(), console.last_module.get(), console.rev.get()),
-            move |(fi, sel, _rev): &(usize, Option<String>, u64)| {
-                match sel.as_deref().and_then(|id| drawer_target(*fi, id)) {
-                    Some(mi) => ui! { Drawer(console = console, feature = *fi, module = mi) },
-                    None => ui! { view {} },
-                }
-            },
-        )
-    })
-    .present(move || console.selected.get().is_some())
-    .enter(PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut))
-    .exit(PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn))
-    .into_element();
+    let drawer_host: Element = ui! {
+        presence(
+            present = move || console.selected.get().is_some(),
+            enter = PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut),
+            exit = PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn),
+        ) {
+            {
+                switch(
+                    move || (console.feature.get(), console.last_module.get(), console.rev.get()),
+                    move |(fi, sel, _rev): &(usize, Option<String>, u64)| {
+                        match sel.as_deref().and_then(|id| drawer_target(*fi, id)) {
+                            Some(mi) => ui! { Drawer(console = console, feature = *fi, module = mi) },
+                            None => ui! { view {} },
+                        }
+                    },
+                )
+            }
+        }
+    };
 
     // The want drawer shares the module drawer's slot; `Console` keeps
     // at most one of the two targets set. Keyed on the want **id**:
     // the pool is paged and re-sorted under the reader, and an origin
     // row can open an idea no loaded page holds — the sync loop
     // fetches it by id and the panel reads it back the same way.
-    let want_host = presence(move || {
-        switch(
-            move || (console.last_want.get(), console.rev.get()),
-            move |(id, _rev): &(Option<String>, u64)| match id {
-                Some(id) if model::want_by_id(id).is_some() => ui! {
-                    WantDrawer(console = console, want = id.clone())
-                },
-                _ => ui! { view {} },
-            },
-        )
-    })
-    .present(move || console.want.get().is_some())
-    .enter(PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut))
-    .exit(PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn))
-    .into_element();
+    let want_host: Element = ui! {
+        presence(
+            present = move || console.want.get().is_some(),
+            enter = PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut),
+            exit = PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn),
+        ) {
+            {
+                switch(
+                    move || (console.last_want.get(), console.rev.get()),
+                    move |(id, _rev): &(Option<String>, u64)| match id {
+                        Some(id) if model::want_by_id(id).is_some() => ui! {
+                            WantDrawer(console = console, want = id.clone())
+                        },
+                        _ => ui! { view {} },
+                    },
+                )
+            }
+        }
+    };
 
     // The gate replaces the whole body, sidebar included: with the host
     // refusing us there is no data behind it to show, and a rail of
@@ -177,19 +185,23 @@ pub fn app() -> Element {
     // The knowledge drawer shares the overlay slot with the other two.
     // Keyed on the memory id — the base re-ranks under a poll, so an
     // index would slide onto a different entry mid-read.
-    let knowledge_host = presence(move || {
-        switch(
-            move || console.know_open.get(),
-            move |id: &Option<String>| match id {
-                Some(id) => ui! { KnowledgeDrawer(console = console, memory_id = id.clone()) },
-                None => ui! { view {} },
-            },
-        )
-    })
-    .present(move || console.know_open.get().is_some())
-    .enter(PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut))
-    .exit(PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn))
-    .into_element();
+    let knowledge_host: Element = ui! {
+        presence(
+            present = move || console.know_open.get().is_some(),
+            enter = PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut),
+            exit = PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn),
+        ) {
+            {
+                switch(
+                    move || console.know_open.get(),
+                    move |id: &Option<String>| match id {
+                        Some(id) => ui! { KnowledgeDrawer(console = console, memory_id = id.clone()) },
+                        None => ui! { view {} },
+                    },
+                )
+            }
+        }
+    };
 
     ui! {
         view(style = PageFrame()) {
@@ -228,6 +240,14 @@ struct Wanted {
     pool: Option<PoolKey>,
     /// The idea whose drawer is open.
     want: Option<String>,
+    /// The discussions on screen — a want's, a module's, a feature's —
+    /// most specific first.
+    threads: Vec<String>,
+}
+
+/// Whether one of the threads on screen is `subject`.
+fn wanted_threads_hold(wanted: &Wanted, subject: &str) -> bool {
+    wanted.threads.iter().any(|t| t == subject)
 }
 
 #[derive(Clone, PartialEq, Eq, Default)]
@@ -296,6 +316,7 @@ fn start_sync(console: Console, key: String) {
     let mut stale_feature = true;
     let mut stale_pool = true;
     let mut stale_want = true;
+    let mut stale_threads = true;
     let in_flight: InFlight = Rc::new(RefCell::new(HashMap::new()));
 
     raf_loop_scoped(move || {
@@ -308,7 +329,28 @@ fn start_sync(console: Console, key: String) {
         let fi = console.feature.get();
         let feature_id = model::feature_id_at(fi);
         let on_feature = pane == "feature" && feature_id.is_some();
+        // The discussions on screen, most specific first: the want
+        // drawer covers the module drawer covers the feature tab. The
+        // first is where the composer aims.
+        let mut threads: Vec<String> = Vec::new();
+        if let Some(w) = console.want.get() {
+            threads.push(w);
+        }
+        if on_feature {
+            if let Some(m) = console.selected.get() {
+                threads.push(m);
+            }
+            if console.view.get() == "discussion" {
+                if let Some(f) = feature_id.clone() {
+                    threads.push(f);
+                }
+            }
+        }
+        if let Some(primary) = threads.first() {
+            console.aim_composer(primary);
+        }
         let wanted = Wanted {
+            threads,
             feature: on_feature.then(|| feature_id.clone()).flatten(),
             module: on_feature.then(|| console.selected.get()).flatten(),
             feed: (on_feature && console.view.get() == "feed")
@@ -336,7 +378,23 @@ fn start_sync(console: Console, key: String) {
                 if untyped || tick.feature_id == feature_id {
                     stale_feature = true;
                 }
-                if untyped || tick.kind.starts_with("want") || tick.kind.starts_with("tag") {
+                // A comment lands on its subject; a question's answer
+                // also moves the feature's readiness. Either way the
+                // threads on screen are re-read when one names them.
+                let on_thread = tick
+                    .subject_id
+                    .as_deref()
+                    .is_some_and(|s| wanted_threads_hold(&last_wanted, s))
+                    || (tick.feature_id.is_some() && tick.feature_id == feature_id);
+                if untyped || on_thread {
+                    stale_threads = true;
+                }
+                // A want moves under a want_* / tag_* event, and under
+                // anything whose SUBJECT is a want — a file attached to
+                // one carries no feature id, so the kind alone would
+                // leave the open drawer stale.
+                let on_want = tick.subject_id.as_deref().is_some_and(|s| s.starts_with("want_"));
+                if untyped || on_want || tick.kind.starts_with("want") || tick.kind.starts_with("tag") {
                     stale_pool = true;
                     stale_want = true;
                 }
@@ -352,6 +410,7 @@ fn start_sync(console: Console, key: String) {
             stale_feature = true;
             stale_pool = true;
             stale_want = true;
+            stale_threads = true;
         }
         // The fallback poll refreshes everything, as a tick naming all
         // of it would.
@@ -361,6 +420,7 @@ fn start_sync(console: Console, key: String) {
             stale_feature = true;
             stale_pool = true;
             stale_want = true;
+            stale_threads = true;
         }
         // A selection change is stale by definition: the new target
         // may be cached, but it has not been refreshed since it was
@@ -373,6 +433,9 @@ fn start_sync(console: Console, key: String) {
         }
         if wanted.want != last_wanted.want {
             stale_want = true;
+        }
+        if wanted.threads != last_wanted.threads {
+            stale_threads = true;
         }
         // The feed's "load older" is a one-shot request, not a state.
         let older = console.feed_older.get();
@@ -484,6 +547,20 @@ fn start_sync(console: Console, key: String) {
                 fetch_feed(console, &in_flight, now, fid, cursor);
             }
         }
+        // Each discussion on screen: read once when it opens, re-read
+        // when a tick names it or the poll comes round.
+        if stale_threads {
+            stale_threads = false;
+            for subject in wanted.threads.clone() {
+                fetch_thread(console, &in_flight, now, subject);
+            }
+        } else {
+            for subject in wanted.threads.clone() {
+                if !model::has_thread(&subject) {
+                    fetch_thread(console, &in_flight, now, subject);
+                }
+            }
+        }
 
         if let Some(key) = wanted.pool.clone() {
             if stale_pool && started("pool") {
@@ -546,6 +623,26 @@ fn fetch_module(console: Console, in_flight: &InFlight, now: u64, module_id: Str
                 }
             }
             Err(err) => runtime_core::log_warn!("module fetch failed: {err:?}"),
+        }
+    });
+}
+
+/// Fetch one subject's discussion.
+fn fetch_thread(console: Console, in_flight: &InFlight, now: u64, subject: String) {
+    let slot = format!("thread:{subject}");
+    if !claim(in_flight, now, &slot) {
+        return;
+    }
+    let pending = in_flight.clone();
+    spawn_then(api::load_comments(subject), move |result| {
+        pending.borrow_mut().remove(&slot);
+        match result {
+            Ok(page) => {
+                if model::apply_comments(page) {
+                    console.rev.update(|r| r + 1);
+                }
+            }
+            Err(err) => runtime_core::log_warn!("discussion fetch failed: {err:?}"),
         }
     });
 }

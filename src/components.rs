@@ -1,8 +1,10 @@
 //! Console components. Each module exports `#[component]` functions the
 //! `ui!` trees invoke by PascalCase tag.
 
+pub mod attachments;
 pub mod bits;
 pub mod composer;
+pub mod discussion;
 pub mod document;
 pub mod drawer;
 pub mod edits;

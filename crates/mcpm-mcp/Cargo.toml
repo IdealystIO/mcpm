@@ -20,4 +20,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 # and a feature flag on the transport would mean the deployed server and
 # the locally tested one are different programs.
 axum = "0.7"
+# `attach_file` carries binary content as base64: an MCP argument is
+# JSON, and a file is the one thing an agent hands over that is not.
+base64 = "0.22"
 chrono = "0.4"

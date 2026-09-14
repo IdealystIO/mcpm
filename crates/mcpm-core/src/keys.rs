@@ -152,18 +152,29 @@ pub struct Actor {
     pub name: String,
     /// The single module a delegated identity is confined to.
     pub scope: Option<String>,
+    /// A person at the console rather than an agent. The one thing it
+    /// changes: a human may answer any open question, whoever it was
+    /// assigned to — the loop is "human in the loop", and the human
+    /// outranks the assignment. Never set from an agent's key.
+    pub human: bool,
 }
 
 impl Actor {
     /// An identity that speaks for itself: a key's own agent name, or
     /// the name declared on an unauthenticated stdio session.
     pub fn new(name: impl Into<String>) -> Actor {
-        Actor { name: name.into(), scope: None }
+        Actor { name: name.into(), scope: None, human: false }
+    }
+
+    /// A person at the console, by the name their key (or the open
+    /// loopback host) records them as.
+    pub fn human(name: impl Into<String>) -> Actor {
+        Actor { name: name.into(), scope: None, human: true }
     }
 
     /// A minted sub-identity, confined to the module it was minted for.
     pub fn delegated(name: impl Into<String>, module_id: impl Into<String>) -> Actor {
-        Actor { name: name.into(), scope: Some(module_id.into()) }
+        Actor { name: name.into(), scope: Some(module_id.into()), human: false }
     }
 
     /// Whether this actor's authority came from a delegation token

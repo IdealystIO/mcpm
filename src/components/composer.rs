@@ -23,7 +23,7 @@ use runtime_core::primitives::key::{KeyEvent, KeyOutcome};
 use runtime_core::primitives::overlay::BackdropMode;
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    anchored_overlay, component, primitives::text_area::TextAreaHandle, pressable, rx, signal,
+    component, primitives::text_area::TextAreaHandle, rx, signal,
     spawn_then, stylesheet, switch, text, ui, view, AlignItems, Cursor, Element, FlexDirection, FlexWrap,
     FontWeight, IdealystSchema, IntoElement, JustifyContent, Ref, Signal, StyleApplication,
     ViewHandle,
@@ -32,6 +32,7 @@ use runtime_core::{
 use crate::model;
 use crate::state::Console;
 use crate::styles::SectionLabel;
+use crate::components::bits::tappable;
 
 /// Props for [`Composer`].
 #[derive(Default, IdealystSchema)]
@@ -144,6 +145,9 @@ pub fn Composer(props: &ComposerProps) -> Element {
             }
         }
     };
+    // Built by hand for `.bind(anchor)`: the `view` tag takes no ref,
+    // and this node is what the completion list anchors to.
+    // idealyst-lint-disable-next-line prefer-ui-macro
     let body: Element = view(vec![editor_box])
         .with_style(EditorHost())
         .bind(anchor)
@@ -381,7 +385,7 @@ pub fn TagChip(props: &TagChipProps) -> Element {
     let inner: Element = ui! {
         Tag(label = label, tone = tone::Neutral, variant = variant::Soft)
     };
-    pressable(vec![inner], move || append_tag(console, &insert))
+    tappable(vec![inner], move || append_tag(console, &insert))
         .with_style(ChipPress())
         .into_element()
 }
@@ -647,24 +651,32 @@ fn completion_list(
                 .into_element(),
         );
     }
+    // Built by hand for `.preserves_focus(true)`, which the `view` tag
+    // does not take: a press on the list must not blur the editor.
+    // idealyst-lint-disable-next-line prefer-ui-macro
     let panel = view(rows)
         .with_style(PanelBox())
         .preserves_focus(true)
         .into_element();
-    anchored_overlay(AnchorTarget::from(anchor), vec![panel])
-        .side(ElementSide::Below)
-        .align(ElementAlign::Start)
-        .offset(4.0)
-        // No scrim and no focus trap: the editor behind stays live and
-        // keeps the caret, which is the whole point of the surface.
-        .backdrop(BackdropMode::None)
-        .trap_focus(false)
-        // Clicking anywhere off the panel — including back into the
-        // editor to move the caret — takes it down. That is also what
-        // keeps a list from lingering after a MOUSE caret move, which
-        // fires no key event for us to notice.
-        .on_dismiss(move || close(fragment, highlight))
-        .into_element()
+    // No scrim and no focus trap: the editor behind stays live and
+    // keeps the caret, which is the whole point of the surface.
+    // Clicking anywhere off the panel — including back into the editor
+    // to move the caret — takes it down. That is also what keeps a
+    // list from lingering after a MOUSE caret move, which fires no key
+    // event for us to notice.
+    ui! {
+        anchored_overlay(
+            target = AnchorTarget::from(anchor),
+            side = ElementSide::Below,
+            align = ElementAlign::Start,
+            offset = 4.0,
+            backdrop = BackdropMode::None,
+            trap_focus = false,
+            on_dismiss = move || close(fragment, highlight),
+        ) {
+            panel
+        }
+    }
 }
 
 /// One row: the tag as it will be written, and how many wants already
@@ -692,7 +704,7 @@ fn completion_row(
             text(style = RowUses()) { uses }
         }
     };
-    pressable(vec![inner], move || {
+    tappable(vec![inner], move || {
         // A press carries no caret, so it accepts against the one that
         // opened this list. That is still the live caret: anything
         // that could have moved it since — a keystroke, a click in the

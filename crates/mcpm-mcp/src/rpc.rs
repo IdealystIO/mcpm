@@ -52,7 +52,21 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     tsk_ doc_ want_. Long-form knowledge lives in documents: a feature's \
     whitepaper (the plan as prose) and each module's handoff (how to use \
     what it built), both carried in the claim briefing and written with \
-    write_document or complete_module's handoff. Subagents that share \
+    write_document or complete_module's handoff. Files — a design, a \
+    screenshot, a spec, a data sample — are attached to a feature or a \
+    want from the console, each with a description written for you: the \
+    briefing lists them, list_attachments re-reads them, read_attachment \
+    fetches one, describe_attachment lets you say what in a file \
+    matters for the next reader, and attach_file adds one of your own \
+    (text inline, anything else as base64). Every feature, want and \
+    module has a DISCUSSION: add_comment for a note (with files if you \
+    like), ask_question to put a question on the record that names who \
+    owes the answer — a person or an agent — and HOLDS the work until \
+    it lands (nothing in a feature with an open question is \
+    dispatchable; a want with one cannot be promoted; report_blocker \
+    is such a question, owed by the planner), and answer_question to \
+    release it. get_context lists the questions owed by you; answer \
+    them before anything else, because someone is waiting. Subagents that share \
     one machine's key each get their own identity from mint_worker: mint \
     one per module and put the token in the subagent's prompt, and the \
     subagent passes delegation_token on get_context and on every write. \
@@ -357,6 +371,96 @@ async fn call_tool(
                 )),
             }
         }
+        "list_attachments" => {
+            let subject_id = str_arg(args, "subject_id")?;
+            to_value(store.attachments_of(&subject_id).await?)
+        }
+        "read_attachment" => {
+            let id = str_arg(args, "attachment_id")?;
+            let view = store.attachment(&id).await?;
+            let url = store.attachment_link(&id).await?;
+            // Inline text is what an agent can actually read; a binary
+            // is a link and a description. The size cap keeps a tool
+            // reply from becoming a context-window event.
+            let text = if is_texty(&view.content_type, &view.name)
+                && view.size_bytes <= INLINE_TEXT_LIMIT
+            {
+                let (_, bytes) = store.attachment_bytes(&id).await?;
+                String::from_utf8(bytes).ok()
+            } else {
+                None
+            };
+            let mut out = serde_json::to_value(&view).map_err(McpmError::internal)?;
+            if let Value::Object(map) = &mut out {
+                map.insert("url".into(), url.map(Value::String).unwrap_or(Value::Null));
+                map.insert("url_ttl_secs".into(), json!(mcpm_core::ATTACHMENT_LINK_TTL_SECS));
+                match text {
+                    Some(t) => {
+                        map.insert("text".into(), Value::String(t));
+                    }
+                    None => {
+                        map.insert(
+                            "note".into(),
+                            Value::String(if map["url"].is_null() {
+                                "Binary or large content, and this server mints no links: \
+                                 read it from the console, or ask a manager to describe it."
+                                    .into()
+                            } else {
+                                "Binary or large content: fetch the url.".into()
+                            }),
+                        );
+                    }
+                }
+            }
+            Ok(out)
+        }
+        "attach_file" => {
+            let subject_id = str_arg(args, "subject_id")?;
+            let name = str_arg(args, "name")?;
+            let description = opt_str_arg(args, "description").unwrap_or_default();
+            let content_type = opt_str_arg(args, "content_type");
+            let (bytes, default_type) = inline_content(args)?;
+            let content_type = content_type.unwrap_or_else(|| default_type.to_string());
+            to_value(
+                store
+                    .attach_file(&actor, &subject_id, &name, &description, &content_type, bytes)
+                    .await?,
+            )
+        }
+        "add_comment" => {
+            let subject_id = str_arg(args, "subject_id")?;
+            let body = opt_str_arg(args, "body").unwrap_or_default();
+            let files = inline_files(args)?;
+            to_value(store.add_comment(&actor, &subject_id, &body, files).await?)
+        }
+        "ask_question" => {
+            let subject_id = str_arg(args, "subject_id")?;
+            let body = str_arg(args, "body")?;
+            let assigned_to = opt_str_arg(args, "assigned_to");
+            let files = inline_files(args)?;
+            to_value(
+                store
+                    .ask_question(&actor, &subject_id, &body, assigned_to.as_deref(), files)
+                    .await?,
+            )
+        }
+        "answer_question" => {
+            let question_id = str_arg(args, "question_id")?;
+            let body = str_arg(args, "body")?;
+            let files = inline_files(args)?;
+            to_value(store.answer_question(&actor, &question_id, &body, files).await?)
+        }
+        "list_comments" => {
+            let subject_id = str_arg(args, "subject_id")?;
+            let since = opt_str_arg(args, "since");
+            let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(100);
+            to_value(store.comments_of(&subject_id, since.as_deref(), limit).await?)
+        }
+        "describe_attachment" => {
+            let id = str_arg(args, "attachment_id")?;
+            let description = str_arg(args, "description")?;
+            to_value(store.describe_attachment(&actor, &id, &description).await?)
+        }
         "report_blocker" => {
             let module_id = str_arg(args, "module_id")?;
             let description = str_arg(args, "description")?;
@@ -632,6 +736,137 @@ pub async fn read_resource(store: &Store, params: &Value) -> Result<Value, McpmE
 // ---------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------
+
+/// The largest attachment `read_attachment` inlines as text.
+const INLINE_TEXT_LIMIT: i64 = 512 * 1024;
+
+/// The most `attach_file` accepts in one call, decoded. Lower than the
+/// store's own cap because the bytes ride a JSON-RPC message — base64
+/// inflates them by a third and the whole message is held in memory
+/// twice on the way in — and because what an agent attaches is a
+/// report, a data sample, a screenshot: not a media library.
+pub const MAX_INLINE_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The `files` argument of a comment: each an object shaped like
+/// `attach_file`'s arguments (`name`, `content` | `content_base64`,
+/// optional `content_type` and `description`).
+fn inline_files(args: &Value) -> Result<Vec<mcpm_core::InlineFile>, McpmError> {
+    let Some(list) = args.get("files") else { return Ok(Vec::new()) };
+    let Some(items) = list.as_array() else {
+        return Err(McpmError::new(
+            ErrorCode::PlanInvalid,
+            "`files` must be an array of {name, content | content_base64, content_type?, description?}.",
+            Value::Null,
+            "Nothing was stored.",
+        ));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    let mut total = 0usize;
+    for item in items {
+        let name = str_arg(item, "name")?;
+        let (bytes, default_type) = inline_content(item)?;
+        total += bytes.len();
+        if total > MAX_INLINE_ATTACHMENT_BYTES {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                format!(
+                    "The files together exceed {} MiB; one call carries at most that.",
+                    MAX_INLINE_ATTACHMENT_BYTES / (1024 * 1024)
+                ),
+                Value::Null,
+                "Post the comment with fewer files and attach the rest with attach_file.",
+            ));
+        }
+        out.push(mcpm_core::InlineFile {
+            name,
+            description: opt_str_arg(item, "description").unwrap_or_default(),
+            content_type: opt_str_arg(item, "content_type").unwrap_or_else(|| default_type.to_string()),
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
+/// The bytes an `attach_file` call carries, and the content type to
+/// record when the caller named none. Exactly one of `content` (text,
+/// stored as UTF-8) and `content_base64` (anything) — both is an
+/// ambiguity nobody meant, neither is an empty file.
+fn inline_content(args: &Value) -> Result<(Vec<u8>, &'static str), McpmError> {
+    use base64::Engine as _;
+    let text = opt_str_arg(args, "content");
+    let encoded = opt_str_arg(args, "content_base64");
+    let (bytes, default_type) = match (text, encoded) {
+        (Some(_), Some(_)) => {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                "attach_file takes `content` OR `content_base64`, not both.",
+                Value::Null,
+                "Send text as `content`; send anything else as `content_base64`.",
+            ))
+        }
+        (Some(t), None) => (t.into_bytes(), "text/plain; charset=utf-8"),
+        (None, Some(e)) => {
+            let cleaned: String = e.chars().filter(|c| !c.is_whitespace()).collect();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(cleaned.as_bytes())
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cleaned.as_bytes()))
+                .map_err(|err| {
+                    McpmError::new(
+                        ErrorCode::PlanInvalid,
+                        format!("content_base64 is not valid base64: {err}"),
+                        Value::Null,
+                        "Encode the file's bytes as standard base64 (padding optional) and resend.",
+                    )
+                })?;
+            (bytes, "application/octet-stream")
+        }
+        (None, None) => {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                "attach_file needs the file: `content` for text, `content_base64` for anything else.",
+                Value::Null,
+                "Nothing was stored.",
+            ))
+        }
+    };
+    if bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
+        return Err(McpmError::new(
+            ErrorCode::PlanInvalid,
+            format!(
+                "The file is {} bytes; attach_file takes up to {} MiB in one call.",
+                bytes.len(),
+                MAX_INLINE_ATTACHMENT_BYTES / (1024 * 1024)
+            ),
+            json!({ "size_bytes": bytes.len(), "limit_bytes": MAX_INLINE_ATTACHMENT_BYTES }),
+            "Attach a smaller artifact — a summary, a sample, a compressed archive — or ask a \
+             person to attach the full file from the console.",
+        ));
+    }
+    Ok((bytes, default_type))
+}
+
+/// Whether a file is worth inlining: by declared type, or by extension
+/// when the uploader's browser called it an octet stream.
+fn is_texty(content_type: &str, name: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("text/")
+        || ct.contains("json")
+        || ct.contains("xml")
+        || ct.contains("yaml")
+        || ct.contains("csv")
+        || ct.contains("markdown")
+        || ct.contains("javascript")
+        || ct.contains("x-sh")
+    {
+        return true;
+    }
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "txt" | "md" | "markdown" | "csv" | "tsv" | "json" | "yaml" | "yml" | "toml" | "xml"
+            | "sql" | "rs" | "ts" | "tsx" | "js" | "py" | "sh" | "html" | "css" | "svg" | "log"
+    )
+}
 
 fn str_arg(args: &Value, key: &str) -> Result<String, McpmError> {
     args.get(key)

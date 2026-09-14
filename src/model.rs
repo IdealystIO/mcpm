@@ -93,6 +93,76 @@ impl Document {
     }
 }
 
+/// One file attached to a feature or a want.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub content_type: String,
+    /// "12.4 KB", formatted by the server.
+    pub size: String,
+    pub added_by: String,
+    pub added: String,
+    /// On a feature's list: the idea a file came in through, in its
+    /// own words. Empty for the feature's own files.
+    pub via_want_id: String,
+    pub via_want: String,
+    /// On a feature's list: the module the file is attached to.
+    pub via_module_id: String,
+    pub via_module: String,
+    /// The comment it arrived with, when it did.
+    pub comment_id: String,
+    pub comment_author: String,
+    pub comment_excerpt: String,
+}
+
+/// An open question, wherever it sits.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Question {
+    pub id: String,
+    /// feature | want | module
+    pub level: String,
+    pub subject_id: String,
+    pub subject_name: String,
+    pub feature_id: String,
+    pub body: String,
+    pub author: String,
+    /// Empty for anyone.
+    pub assigned_to: String,
+    pub asked: String,
+}
+
+/// One comment in a discussion.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Comment {
+    pub id: String,
+    /// note | question | answer
+    pub kind: String,
+    pub body: String,
+    pub author: String,
+    pub assigned_to: String,
+    pub answers: String,
+    pub resolved: bool,
+    pub resolved_by: String,
+    pub posted: String,
+    pub edited: bool,
+    pub attachments: Vec<Attachment>,
+}
+
+impl Attachment {
+    /// The muted line under a file name: size, type, who, when.
+    pub fn meta(&self) -> String {
+        let mut parts = vec![self.size.clone()];
+        if !self.content_type.is_empty() && self.content_type != "application/octet-stream" {
+            parts.push(self.content_type.clone());
+        }
+        parts.push(self.added_by.clone());
+        parts.push(self.added.clone());
+        parts.join(" \u{b7} ")
+    }
+}
+
 pub struct Module {
     pub id: String,
     pub name: String,
@@ -110,6 +180,8 @@ pub struct Module {
     pub depth: usize,
     pub summary: Option<String>,
     pub block: Option<(String, String)>,
+    /// Open questions on this module.
+    pub open_questions: Vec<Question>,
     pub tasks: Vec<Task>,
 }
 
@@ -184,6 +256,9 @@ pub struct Want {
     pub captured: String,
     /// `(feature name, how this want was read into it)`.
     pub features: Vec<(String, String)>,
+    /// The want's files. Only the drawer's read carries them; a page
+    /// of the pool leaves this empty.
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -253,6 +328,10 @@ pub struct Feature {
     pub whitepaper: Option<Rc<Document>>,
     /// The loose ideas this feature was composed from.
     pub sources: Rc<Vec<WantSource>>,
+    /// The feature's files, then its source wants' files.
+    pub attachments: Rc<Vec<Attachment>>,
+    /// Open questions on the feature itself.
+    pub open_questions: Rc<Vec<Question>>,
 }
 
 // ---------------------------------------------------------------------
@@ -355,6 +434,8 @@ struct Detail {
     modules: Rc<Vec<Module>>,
     whitepaper: Option<Rc<Document>>,
     sources: Rc<Vec<WantSource>>,
+    attachments: Rc<Vec<Attachment>>,
+    open_questions: Rc<Vec<Question>>,
 }
 
 struct Current {
@@ -378,6 +459,12 @@ struct Current {
     want_total: usize,
     /// The idea whose drawer is open, whatever page it is on.
     open_want: Option<(api::WantDto, Want)>,
+    /// Discussions by subject id, as far as each has been read.
+    threads: HashMap<String, (api::CommentPage, Rc<Vec<Comment>>)>,
+    /// Every open question in the project, oldest first.
+    questions: Rc<Vec<Question>>,
+    /// The name this console's writes are recorded under.
+    you: String,
     loaded: bool,
 }
 
@@ -398,6 +485,9 @@ thread_local! {
         wants: Rc::new(Vec::new()),
         want_total: 0,
         open_want: None,
+        threads: HashMap::new(),
+        questions: Rc::new(Vec::new()),
+        you: String::new(),
         loaded: false,
     });
 }
@@ -423,6 +513,33 @@ pub fn has_detail(feature_id: &str) -> bool {
 /// A module's drawer contents, once [`apply_module`] has landed them.
 pub fn module_detail(module_id: &str) -> Option<Rc<ModuleDetail>> {
     CURRENT.with(|c| c.borrow().modules.get(module_id).map(|(_, d)| d.clone()))
+}
+
+/// A subject's discussion, once read.
+pub fn thread(subject_id: &str) -> Option<Rc<Vec<Comment>>> {
+    CURRENT.with(|c| c.borrow().threads.get(subject_id).map(|(_, t)| t.clone()))
+}
+
+/// Whether a subject's discussion has been read at all.
+pub fn has_thread(subject_id: &str) -> bool {
+    CURRENT.with(|c| c.borrow().threads.contains_key(subject_id))
+}
+
+/// One comment by id, from whichever thread on screen holds it.
+pub fn comment_by_id(id: &str) -> Option<Comment> {
+    CURRENT.with(|c| {
+        c.borrow()
+            .threads
+            .values()
+            .flat_map(|(_, t)| t.iter())
+            .find(|x| x.id == id)
+            .cloned()
+    })
+}
+
+/// The name this console's writes are recorded under.
+pub fn you() -> String {
+    CURRENT.with(|c| c.borrow().you.clone())
 }
 
 /// A feature's ledger as far as it has been read.
@@ -456,6 +573,9 @@ pub enum AttentionTarget {
     Module(usize, String),
     /// The want pool screen.
     Pool,
+    /// An open question: `(level, subject id, feature id)` — see
+    /// `Console::open_question`.
+    Question(String, String, String),
 }
 
 /// One row on the overview's attention list.
@@ -557,17 +677,36 @@ pub fn want_total() -> usize {
     CURRENT.with(|c| c.borrow().want_total)
 }
 
-/// One idea by id: from the page on screen, or the one whose drawer is
-/// open — which a feature's origin list can open onto an idea no
-/// loaded page holds.
+/// One idea by id: the one whose drawer is open, else from the page on
+/// screen. The open one first because it is the fuller read — it
+/// carries the want's files, which a page row does not — and because
+/// a feature's origin list can open onto an idea no loaded page holds.
 pub fn want_by_id(id: &str) -> Option<Want> {
     CURRENT.with(|c| {
         let cur = c.borrow();
-        cur.wants
+        cur.open_want
+            .as_ref()
+            .filter(|(_, w)| w.id == id)
+            .map(|(_, w)| w.clone())
+            .or_else(|| cur.wants.iter().find(|w| w.id == id).cloned())
+    })
+}
+
+/// One attachment by id, wherever it is on screen: on a feature's
+/// list (its own or a source want's) or on the open want.
+pub fn attachment_by_id(id: &str) -> Option<Attachment> {
+    CURRENT.with(|c| {
+        let cur = c.borrow();
+        cur.features
             .iter()
-            .find(|w| w.id == id)
+            .flat_map(|f| f.attachments.iter())
+            .find(|a| a.id == id)
             .cloned()
-            .or_else(|| cur.open_want.as_ref().filter(|(_, w)| w.id == id).map(|(_, w)| w.clone()))
+            .or_else(|| {
+                cur.open_want
+                    .as_ref()
+                    .and_then(|(_, w)| w.attachments.iter().find(|a| a.id == id).cloned())
+            })
     })
 }
 
@@ -621,6 +760,8 @@ pub fn apply_board(board: api::Board) -> bool {
                     .collect(),
             );
             cur.recent = Rc::new(board.recent.iter().map(map_event).collect());
+            cur.questions = Rc::new(board.questions.iter().map(map_question).collect());
+            cur.you = board.you.clone();
             cur.want_counts = (
                 board.wants.open.max(0) as usize,
                 board.wants.promoted.max(0) as usize,
@@ -652,6 +793,8 @@ pub fn apply_feature(detail: api::FeatureDetail) -> bool {
                     .map(|s| WantSource { id: s.want_id.clone(), body: s.body.clone() })
                     .collect(),
             ),
+            attachments: Rc::new(detail.attachments.iter().map(map_attachment).collect()),
+            open_questions: Rc::new(detail.open_questions.iter().map(map_question).collect()),
             raw: detail,
         };
         cur.details.insert(mapped.raw.id.clone(), mapped);
@@ -739,6 +882,19 @@ pub fn apply_events(page: api::EventPage) -> bool {
     })
 }
 
+/// Store one subject's discussion. Returns true when it changed.
+pub fn apply_comments(page: api::CommentPage) -> bool {
+    CURRENT.with(|c| {
+        let mut cur = c.borrow_mut();
+        if cur.threads.get(&page.subject_id).is_some_and(|(raw, _)| *raw == page) {
+            return false;
+        }
+        let mapped = Rc::new(page.comments.iter().map(map_comment).collect());
+        cur.threads.insert(page.subject_id.clone(), (page, mapped));
+        true
+    })
+}
+
 /// Store the page of the pool the wants screen asked for. Returns true
 /// when it changed.
 pub fn set_want_page(page: api::WantPage) -> bool {
@@ -804,6 +960,8 @@ fn rebuild(cur: &mut Current) {
                 modules: detail.map(|d| d.modules.clone()).unwrap_or_default(),
                 whitepaper: detail.and_then(|d| d.whitepaper.clone()),
                 sources: detail.map(|d| d.sources.clone()).unwrap_or_default(),
+                attachments: detail.map(|d| d.attachments.clone()).unwrap_or_default(),
+                open_questions: detail.map(|d| d.open_questions.clone()).unwrap_or_default(),
             }
         })
         .collect();
@@ -840,6 +998,18 @@ fn rebuild(cur: &mut Current) {
             })
         })
         .collect();
+    // Every open question, oldest first, above the loose-ideas nudge:
+    // somebody is waiting on each of these.
+    for q in cur.questions.iter() {
+        let owed = if q.assigned_to.is_empty() { "anyone".to_string() } else { q.assigned_to.clone() };
+        attention.push(Attention {
+            kind: "question",
+            status: Status::Blocked,
+            title: format!("{} asked on {}: {}", q.author, q.subject_name, q.body),
+            place: format!("owed by {owed}"),
+            target: AttentionTarget::Question(q.level.clone(), q.subject_id.clone(), q.feature_id.clone()),
+        });
+    }
     let loose = cur.want_counts.0;
     if loose > 0 {
         attention.push(Attention {
@@ -965,6 +1135,7 @@ fn map_module(m: &api::ModuleDto) -> Module {
         depth: m.depth.max(1) as usize,
         summary: m.summary.clone().filter(|s| !s.trim().is_empty()),
         block,
+        open_questions: m.open_questions.iter().map(map_question).collect(),
         tasks: m
             .tasks
             .iter()
@@ -996,6 +1167,56 @@ fn map_want(w: &api::WantDto) -> Want {
             .iter()
             .map(|l| (l.feature_name.clone(), l.rationale.clone()))
             .collect(),
+        attachments: w.attachments.iter().map(map_attachment).collect(),
+    }
+}
+
+fn map_question(q: &api::QuestionDto) -> Question {
+    Question {
+        id: q.id.clone(),
+        level: q.level.clone(),
+        subject_id: q.subject_id.clone(),
+        subject_name: q.subject_name.clone(),
+        feature_id: q.feature_id.clone(),
+        body: q.body.clone(),
+        author: q.author.clone(),
+        assigned_to: q.assigned_to.clone(),
+        asked: q.asked.clone(),
+    }
+}
+
+fn map_comment(c: &api::CommentDto) -> Comment {
+    Comment {
+        id: c.id.clone(),
+        kind: c.kind.clone(),
+        body: c.body.clone(),
+        author: c.author.clone(),
+        assigned_to: c.assigned_to.clone(),
+        answers: c.answers.clone(),
+        resolved: c.resolved,
+        resolved_by: c.resolved_by.clone(),
+        posted: c.posted.clone(),
+        edited: c.edited,
+        attachments: c.attachments.iter().map(map_attachment).collect(),
+    }
+}
+
+fn map_attachment(a: &api::AttachmentDto) -> Attachment {
+    Attachment {
+        id: a.id.clone(),
+        name: a.name.clone(),
+        description: a.description.clone(),
+        content_type: a.content_type.clone(),
+        size: a.size.clone(),
+        added_by: a.added_by.clone(),
+        added: a.added.clone(),
+        via_want_id: a.via_want_id.clone(),
+        via_want: a.via_want.clone(),
+        via_module_id: a.via_module_id.clone(),
+        via_module: a.via_module.clone(),
+        comment_id: a.comment_id.clone(),
+        comment_author: a.comment_author.clone(),
+        comment_excerpt: a.comment_excerpt.clone(),
     }
 }
 

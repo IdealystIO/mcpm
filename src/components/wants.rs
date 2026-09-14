@@ -21,12 +21,12 @@ use idea_ui::{size, tone, typography_kind, variant, Button, Field, IdeaThemeRef,
     MenuItem, MenuLabel, MenuSeparator, Spacer, Table, TableCell, TableRow, Tag, Typography};
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    component, pressable, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
+    component, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
     FontWeight, IdealystSchema, IntoElement, JustifyContent, PressableHandle, Ref,
     StyleApplication,
 };
 
-use crate::components::bits::{Pager, StatusDot};
+use crate::components::bits::{Pager, StatusDot, tappable};
 use crate::components::composer::Composer;
 use crate::model::{want_counts, want_total, wants, WantState};
 use crate::state::Console;
@@ -464,7 +464,7 @@ pub fn ActiveChip(props: &ActiveChipProps) -> Element {
     let label = format!("{} \u{d7}", props.label);
     let is_tag = props.tag;
     let inner: Element = ui! { Tag(label = label, tone = tone::Primary, variant = variant::Soft) };
-    pressable(vec![inner], move || {
+    tappable(vec![inner], move || {
         if is_tag {
             console.toggle_pool_tag(&id);
         } else {

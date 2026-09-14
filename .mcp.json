@@ -9,7 +9,10 @@
       "args": ["run", "--quiet", "-p", "mcpm-mcp"],
       "env": {
         "DATABASE_URL": "postgres://app:app@localhost:55432/app",
-        "MCPM_PROJECT_NAME": "control-center"
+        "MCPM_PROJECT_NAME": "control-center",
+        "MCPM_S3_ENDPOINT": "http://localhost:59000",
+        "MCPM_S3_ACCESS_KEY": "minioadmin",
+        "MCPM_S3_SECRET_KEY": "minioadmin"
       }
     }
   }

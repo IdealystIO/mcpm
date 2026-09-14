@@ -163,6 +163,159 @@ pub struct DocumentView {
     pub created_at: DateTime<Utc>,
 }
 
+/// One file attached to a feature or a want, as every reader sees it.
+///
+/// The bytes are elsewhere (see `FileProvider`); this is the record,
+/// and the `description` is the part written for an agent: what the
+/// file is and why it is here, so a worker can decide whether to fetch
+/// it at all.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AttachmentView {
+    pub id: String,
+    /// `feature` | `want`
+    pub level: String,
+    pub subject_id: String,
+    /// The feature's name, or the want's body.
+    pub subject_name: String,
+    /// The file name as attached.
+    pub name: String,
+    pub description: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub added_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Set on a FEATURE's listing for a file that reached it through
+    /// one of the wants it was composed from. `None` for the feature's
+    /// own files, and on a want's own listing.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub via_want: Option<WantOrigin>,
+    /// Set on a FEATURE's listing for a file attached to one of its
+    /// modules.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub via_module: Option<ModuleOrigin>,
+    /// The comment this file arrived with, when it did.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub comment: Option<CommentOrigin>,
+}
+
+/// A module named from an attachment listing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ModuleOrigin {
+    pub id: String,
+    pub name: String,
+}
+
+/// The comment a file came in with: who said what, briefly.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CommentOrigin {
+    pub id: String,
+    pub author: String,
+    /// The comment's first line or so.
+    pub excerpt: String,
+}
+
+/// A file handed over inline — by an agent's tool call, or by the
+/// console's multipart post — on its way to `attach_file` or a comment.
+#[derive(Clone, Debug)]
+pub struct InlineFile {
+    pub name: String,
+    pub description: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// What a comment is.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentKind {
+    /// A remark on the record.
+    Note,
+    /// Names who owes an answer, and blocks its subject until one lands.
+    Question,
+    /// Resolves the question it points at.
+    Answer,
+}
+
+impl CommentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommentKind::Note => "note",
+            CommentKind::Question => "question",
+            CommentKind::Answer => "answer",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<CommentKind> {
+        match s {
+            "note" => Some(CommentKind::Note),
+            "question" => Some(CommentKind::Question),
+            "answer" => Some(CommentKind::Answer),
+            _ => None,
+        }
+    }
+}
+
+/// One comment in a discussion, with the files it carried.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CommentView {
+    pub id: String,
+    /// `feature` | `want` | `module`
+    pub level: String,
+    pub subject_id: String,
+    pub subject_name: String,
+    pub kind: CommentKind,
+    /// Markdown.
+    pub body: String,
+    pub author: String,
+    /// A question: who owes the answer. `None` means anyone may.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub assigned_to: Option<String>,
+    /// An answer: the question it resolves.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub answers: Option<String>,
+    /// A question: whether an answer has landed.
+    pub resolved: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resolved_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub edited_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentView>,
+}
+
+/// An open question, named from the thing it blocks or the agent it
+/// awaits.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct QuestionRef {
+    pub id: String,
+    /// `feature` | `want` | `module`
+    pub level: String,
+    pub subject_id: String,
+    pub subject_name: String,
+    /// The feature a module's question sits in; the feature itself
+    /// for a feature's; `None` for a want's.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub feature_id: Option<String>,
+    pub body: String,
+    pub author: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub assigned_to: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A want named from an attachment listing: which idea a file came in
+/// through.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WantOrigin {
+    pub id: String,
+    pub body: String,
+}
+
 /// `complete_task` outcome.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -710,6 +863,15 @@ pub struct FeatureTree {
     pub modules: Vec<ModuleView>,
     /// The current whitepaper, when one was written.
     pub whitepaper: Option<DocumentView>,
+    /// Files attached to the feature, and to the wants it was composed
+    /// from, oldest first. Descriptions only — the bytes are fetched
+    /// per file, by id.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentView>,
+    /// Open questions on the feature itself. While any is open nothing
+    /// in the feature is dispatchable.
+    #[serde(default)]
+    pub open_questions: Vec<QuestionRef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -728,8 +890,12 @@ pub struct ModuleView {
     pub owns: Vec<String>,
     /// Longest path from a root, 1-based. Derived; a display hint.
     pub depth: i32,
-    /// Derived: todo + unclaimed + every prerequisite done.
+    /// Derived: todo + unclaimed + every prerequisite done + no open
+    /// question on it or on its feature.
     pub dispatchable: bool,
+    /// Open questions on this module (the feature's are on the tree).
+    #[serde(default)]
+    pub open_questions: Vec<QuestionRef>,
     pub tasks: Vec<TaskView>,
 }
 
@@ -757,6 +923,10 @@ pub struct Context {
     pub your_claims: Vec<ClaimRef>,
     /// Loose ideas waiting to be composed into features.
     pub open_wants: i64,
+    /// Questions assigned to this agent that nobody has answered.
+    /// Each blocks its subject until this agent (or a human) answers.
+    #[serde(default)]
+    pub awaiting_you: Vec<QuestionRef>,
     pub suggested_next: String,
 }
 
@@ -808,6 +978,10 @@ pub struct NextWork {
     /// what's in flight or blocked, so the manager knows to wait.
     pub in_flight: Vec<ClaimRef>,
     pub blocked: Vec<String>,
+    /// Open questions on the feature or its modules — each names who
+    /// owes the answer. While any is open the frontier stays closed.
+    #[serde(default)]
+    pub pending: Vec<QuestionRef>,
     pub note: String,
 }
 
@@ -819,6 +993,16 @@ pub struct Briefing {
     pub feature_name: String,
     /// The feature's plan as prose, when the planner wrote one.
     pub whitepaper: Option<DocumentView>,
+    /// Files attached to the feature (and to its source wants), each
+    /// with the description its author wrote for a reader like this
+    /// one. `read_attachment` fetches one by id.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentView>,
+    /// The newest comments on this module and its feature, oldest
+    /// first — what people and agents have said about this work,
+    /// questions and answers included.
+    #[serde(default)]
+    pub discussion: Vec<CommentView>,
     /// Memories at the module's ancestors (feature + project scope) —
     /// conventions and interface decisions recorded upstream.
     pub ancestor_memories: Vec<Memory>,

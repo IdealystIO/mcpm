@@ -9,12 +9,14 @@ use std::rc::Rc;
 use idea_ui::{typography_kind, Button, Field, IdeaThemeRef, Popover, Spacer, Tab, Tabs, Typography};
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    component, presence, pressable, signal, stylesheet, switch, ui, AlignItems, Easing, Element,
+    component, signal, stylesheet, switch, ui, AlignItems, Easing, Element,
     FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent,
     PresenceAnim, PresenceState, PressableHandle, Ref, StyleApplication,
 };
 
-use crate::components::bits::{Mono, StatusBadge, StatusDot};
+use crate::components::attachments::FilesView;
+use crate::components::discussion::Discussion;
+use crate::components::bits::{Mono, StatusBadge, StatusDot, tappable};
 use crate::components::document::DocumentView;
 use crate::components::edits::{feature_entries, ActionMenu};
 use crate::components::feature_list::FeaturesView;
@@ -134,12 +136,38 @@ fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
     let is_paper = active_view == "whitepaper";
     let is_feed = active_view == "feed";
     let is_origin = active_view == "origin";
+    let is_files = active_view == "files";
+    let is_discussion = active_view == "discussion";
+    let feature_id = f.id.clone();
+    let pending = f.open_questions.len();
 
     ui! {
         view(style = PaneBox()) {
             FeatureHead(console = console, feature = fi)
             if is_graph {
                 GraphView(console = console, feature = fi)
+            }
+            if is_files {
+                FilesView(console = console, feature = fi)
+            }
+            if is_discussion {
+                scroll_view(style = PaneScroll()) {
+                    view(style = PanePad()) {
+                        view(style = PaperCol()) {
+                            if pending > 0 {
+                                Typography(
+                                    content = format!(
+                                        "{pending} open question{} \u{2014} nothing in this feature is dispatchable until answered.",
+                                        if pending == 1 { "" } else { "s" }
+                                    ),
+                                    kind = typography_kind::BodySm,
+                                    muted = true,
+                                )
+                            }
+                            Discussion(console = console, subject = feature_id.clone(), compact = false)
+                        }
+                    }
+                }
             }
             if is_paper {
                 scroll_view(style = PaneScroll()) {
@@ -223,7 +251,7 @@ pub fn OriginRow(props: &OriginRowProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || console.open_want(&id))
+    tappable(vec![inner], move || console.open_want(&id))
         .with_style(StyleApplication::new(origin_row_box_style()).with("first", first.to_string()))
         .into_element()
 }
@@ -260,9 +288,20 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
     }
     meta.push_str(&format!(" \u{b7} {elapsed}"));
 
+    let file_count = f.attachments.len();
+    let pending = f.open_questions.len()
+        + f.modules.iter().map(|m| m.open_questions.len()).sum::<usize>();
     let tabs = signal(vec![
         Tab::new("graph", "Graph"),
         Tab::new("whitepaper", "Whitepaper"),
+        Tab::new(
+            "discussion",
+            if pending > 0 { format!("Discussion ({pending} open)") } else { "Discussion".to_string() },
+        ),
+        Tab::new(
+            "files",
+            if file_count > 0 { format!("Files ({file_count})") } else { "Files".to_string() },
+        ),
         Tab::new("feed", "Activity"),
         Tab::new("origin", "Composed from"),
     ]);
@@ -315,7 +354,7 @@ pub fn Crumb(props: &CrumbProps) -> Element {
     };
     ui! {
         view(style = CrumbRow()) {
-            pressable(vec![inner], move || console.show_features())
+            tappable(vec![inner], move || console.show_features())
                 .with_style(StyleApplication::new(crumb_box_style()))
                 .into_element()
             text(style = CrumbSep()) { "/" }
@@ -346,24 +385,28 @@ pub fn FeatureSwitcher(props: &FeatureSwitcherProps) -> Element {
             text(style = SwitchCaret()) { "\u{25be}" }
         }
     };
-    let button = pressable(vec![inner], move || console.toggle_switcher())
+    let button = tappable(vec![inner], move || console.toggle_switcher())
         .bind(trigger)
         .with_style(StyleApplication::new(switch_box_style()))
         .into_element();
 
-    let panel = presence(move || ui! { SwitcherPanel(console = console, anchor = Some(trigger)) })
-        .present(move || console.switcher_open.get())
-        .enter(PresenceAnim::new(
-            PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
-            140,
-            Easing::EaseOut,
-        ))
-        .exit(PresenceAnim::new(
-            PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
-            110,
-            Easing::EaseIn,
-        ))
-        .into_element();
+    let panel: Element = ui! {
+        presence(
+            present = move || console.switcher_open.get(),
+            enter = PresenceAnim::new(
+                PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
+                140,
+                Easing::EaseOut,
+            ),
+            exit = PresenceAnim::new(
+                PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
+                110,
+                Easing::EaseIn,
+            ),
+        ) {
+            SwitcherPanel(console = console, anchor = Some(trigger))
+        }
+    };
 
     ui! {
         view(style = SwitchAnchor()) {
@@ -484,7 +527,7 @@ pub fn SwitcherRow(props: &SwitcherRowProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || console.select_feature(index))
+    tappable(vec![inner], move || console.select_feature(index))
         .with_style(StyleApplication::new(switch_row_style_style()).with("selected", arm.to_string()))
         .into_element()
 }

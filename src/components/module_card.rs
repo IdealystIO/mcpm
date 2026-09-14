@@ -3,11 +3,11 @@
 
 use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Typography};
 use runtime_core::{
-    component, pressable, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
+    component, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
     IdealystSchema, IntoElement, StyleApplication,
 };
 
-use crate::components::bits::{Mono, StatusBadge, StatusDot, Ticks};
+use crate::components::bits::{Mono, StatusBadge, StatusDot, Ticks, tappable};
 use crate::model::{features, Readiness, Status};
 use crate::state::Console;
 use crate::styles::{MonoTextSize, MonoTextTone};
@@ -106,7 +106,7 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     // `Console::selected`, and reading it here means the highlight
     // lands on this one node instead of rebuilding the graph around it
     // — which is what lets the border transition play at all.
-    pressable(vec![inner], move || console.open_module(&press_id))
+    tappable(vec![inner], move || console.open_module(&press_id))
         .with_style(move || {
             let accent = if selection.get().as_deref() == Some(id.as_str()) {
                 "selected"

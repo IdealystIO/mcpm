@@ -46,6 +46,15 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
 ] }
 thiserror = "2"
+# The object store behind attachments: S3, or MinIO in the devcontainer.
+# `rust-s3` rather than the AWS SDK because every S3-compatible store
+# speaks the same signed-request protocol, and a hundred crates of
+# smithy runtime is a lot to compile for put/get/delete/presign. Same
+# TLS stack as sqlx (rustls), no native-tls — see the sqlx note above.
+# `fail-on-err` turns a non-2xx from the store into an `Err` instead of
+# a success-shaped response carrying an error body.
+s3 = { package = "rust-s3", version = "0.37", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
+hex = "0.4"
 # The event fan-out: one listener task, a broadcast to every subscriber.
 tokio = { version = "1", features = ["sync", "rt"] }
 uuid = { version = "1", features = ["v4"] }

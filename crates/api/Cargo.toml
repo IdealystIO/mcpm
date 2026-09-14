@@ -38,10 +38,12 @@ server = [
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-server = { version = "1.5.2", registry = "idealyst" }
+server = { version = "1.6.0", registry = "idealyst" }
 
 # Server-only. Optional so the wasm build never pulls sqlx/tokio/axum.
-axum = { version = "0.7", optional = true }
+# `multipart` is for the attachment upload route: a file is not a JSON
+# argument, so it does not ride a `#[server]` fn.
+axum = { version = "0.7", features = ["multipart"], optional = true }
 mcpm-core = { path = "../mcpm-core", optional = true }
 chrono = { version = "0.4", optional = true }
 # The Stream trait `#[subscription]`'s return type names.

@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 pub enum ErrorCode {
     /// A prerequisite the module names is not done. The gate.
     PrereqsOpen,
+    /// An open question on the module, its feature, or the want: a
+    /// person or agent owes an answer, and until it lands nothing here
+    /// is dispatchable or promotable. The other half of the gate.
+    PendingResolution,
     AlreadyClaimed,
     AlreadyDone,
     NotClaimedByYou,

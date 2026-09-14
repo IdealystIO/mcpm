@@ -16,7 +16,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -45,6 +45,13 @@ pub async fn serve(store: Store, bind: &str) -> Result<(), String> {
 
     let app = Router::new()
         .route("/mcp", post(handle).get(no_server_stream))
+        // axum's default cap is 2 MiB, which no tool call but one comes
+        // near: `attach_file` carries a file as base64 inside its JSON
+        // arguments, so the cap is the inline limit plus base64's third
+        // plus room for the envelope. The tool still refuses anything
+        // over its own limit in its own words; this only stops a body
+        // from being cut off at the transport with a bare 413.
+        .layer(DefaultBodyLimit::max(rpc::MAX_INLINE_ATTACHMENT_BYTES * 4 / 3 + 256 * 1024))
         // A plain liveness probe for whatever supervises the process.
         // Unauthenticated on purpose: it reveals only that the port is
         // answering, which anything that can reach the port already knows.

@@ -33,8 +33,9 @@ mod rpc;
 mod tools;
 
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 
-use mcpm_core::{redact_url, ApiKeyInfo, McpmError, Store};
+use mcpm_core::{redact_url, ApiKeyInfo, FileProvider as _, McpmError, S3Files, Store};
 use serde_json::Value;
 
 use crate::cli::Mode;
@@ -143,7 +144,31 @@ async fn connect() -> Store {
         std::process::exit(1);
     }
     eprintln!("mcpm-mcp: db {}", redact_url(&database_url));
-    store
+    // The object store is optional: a server without one still serves
+    // attachment RECORDS (a briefing carries their descriptions) and
+    // refuses only the bytes, saying why. A misconfigured one is not
+    // optional — half an endpoint is an operator's typo, not a choice.
+    // An UNREACHABLE one is neither: this process is an agent's local
+    // pipe, and MinIO being down should cost that agent attachments,
+    // not the whole project — so it is said loudly and the provider is
+    // installed anyway, to fail per call with the store's own words.
+    match S3Files::from_env() {
+        Ok(Some(files)) => {
+            if let Err(err) = files.ensure_bucket().await {
+                eprintln!("mcpm-mcp: object store not ready — attachments will fail until it is: {err}");
+            }
+            eprintln!("mcpm-mcp: files {}", files.describe());
+            store.with_files(Arc::new(files))
+        }
+        Ok(None) => {
+            eprintln!("mcpm-mcp: no object store configured — attachments are read-only records here");
+            store
+        }
+        Err(err) => {
+            eprintln!("mcpm-mcp: cannot start: {err}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The stdio transport. One session for the life of the pipe: the agent

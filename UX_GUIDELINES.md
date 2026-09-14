@@ -37,6 +37,15 @@ assemble children for one call site are fine as plain functions, but the
 moment something is a *component* — has props, is mounted as a unit —
 it follows the paradigm.)
 
+Elements are built inside `ui!`, not by hand — `idealyst lint`'s
+`prefer-ui-macro` rule enforces it, and it is clean. The one primitive
+with no tag, `pressable`, is reached through `bits::tappable`, which
+carries the single lint directive and the reason; a new hand-built
+constructor anywhere else should trip the rule, and that is the point.
+A builder-only method the tag cannot express (`.bind(ref)`,
+`.preserves_focus(true)`) gets a `// idealyst-lint-disable-next-line`
+with its reason on the line above, never a rule turned off in config.
+
 Likewise, theme tokens in a `stylesheet!` are typed accessors on the
 block binding — `t.spacing.sm()`, `t.color.border()` — never
 `Tokenized::token("spacing-sm", fallback)` strings. The string form is
@@ -468,6 +477,30 @@ the window.
 
 The tell is a screen that stopped scrolling without anyone touching its
 scroller — look up the tree, not at the `scroll_view`.
+
+### 29. A gesture-gated browser call runs inside the click, and only it does
+
+Some platform calls are honoured only during the user gesture that
+asked for them: opening a new tab (`open_url`), the file-open dialog,
+the clipboard, fullscreen. Put an `await` — a server round trip, a
+fetch of the URL to open — between the click and the call and the
+browser refuses it with no error anywhere: the tab simply does not
+open, the dialog simply does not appear.
+
+- **Make the call synchronous from the handler**, from state the
+  console already holds. If the target needs computing on the server,
+  move the round trip to the other side of the call: open a URL on OUR
+  host that does the lookup and redirects, rather than looking up and
+  then opening.
+- **This is the one thing that may run from a control's own handler**
+  under rule 25 — and only the gated call itself. Everything that
+  follows (reading what was picked, sending it, reporting the result)
+  still writes through live props or a request-counter hole, and
+  nothing the call writes may be a key of a `switch` that rebuilds the
+  control that made it.
+
+The tell is a feature that works in a test, in curl, and in the
+console's own logs, and does nothing on screen.
 
 ### 28. A registry renders once per screen, and a filter over it is a menu
 

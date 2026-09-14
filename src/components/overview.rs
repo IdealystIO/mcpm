@@ -11,11 +11,11 @@
 
 use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, ProgressCap, Typography};
 use runtime_core::{
-    component, pressable, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FontWeight,
+    component, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FontWeight,
     IdealystSchema, IntoElement, StyleApplication,
 };
 
-use crate::components::bits::{Mono, StatusDot};
+use crate::components::bits::{Mono, StatusDot, tappable};
 use crate::model::{
     active_agent_count, attention, features, in_play, project_name, recent, want_counts,
     AttentionTarget,
@@ -179,9 +179,12 @@ pub fn AttentionRow(props: &AttentionRowProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || match &target {
+    tappable(vec![inner], move || match &target {
         AttentionTarget::Module(fi, id) => console.open_module_in(*fi, id),
         AttentionTarget::Pool => console.show_wants(),
+        AttentionTarget::Question(level, subject, feature) => {
+            console.open_question(level, subject, feature)
+        }
     })
     .with_style(StyleApplication::new(divided_row_style()).with("first", first.to_string()))
     .into_element()
@@ -241,7 +244,7 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
         }
     };
 
-    pressable(vec![inner], move || console.select_feature(index))
+    tappable(vec![inner], move || console.select_feature(index))
         .with_style(StyleApplication::new(divided_row_style()).with("first", first.to_string()))
         .into_element()
 }
@@ -304,7 +307,7 @@ pub fn LedgerLink(props: &LedgerLinkProps) -> Element {
     let inner: Element = ui! {
         text(style = LinkText()) { "Open the full ledger \u{2192}" }
     };
-    pressable(vec![inner], move || {
+    tappable(vec![inner], move || {
         if let Some(fi) = target {
             console.select_feature(fi);
             console.view.set("feed".to_string());

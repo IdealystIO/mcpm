@@ -1,5 +1,5 @@
 //! Short, prefixed, stable ids: `feat_…`, `mod_…`, `tsk_…`, `mem_…`,
-//! `doc_…`, `want_…`. Never positional, so re-wiring a module's
+//! `doc_…`, `want_…`, `att_…`, `cmt_…`. Never positional, so re-wiring a module's
 //! prerequisites breaks no reference; the prefix lets tools dispatch on
 //! id shape. (`stg_…` was the stage prefix; stages were retired in
 //! migration 0012 and the prefix now resolves to nothing.)
@@ -84,6 +84,19 @@ pub fn new_want_id() -> String {
 pub fn new_document_id() -> String {
     let uuid = uuid::Uuid::new_v4().simple().to_string();
     format!("doc_{}", &uuid[..8])
+}
+
+/// Mint an attachment id. A file rides a feature or a want; it is not
+/// a tree node.
+pub fn new_attachment_id() -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    format!("att_{}", &uuid[..8])
+}
+
+/// Mint a comment id.
+pub fn new_comment_id() -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    format!("cmt_{}", &uuid[..8])
 }
 
 /// Recover the level from an id's prefix (for tools like `revise_plan`

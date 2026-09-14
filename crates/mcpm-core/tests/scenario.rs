@@ -329,7 +329,23 @@ async fn the_worked_scenario() {
             .unwrap();
         let status = store.feature_status(&fid, 0).await.unwrap();
         assert!(status.events.iter().any(|e| e.kind == "blocker_reported"));
-        // Same worker resumes its own blocked module via claim_module.
+        // A blocker is a question owed by the planner, and the module
+        // is held until the answer lands — for its own worker too.
+        let held = store.claim_module(w2, &m_api).await.expect_err("pending");
+        assert_eq!(held.code, ErrorCode::PendingResolution);
+        let question = status
+            .feature
+            .modules
+            .iter()
+            .find(|m| m.id == m_api)
+            .and_then(|m| m.open_questions.first().cloned())
+            .expect("the blocker is an open question");
+        assert_eq!(question.assigned_to.as_deref(), Some(manager));
+        store
+            .answer_question(manager, &question.id, "Use RATES_KEY from the vault.", vec![])
+            .await
+            .unwrap();
+        // Same worker resumes its own module via claim_module.
         store.claim_module(w2, &m_api).await.unwrap();
         for task in store
             .feature_tree(&fid)

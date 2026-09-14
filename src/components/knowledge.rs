@@ -17,12 +17,12 @@ use std::rc::Rc;
 use idea_ui::{size, tone, typography_kind, variant, Button, Field, IdeaThemeRef, SegmentOption,
     SegmentedControl, Spacer, Tag, Typography};
 use runtime_core::{
-    component, pressable, rx, signal, spawn_then, stylesheet, switch, ui, AlignItems, Element,
+    component, rx, signal, spawn_then, stylesheet, switch, ui, AlignItems, Element,
     FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, Signal,
     StyleApplication,
 };
 
-use crate::components::bits::{Mono, Pager};
+use crate::components::bits::{Mono, Pager, tappable};
 use crate::state::Console;
 use crate::styles::{MonoTextTone, SectionLabel};
 
@@ -357,7 +357,7 @@ pub fn KindChip(props: &KindChipProps) -> Element {
     } else {
         ui! { Tag(label = label, tone = tone::Neutral, variant = variant::Soft) }
     };
-    pressable(vec![inner], move || console.toggle_know_kind(kind))
+    tappable(vec![inner], move || console.toggle_know_kind(kind))
         .with_style(StyleApplication::new(chip_press_style()))
         .into_element()
 }
@@ -389,7 +389,7 @@ pub fn KnowTag(props: &KnowTagProps) -> Element {
         ui! { Tag(label = label, tone = tone::Neutral, variant = variant::Soft) }
     };
     let pick = name.clone();
-    pressable(vec![inner], move || console.toggle_know_tag(&pick))
+    tappable(vec![inner], move || console.toggle_know_tag(&pick))
         .with_style(StyleApplication::new(chip_press_style()))
         .into_element()
 }
@@ -498,7 +498,7 @@ pub fn EntryCard(props: &EntryCardProps) -> Element {
     // The card carries the entry; the drawer carries its place in the
     // graph. Clicking is how you get from one to the other (rule 15:
     // one action belongs on the row, not behind a menu).
-    pressable(vec![inner], move || console.open_knowledge(Some(open_id.clone())))
+    tappable(vec![inner], move || console.open_knowledge(Some(open_id.clone())))
         .with_style(StyleApplication::new(card_press_style()))
         .into_element()
 }
@@ -940,7 +940,7 @@ pub fn KnowledgeDrawer(props: &KnowledgeDrawerProps) -> Element {
     );
 
     let close: Rc<dyn Fn()> = Rc::new(move || console.open_knowledge(None));
-    let backdrop = pressable(vec![ui! { view(style = Backdrop()) {} }], {
+    let backdrop = tappable(vec![ui! { view(style = Backdrop()) {} }], {
         let console = console;
         move || console.open_knowledge(None)
     })
@@ -1042,7 +1042,7 @@ pub fn LinkRow(props: &LinkRowProps) -> Element {
             }
         }
     };
-    pressable(vec![inner], move || console.open_knowledge(Some(target.clone())))
+    tappable(vec![inner], move || console.open_knowledge(Some(target.clone())))
         .with_style(StyleApplication::new(link_press_style()))
         .into_element()
 }
@@ -1069,7 +1069,7 @@ pub fn SuggestionRow(props: &SuggestionRowProps) -> Element {
             Typography(content = content, kind = typography_kind::BodySm, muted = true)
         }
     };
-    pressable(vec![inner], move || console.open_knowledge(Some(target.clone())))
+    tappable(vec![inner], move || console.open_knowledge(Some(target.clone())))
         .with_style(StyleApplication::new(link_press_style()))
         .into_element()
 }

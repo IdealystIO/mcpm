@@ -24,12 +24,78 @@
 //! titles/bodies so the UI stays a dumb renderer.
 
 pub mod capture;
+#[cfg(feature = "server")]
+pub mod files;
 
 pub use capture::{parse_buffer, parse_line, scan_tags, tag_fragment_at, utf16_to_byte, TagSpan,
     WantDraftDto};
 
 use serde::{Deserialize, Serialize};
 use server::{server, subscription, ServerError};
+
+// ---------------------------------------------------------------------
+// The file routes
+// ---------------------------------------------------------------------
+//
+// Attachment bytes do not ride a `#[server]` fn: those carry a JSON
+// array of arguments, and a file is neither small nor JSON. They have
+// two plain HTTP routes on the same host instead (see `files`), and the
+// paths are spelled here — once, on both halves of the build — so the
+// console and the host cannot disagree about where they are.
+
+/// Where the console POSTs a file for `subject_id` (a feature or a
+/// want), as `multipart/form-data` with a `file` part and an optional
+/// `description` part. Answers a JSON [`WriteResult`] on success and a
+/// plain-text refusal otherwise.
+pub fn upload_path(subject_id: &str) -> String {
+    format!("/_files/{subject_id}")
+}
+
+/// Where the console POSTs a comment for `subject_id`, as
+/// `multipart/form-data`: a `kind` part (`note` | `question` |
+/// `answer`), a `body`, for a question an `assigned_to`, for an
+/// answer the `answers` question id, and zero or more `file` parts.
+/// Answers a JSON [`WriteResult`] on success, a plain-text refusal
+/// otherwise.
+pub fn comment_path(subject_id: &str) -> String {
+    format!("/_comments/{subject_id}")
+}
+
+/// Where a browser fetches one attachment's bytes. A navigation cannot
+/// carry a header, so on a gated host the key rides the query string —
+/// the same trade the event socket makes, for the same reason, and
+/// the link then 302s to a short-lived presigned URL (or serves the
+/// bytes itself when the object store mints none).
+pub fn download_path(attachment_id: &str, key: &str) -> String {
+    if key.is_empty() {
+        format!("/_files/{attachment_id}")
+    } else {
+        format!("/_files/{attachment_id}?key={}", hex_of(key))
+    }
+}
+
+/// Lowercase hex, as the event socket encodes its key: a key is
+/// opaque bytes and a query string is not the place to find out which
+/// characters it contains.
+fn hex_of(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The inverse of [`hex_of`]; `None` for anything that is not hex.
+pub fn unhex(s: &str) -> Option<String> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect();
+    String::from_utf8(bytes?).ok()
+}
 
 // ---------------------------------------------------------------------
 // Wire types
@@ -54,6 +120,64 @@ pub struct Board {
     pub tags: Vec<TagDto>,
     /// The pool's shape. The pool itself is paged — see [`search_wants`].
     pub wants: WantCountsDto,
+    /// Every open question in the project, oldest first — what is
+    /// waiting on somebody, and on whom.
+    #[serde(default)]
+    pub questions: Vec<QuestionDto>,
+    /// The name this console's writes are recorded under: the key's
+    /// agent name, or `console` on an open loopback host. What the
+    /// console needs to know which comments are its own and which
+    /// questions are owed to the person reading.
+    #[serde(default)]
+    pub you: String,
+}
+
+/// An open question, wherever it sits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QuestionDto {
+    pub id: String,
+    /// feature | want | module
+    pub level: String,
+    pub subject_id: String,
+    pub subject_name: String,
+    /// The feature a module's or a feature's question sits in; empty
+    /// for a want's.
+    pub feature_id: String,
+    pub body: String,
+    pub author: String,
+    /// Who owes the answer; empty for anyone.
+    pub assigned_to: String,
+    /// "MMM D HH:MM"
+    pub asked: String,
+}
+
+/// One comment in a discussion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommentDto {
+    pub id: String,
+    /// note | question | answer
+    pub kind: String,
+    /// Markdown.
+    pub body: String,
+    pub author: String,
+    /// A question: who owes the answer, or empty for anyone.
+    pub assigned_to: String,
+    /// An answer: the question it resolves.
+    pub answers: String,
+    /// A question: whether an answer has landed.
+    pub resolved: bool,
+    pub resolved_by: String,
+    /// "MMM D HH:MM"
+    pub posted: String,
+    pub edited: bool,
+    pub attachments: Vec<AttachmentDto>,
+}
+
+/// The discussion on one subject, oldest first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommentPage {
+    pub subject_id: String,
+    pub comments: Vec<CommentDto>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -123,6 +247,13 @@ pub struct FeatureDetail {
     pub whitepaper: Option<DocumentDto>,
     /// The wants this feature was composed from, oldest link first.
     pub sources: Vec<WantSourceDto>,
+    /// The feature's files, then its source wants' files.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentDto>,
+    /// Open questions on the feature itself; while any is open nothing
+    /// in it is dispatchable.
+    #[serde(default)]
+    pub open_questions: Vec<QuestionDto>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -153,6 +284,9 @@ pub struct ModuleDto {
     pub block_body: String,
     /// "MMM D HH:MM" of its first claim, or empty.
     pub spawned: String,
+    /// Open questions on this module.
+    #[serde(default)]
+    pub open_questions: Vec<QuestionDto>,
     pub tasks: Vec<TaskDto>,
 }
 
@@ -240,6 +374,42 @@ pub struct WriteResult {
     pub id: String,
 }
 
+/// One file attached to a feature or a want. The bytes are behind
+/// [`download_path`]; this is the record and the description written
+/// for whoever reads it next.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AttachmentDto {
+    pub id: String,
+    /// feature | want
+    pub level: String,
+    pub subject_id: String,
+    pub name: String,
+    pub description: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    /// "12.4 KB", "3.1 MB" — formatted server-side.
+    pub size: String,
+    pub added_by: String,
+    /// "MMM D HH:MM"
+    pub added: String,
+    /// On a feature's list: the want a file came in through, as the
+    /// idea's own words. Empty for the feature's own files.
+    pub via_want_id: String,
+    pub via_want: String,
+    /// On a feature's list: the module a file is attached to.
+    #[serde(default)]
+    pub via_module_id: String,
+    #[serde(default)]
+    pub via_module: String,
+    /// The comment the file arrived with, when it did.
+    #[serde(default)]
+    pub comment_id: String,
+    #[serde(default)]
+    pub comment_author: String,
+    #[serde(default)]
+    pub comment_excerpt: String,
+}
+
 /// One current document revision: a feature's whitepaper or a
 /// module's handoff. Markdown in `body`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -295,6 +465,11 @@ pub struct WantDto {
     pub captured: String,
     /// Every feature that absorbed this want.
     pub features: Vec<WantLinkDto>,
+    /// The want's files. Filled by [`load_want`] (the drawer's read);
+    /// a page of the pool leaves it empty, because a row is a handle
+    /// on the idea and its files are properties of it (UX rule 20).
+    #[serde(default)]
+    pub attachments: Vec<AttachmentDto>,
 }
 
 /// One entry in the knowledge base.
@@ -462,6 +637,39 @@ impl Caller {
     pub fn local() -> Caller {
         Caller { name: CONSOLE_AUTHOR.to_string(), role: None }
     }
+
+    /// This caller as the store sees it. A person — the open loopback
+    /// host, or a console key — is a human actor, which is what lets
+    /// them answer any question; an agent's key stays an agent.
+    pub fn actor(&self) -> mcpm_core::Actor {
+        match self.role {
+            None | Some(mcpm_core::KeyRole::Console) => mcpm_core::Actor::human(&self.name),
+            Some(_) => mcpm_core::Actor::new(&self.name),
+        }
+    }
+
+    /// Resolve a presented key — or none — to a caller under this
+    /// host's posture. `Err(())` is a refusal: a bad key in either
+    /// posture, or no key on a host that demands one.
+    ///
+    /// One function for the server-fn gate AND the file routes, so
+    /// the two surfaces cannot drift on who gets in: a route that
+    /// authenticated a little differently from `/_srv/*` would be the
+    /// hole nobody looks at.
+    pub async fn resolve(
+        store: &mcpm_core::Store,
+        presented: Option<&str>,
+        require_auth: bool,
+    ) -> Result<Caller, ()> {
+        match presented {
+            Some(token) => match store.verify_key(token).await {
+                Ok(identity) => Ok(Caller { name: identity.agent_name, role: Some(identity.role) }),
+                Err(_) => Err(()),
+            },
+            None if !require_auth => Ok(Caller::local()),
+            None => Err(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -596,7 +804,7 @@ fn async_stream_compat(
 
 /// The console's global read. See [`Board`].
 #[server]
-pub async fn load_board() -> Result<Board, ServerError> {
+pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, ServerError> {
     let store = server::use_state::<mcpm_core::Store>()
         .ok_or_else(|| ServerError::failed("Store not installed"))?;
     let raw = store.snapshot().await.map_err(fail)?;
@@ -667,6 +875,13 @@ pub async fn load_board() -> Result<Board, ServerError> {
         })
         .collect();
     let counts = store.want_counts().await.map_err(fail)?;
+    let questions = store
+        .open_questions()
+        .await
+        .map_err(fail)?
+        .iter()
+        .map(question_dto)
+        .collect();
 
     Ok(Board {
         project,
@@ -680,6 +895,8 @@ pub async fn load_board() -> Result<Board, ServerError> {
             promoted: counts.promoted,
             declined: counts.declined,
         },
+        questions,
+        you: caller.name.clone(),
     })
 }
 
@@ -715,7 +932,19 @@ pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerErr
             let rejected = m.status != "done"
                 && m.claimed_by.is_none()
                 && marks.is_some_and(|x| x.last_rejection.is_some());
-            let (block_title, block_body) = if rejected {
+            let (block_title, block_body) = if let Some(q) = m.open_questions.first() {
+                (
+                    format!(
+                        "Pending resolution \u{2014} owed by {}",
+                        if q.assigned_to.as_deref().unwrap_or("").is_empty() {
+                            "anyone"
+                        } else {
+                            q.assigned_to.as_deref().unwrap_or("")
+                        }
+                    ),
+                    q.body.clone(),
+                )
+            } else if rejected {
                 (
                     "Start rejected \u{2014} prerequisites open".to_string(),
                     marks
@@ -753,6 +982,7 @@ pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerErr
                 owns: m.owns,
                 depth: m.depth,
                 dispatchable: m.dispatchable,
+                open_questions: m.open_questions.iter().map(question_dto).collect(),
                 tasks: m
                     .tasks
                     .into_iter()
@@ -776,7 +1006,21 @@ pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerErr
         modules,
         whitepaper: tree.whitepaper.as_ref().map(document_dto),
         sources,
+        attachments: tree.attachments.iter().map(attachment_dto).collect(),
+        open_questions: tree.open_questions.iter().map(question_dto).collect(),
     })
+}
+
+/// The discussion on one subject — a feature, a want or a module —
+/// oldest first, the newest 200. Its own read, fetched when the
+/// discussion is on screen, because a thread grows without bound and
+/// the feature's board must not.
+#[server]
+pub async fn load_comments(subject_id: String) -> Result<CommentPage, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let comments = store.comments_of(&subject_id, None, 200).await.map_err(fail)?;
+    Ok(CommentPage { subject_id, comments: comments.iter().map(comment_dto).collect() })
 }
 
 /// One module's drawer. See [`ModuleDetail`].
@@ -860,7 +1104,15 @@ pub async fn search_wants(
 pub async fn load_want(want_id: String) -> Result<WantDto, ServerError> {
     let store = server::use_state::<mcpm_core::Store>()
         .ok_or_else(|| ServerError::failed("Store not installed"))?;
-    Ok(want_dto(&store.get_want(&want_id).await.map_err(fail)?))
+    let mut want = want_dto(&store.get_want(&want_id).await.map_err(fail)?);
+    want.attachments = store
+        .attachments_of(&want_id)
+        .await
+        .map_err(fail)?
+        .iter()
+        .map(attachment_dto)
+        .collect();
+    Ok(want)
 }
 
 // ---------------------------------------------------------------------
@@ -878,7 +1130,7 @@ pub async fn load_want(want_id: String) -> Result<WantDto, ServerError> {
 /// dispatched, they do not plan — and that is the one rule this surface
 /// adds to the store's own.
 #[cfg(feature = "server")]
-fn require_planner(caller: &Caller) -> Result<(), ServerError> {
+pub(crate) fn require_planner(caller: &Caller) -> Result<(), ServerError> {
     match caller.role {
         Some(mcpm_core::KeyRole::Worker) => Err(ServerError::failed(
             "A worker key cannot plan or edit from the console.",
@@ -993,6 +1245,61 @@ pub async fn shelve_plan(
     Ok(WriteResult { message: ack.message, id: feature_id })
 }
 
+/// Rewrite a comment of one's own.
+#[server]
+pub async fn edit_comment(
+    comment_id: String,
+    body: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let c = store.edit_comment(caller.actor(), &comment_id, &body).await.map_err(fail)?;
+    Ok(WriteResult { message: "Comment updated.".into(), id: c.subject_id })
+}
+
+/// Delete a note of one's own, or withdraw an open question.
+#[server]
+pub async fn delete_comment(
+    comment_id: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ack = store.delete_comment(caller.actor(), &comment_id).await.map_err(fail)?;
+    Ok(WriteResult { message: ack.message, id: String::new() })
+}
+
+/// Rewrite what an attachment is for.
+#[server]
+pub async fn describe_attachment(
+    attachment_id: String,
+    description: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let att = store
+        .describe_attachment(caller.name.as_str(), &attachment_id, &description)
+        .await
+        .map_err(fail)?;
+    Ok(WriteResult { message: format!("Described '{}'.", att.name), id: att.subject_id })
+}
+
+/// Remove an attachment: its record now, its bytes right after.
+#[server]
+pub async fn remove_attachment(
+    attachment_id: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ack = store.remove_attachment(caller.name.as_str(), &attachment_id).await.map_err(fail)?;
+    Ok(WriteResult { message: ack.message, id: String::new() })
+}
+
 /// Revise a want's wording and tags. Tags are the console's `#tag`
 /// syntax split out already; an empty `body` leaves the wording alone
 /// (a composed want's is frozen, and the form does not offer it).
@@ -1077,6 +1384,7 @@ fn want_dto(w: &mcpm_core::Want) -> WantDto {
                 rationale: l.rationale.clone(),
             })
             .collect(),
+        attachments: Vec::new(),
     }
 }
 
@@ -1344,6 +1652,75 @@ fn document_dto(d: &mcpm_core::DocumentView) -> DocumentDto {
     }
 }
 
+#[cfg(feature = "server")]
+fn question_dto(q: &mcpm_core::QuestionRef) -> QuestionDto {
+    QuestionDto {
+        id: q.id.clone(),
+        level: q.level.clone(),
+        subject_id: q.subject_id.clone(),
+        subject_name: q.subject_name.clone(),
+        feature_id: q.feature_id.clone().unwrap_or_default(),
+        body: q.body.clone(),
+        author: q.author.clone(),
+        assigned_to: q.assigned_to.clone().unwrap_or_default(),
+        asked: q.created_at.format("%b %-d %H:%M").to_string(),
+    }
+}
+
+#[cfg(feature = "server")]
+fn comment_dto(c: &mcpm_core::CommentView) -> CommentDto {
+    CommentDto {
+        id: c.id.clone(),
+        kind: c.kind.as_str().to_string(),
+        body: c.body.clone(),
+        author: c.author.clone(),
+        assigned_to: c.assigned_to.clone().unwrap_or_default(),
+        answers: c.answers.clone().unwrap_or_default(),
+        resolved: c.resolved,
+        resolved_by: c.resolved_by.clone().unwrap_or_default(),
+        posted: c.created_at.format("%b %-d %H:%M").to_string(),
+        edited: c.edited_at.is_some(),
+        attachments: c.attachments.iter().map(attachment_dto).collect(),
+    }
+}
+
+#[cfg(feature = "server")]
+fn attachment_dto(a: &mcpm_core::AttachmentView) -> AttachmentDto {
+    AttachmentDto {
+        id: a.id.clone(),
+        level: a.level.clone(),
+        subject_id: a.subject_id.clone(),
+        name: a.name.clone(),
+        description: a.description.clone(),
+        content_type: a.content_type.clone(),
+        size_bytes: a.size_bytes,
+        size: size_label(a.size_bytes),
+        added_by: a.added_by.clone(),
+        added: a.created_at.format("%b %-d %H:%M").to_string(),
+        via_want_id: a.via_want.as_ref().map(|w| w.id.clone()).unwrap_or_default(),
+        via_want: a.via_want.as_ref().map(|w| w.body.clone()).unwrap_or_default(),
+        via_module_id: a.via_module.as_ref().map(|m| m.id.clone()).unwrap_or_default(),
+        via_module: a.via_module.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
+        comment_id: a.comment.as_ref().map(|c| c.id.clone()).unwrap_or_default(),
+        comment_author: a.comment.as_ref().map(|c| c.author.clone()).unwrap_or_default(),
+        comment_excerpt: a.comment.as_ref().map(|c| c.excerpt.clone()).unwrap_or_default(),
+    }
+}
+
+/// A byte count as people read one: "812 B", "12.4 KB", "3.1 MB".
+pub fn size_label(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    if b < 1024.0 {
+        format!("{bytes} B")
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.1} KB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", b / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 /// Pre-format one ledger entry for display.
 #[cfg(feature = "server")]
 fn format_event(e: &mcpm_core::Event) -> EventDto {
@@ -1427,6 +1804,42 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
             ),
             format!("Revision {}.", p["revision"].as_i64().unwrap_or(1)),
         ),
+        "attachment_added" => (
+            format!("File attached: {}", s("name")),
+            {
+                let size = size_label(p["size_bytes"].as_i64().unwrap_or(0));
+                let d = s("description");
+                if d.is_empty() { size } else { format!("{size} \u{b7} {d}") }
+            },
+        ),
+        "attachment_described" => (format!("File described: {}", s("name")), s("description")),
+        "comment_added" => (
+            format!("{} commented on {}", s("author"), s("subject")),
+            {
+                let n = p["files"].as_u64().unwrap_or(0);
+                let e = s("excerpt");
+                if n > 0 { format!("{e} ({n} file{})", if n == 1 { "" } else { "s" }) } else { e }
+            },
+        ),
+        "question_asked" => (
+            format!(
+                "Question on {} \u{2014} owed by {}",
+                s("subject"),
+                p["assigned_to"].as_str().filter(|a| !a.is_empty()).unwrap_or("anyone")
+            ),
+            s("excerpt"),
+        ),
+        "question_answered" => (
+            format!("{} answered on {}", s("author"), s("subject")),
+            {
+                let e = s("excerpt");
+                if p["released"].as_bool().unwrap_or(false) { format!("{e} \u{2014} module released.") } else { e }
+            },
+        ),
+        "question_withdrawn" => (format!("Question withdrawn on {}", s("subject")), String::new()),
+        "comment_edited" => (format!("Comment edited on {}", s("subject")), s("excerpt")),
+        "comment_deleted" => (format!("Comment deleted on {}", s("subject")), String::new()),
+        "attachment_removed" => (format!("File removed: {}", s("name")), String::new()),
         "blocker_reported" => (format!("Blocker on {}", s("module")), s("description")),
         "module_released" => (
             format!("Module released: {}", s("module")),

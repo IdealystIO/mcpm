@@ -74,14 +74,39 @@ pub enum Edit {
     DeclineWant { want: String },
     ReopenWant { want: String },
     DeleteWant { want: String },
+    /// Attach a file to a feature or a want. `subject` is its id.
+    AttachFile { subject: String },
+    /// Rewrite what an attachment is for.
+    DescribeAttachment { subject: String, attachment: String },
+    RemoveAttachment { subject: String, attachment: String },
+    /// Post what the composer holds (`comment_*`) on `subject`. Not a
+    /// modal: the composer is its own surface.
+    PostComment { subject: String },
+    EditComment { subject: String, comment: String },
+    /// Delete a note, or — `question` — withdraw an open question.
+    DeleteComment { subject: String, comment: String, question: bool },
 }
 
 impl Edit {
     /// Whether this edit takes a modal (a form or a confirm), as
     /// opposed to running straight away or living on its own screen.
     pub fn is_modal(&self) -> bool {
-        !matches!(self, Edit::None | Edit::CreatePlan | Edit::ReopenWant { .. })
+        !matches!(
+            self,
+            Edit::None | Edit::CreatePlan | Edit::ReopenWant { .. } | Edit::PostComment { .. }
+        )
     }
+}
+
+/// A file the reader picked, read into memory and waiting in the
+/// attach form. Held by value: the picker's handle is not `Clone`, and
+/// the request that sends it is built later, from a hole that is not
+/// the picker's scope (UX_GUIDELINES rule 25).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PickedBlob {
+    pub name: String,
+    pub content_type: String,
+    pub bytes: std::rc::Rc<Vec<u8>>,
 }
 
 /// Copy-able handle set for the console's interactive state.
@@ -101,8 +126,8 @@ pub struct Console {
     pub nav_open: Signal<bool>,
     /// Index into [`crate::model::features`] of the selected feature.
     pub feature: Signal<usize>,
-    /// Active main-pane view tab id: "graph" | "whitepaper" | "feed" |
-    /// "origin".
+    /// Active main-pane view tab id: "graph" | "whitepaper" | "files" |
+    /// "discussion" | "feed" | "origin".
     pub view: Signal<String>,
     /// Module drawer target: the id of the open module, or `None` when
     /// the drawer is closed. An **id**, not an index: the home screen's
@@ -204,6 +229,30 @@ pub struct Console {
     pub form_owns: Signal<String>,
     pub form_tags: Signal<String>,
     pub form_pick: Signal<Vec<String>>,
+    /// The attach form's file, once picked.
+    pub form_file: Signal<Option<PickedBlob>>,
+    /// The picker is open, or the pick is being read into memory.
+    pub form_picking: Signal<bool>,
+
+    // --- The comment composer ----------------------------------------
+    // One composer's worth of buffers, on `Console` so a tick that
+    // rebuilds the discussion cannot discard a half-written reply.
+    /// The subject the draft belongs to; a different subject opening
+    /// its discussion resets the buffers.
+    pub comment_subject: Signal<String>,
+    pub comment_draft: Signal<String>,
+    pub comment_files: Signal<Vec<PickedBlob>>,
+    /// "note" | "question"
+    pub comment_kind: Signal<String>,
+    /// A question's assignee, as typed.
+    pub comment_assignee: Signal<String>,
+    /// The open question being answered, when the composer is a reply
+    /// to one.
+    pub comment_answering: Signal<Option<String>>,
+    /// A comment is being posted.
+    pub comment_busy: Signal<bool>,
+    /// What the last post was refused for.
+    pub comment_error: Signal<String>,
     /// Which action menu is open, by its owner's id, so a tick that
     /// rebuilds the surface around a menu does not close it.
     pub menu_open: Signal<Option<String>>,
@@ -312,6 +361,16 @@ pub fn use_console() -> Console {
         form_owns: signal(String::new()),
         form_tags: signal(String::new()),
         form_pick: signal(Vec::new()),
+        form_file: signal(None),
+        form_picking: signal(false),
+        comment_subject: signal(String::new()),
+        comment_draft: signal(String::new()),
+        comment_files: signal(Vec::new()),
+        comment_kind: signal("note".to_string()),
+        comment_assignee: signal(String::new()),
+        comment_answering: signal(None),
+        comment_busy: signal(false),
+        comment_error: signal(String::new()),
         menu_open: signal(None),
         open_after: signal(None),
         plan_name: signal(String::new()),
@@ -514,6 +573,55 @@ impl Console {
         self.form_owns.set(owns.to_string());
         self.form_tags.set(tags.to_string());
         self.form_pick.set(Vec::new());
+        self.form_file.set(None);
+        self.form_picking.set(false);
+    }
+
+    /// Point the composer at a subject, clearing a draft written for
+    /// another one. Called by the discussion surface as it mounts; a
+    /// draft for the SAME subject survives a rebuild.
+    pub fn aim_composer(&self, subject: &str) {
+        if self.comment_subject.get() != subject {
+            self.comment_subject.set(subject.to_string());
+            self.reset_composer();
+        }
+    }
+
+    /// Empty the composer.
+    pub fn reset_composer(&self) {
+        self.comment_draft.set(String::new());
+        self.comment_files.set(Vec::new());
+        self.comment_kind.set("note".to_string());
+        self.comment_assignee.set(String::new());
+        self.comment_answering.set(None);
+        self.comment_error.set(String::new());
+    }
+
+    /// Send the composer's contents.
+    pub fn post_comment(&self, subject: &str) {
+        self.comment_error.set(String::new());
+        self.comment_busy.set(true);
+        self.action.set(Edit::PostComment { subject: subject.to_string() });
+        self.action_seq.update(|n| n + 1);
+    }
+
+    /// Go to an open question: the feature's discussion, the module's
+    /// drawer, or the want's — wherever it was asked.
+    pub fn open_question(&self, level: &str, subject_id: &str, feature_id: &str) {
+        match level {
+            "want" => self.open_want(subject_id),
+            "module" => {
+                if let Some(fi) = crate::model::features().iter().position(|f| f.id == feature_id) {
+                    self.open_module_in(fi, subject_id);
+                }
+            }
+            _ => {
+                if let Some(fi) = crate::model::features().iter().position(|f| f.id == subject_id) {
+                    self.select_feature(fi);
+                    self.view.set("discussion".to_string());
+                }
+            }
+        }
     }
 
     /// Open or close one action menu by its owner's id.

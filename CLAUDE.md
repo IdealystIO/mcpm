@@ -27,6 +27,22 @@ order at read time; nothing about readiness is stored. When you add a
 plan op, it ends in `check_ownership` and, for an edge, `reaches` — the
 cycle and overlap rules live once each and every writer calls them.
 
+**A question is the other half of the gate.** A comment of kind
+`question` names who owes the answer (`assigned_to`, or nobody) and
+holds its subject until an `answer` comment lands: a module with one —
+or whose feature has one — is not dispatchable and `claim_module`
+refuses with `PENDING_RESOLUTION`; a want with one cannot be promoted.
+Like readiness, nothing about this is stored: `feature_tree` derives
+`dispatchable` from open questions and `claim_module` reads them
+inside its transaction, through the same `open_questions_*` helpers,
+so the two cannot disagree. `report_blocker` is such a question, owed
+by the feature's planner — that is what gave blockers a resolution
+path. Who may answer is `Store::answer_question`'s rule and nobody
+else's: the assignee, the asker, anyone when unassigned, and a
+`human` actor whoever it names. `Actor::human` exists for exactly that
+and is set only by the console host from a person's key (or none) —
+never from an agent's.
+
 **Identity is a credential, not an argument.** Over HTTP an agent does
 not say who it is: `Store::verify_key` resolves its API key to an agent
 name and role, and that is what the ledger records and what the role
@@ -136,7 +152,7 @@ anything that writes to `memories`.
 | --- | --- |
 | `crates/mcpm-core` | Domain + Postgres store. Every invariant lives here, in one place each. |
 | `crates/mcpm-mcp` | The MCP server agents connect to: tools, prompts, `project://` resources. Two transports (`rpc.rs` is the shared dispatcher), plus the key CLI. |
-| `crates/api` | Wire DTOs, the capture-syntax parser, `#[server]` fns, and the `mcpm-web` host binary. |
+| `crates/api` | Wire DTOs, the capture-syntax parser, `#[server]` fns, the attachment upload/download routes (`files.rs`), and the `mcpm-web` host binary. |
 | `src/` | The Idealyst console. `components/` is one module per view. |
 
 When you change anything that affects ranking — weights, synonyms, the
@@ -153,13 +169,17 @@ ranked by whichever entry contained "the".
 docker compose -p control-center-devc \
   -f .devcontainer/docker-compose.yml \
   -f .devcontainer/docker-compose.idealyst.yml \
-  -f .devcontainer/docker-compose.host-db.yml up -d database   # :55432
+  -f .devcontainer/docker-compose.host-db.yml up -d database minio  # :55432, :59000
+MCPM_S3_ENDPOINT=http://localhost:59000 \
+MCPM_S3_ACCESS_KEY=minioadmin MCPM_S3_SECRET_KEY=minioadmin \
 cargo run -p api --bin mcpm-web --features server               # :3210
 idealyst dev --web --local --port 8090                          # :8090
 ```
 
-Ports are deliberate — 5432/5433/8080 belong to the user's other
-projects. `mcpm-web` binds loopback (`HOST`/`PORT` override); a container
+Ports are deliberate — 5432/5433/8080/9000 belong to the user's other
+projects. The `MCPM_S3_*` trio is only for attachments; without it the
+host starts, serves attachment records, and refuses uploads with a
+message that says so. `mcpm-web` binds loopback (`HOST`/`PORT` override); a container
 needs `HOST=0.0.0.0` or a published port reaches nothing, and nothing
 outside a container should set it — the host is CORS-permissive and
 unauthenticated. Before calling UI work done:
@@ -173,6 +193,16 @@ idealyst lint
 
 Both `cargo check` lines matter: they compile mutually exclusive halves
 of the `server` SDK, and only running one hides breakage in the other.
+
+To see a change in a browser, build the wasm with the API origin of the
+host you are running (`MCPM_API_ORIGIN=http://127.0.0.1:3299 idealyst dev
+--web --local --port 8091`) and drive it either with the `idealyst`
+robot tools or with headless Chrome over CDP. One trap with the robot:
+the console's sync loop is a `raf_loop`, and a browser pauses rAF in a
+BACKGROUND tab — every `open <url>` on macOS makes a new tab, so after
+the second one the relay is capturing a tab that never fetches and the
+screen reads as "polling · 0 features" forever. That is the tab, not
+the console; keep one tab, or use headless Chrome.
 
 ## Gotchas that fail silently
 
@@ -216,8 +246,8 @@ of the `server` SDK, and only running one hides breakage in the other.
 - **The console reads in tiers, and every fetch is issued from one
   place.** `load_board` is the only global read and is scalars per
   feature; a feature's tree, a module's handoff and history, a page of
-  a feed, a page of the pool are each their own read, fetched when
-  they are on screen. The scheduler is `start_sync` in `src/app.rs`:
+  a feed, a page of the pool, a subject's discussion are each their own
+  read, fetched when they are on screen. The scheduler is `start_sync` in `src/app.rs`:
   it computes what the screen needs each frame, what a tick has made
   stale, and issues the difference. A view that spawns its own fetch
   breaks that — a rev bump rebuilds it, it fetches again, and the
@@ -240,6 +270,59 @@ of the `server` SDK, and only running one hides breakage in the other.
   rule 25). A `#[server]` fn's arguments are sent as a JSON array on
   the wire (`'["feat_x", true]'`), and the reply is `{"Ok": …}` /
   `{"Err": …}` — what to send when you curl one.
+- **An attachment's bytes go to the object store BEFORE its row, and
+  its row is deleted BEFORE its object.** `Store::attach_file` puts
+  first and inserts second, taking the object back down if the insert
+  fails; `remove_attachment` (and the feature/want deletes) delete the
+  row in the transaction and the object after the commit, best effort.
+  The asymmetry is the point: an orphaned object is wasted bytes, an
+  orphaned ROW is a briefing promising a file nobody can fetch. A
+  storage failure on the way down is logged, never reported over the
+  write that succeeded. Keep both orderings if you add another writer.
+- **A comment and its files are one transaction, and a question's
+  side effects live in it.** `Store::post_comment` is the single
+  writer for notes, questions and answers: files are put first (the
+  same argument as `attach_file`), then the comment row, its
+  attachment rows, the question's `resolved_at`, the module's
+  `blocked`/release, and the event commit together. `release_if_answered`
+  clears `blocked` only when NO open question remains on the module —
+  two questions, one answer, still held — and returns the module to
+  its worker if one holds the claim, else to `todo`. A deleted comment
+  cascades its attachment rows in SQL, so `delete_comment` collects
+  the object keys first and discards after commit; the feature, want
+  and module deletes call `delete_comment_rows` after
+  `delete_attachment_rows` for the same reason.
+- **A feature's attachments are DERIVED from its wants, not copied.**
+  `feature_attachments` unions the feature's own rows with those of the
+  wants linked through `want_features`, marked `via_want`. Copying at
+  promote time would leave two records for one file, and un-linking a
+  want would silently keep it. The console shows a via-want row without
+  a menu for the same reason: the file is the want's to edit.
+- **`attach_file` carries bytes inside a JSON-RPC message, so the
+  HTTP transport's body cap is sized to it.** `rpc::MAX_INLINE_ATTACHMENT_BYTES`
+  (8 MiB decoded) is the tool's own limit and `http.rs` sets axum's
+  `DefaultBodyLimit` from it — base64 inflates by a third, and axum's
+  default is 2 MiB, which would cut a legitimate call off with a bare
+  413 before the tool ever saw it. Raise one and you must raise the
+  other; the tool's refusal is the one that says why.
+- **The file routes are not server functions, and they gate
+  themselves.** A file is not a JSON argument, so `POST /_files/{subject}`
+  (multipart), `POST /_comments/{subject}` (a comment with its files,
+  one request, one transaction) and `GET /_files/{attachment}` live in
+  `api::files` as axum routes merged beside `/_srv/*`. The dispatch hook never sees
+  them, so each resolves its caller through `api::Caller::resolve` —
+  the SAME function the hook uses — and the upload applies the same
+  `require_planner`. A second way of deciding who gets in would be a
+  hole nobody looks at. The download accepts the key in its query
+  string (hex, like the event socket) because a browser navigation
+  carries no header; it then 302s to a presigned link, so the key never
+  reaches the object store and the link expires on its own.
+- **Opening a file must happen inside the click.** A browser only lets
+  a page open a window (or a file dialog) during the gesture that asked
+  for it, so `open_attachment` builds the URL synchronously from what
+  the console already holds and the host does the round trip. An
+  `await` before `open_url` is a popup that silently never opens — no
+  error, just nothing.
 - **The capture syntax is defined once**, in `crates/api/src/capture.rs`,
   and used by both the editor's highlighting and the server function
   that writes. Never add a second parser — drift between them means the
@@ -247,7 +330,13 @@ of the `server` SDK, and only running one hides breakage in the other.
 - **Keep the capture composer outside any `switch` keyed on
   `Console.rev`.** A background poll would rebuild the text node and
   steal focus mid-sentence. Its buffers live on `Console` for the same
-  reason.
+  reason. The comment composer's buffers (`comment_*`) are there too,
+  and are AIMED at one subject by `start_sync` (`aim_composer`) rather
+  than by the surface that renders them: three surfaces can show a
+  composer (feature tab, module drawer, want drawer), all bound to the
+  same buffers, and the one on top is the one the loop names — a draft
+  therefore never leaks from one subject to another, and never resets
+  under a rebuild of the same one.
 - **`scroll_view` is single-axis and clips the other one silently.**
   Vertical unless `horizontal = true`, never both — so the board and the
   dependency graph each nest two, and the inner axis is pinned with

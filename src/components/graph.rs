@@ -446,6 +446,7 @@ mod tests {
             depth,
             summary: None,
             block: None,
+            open_questions: Vec::new(),
             tasks: Vec::new(),
         }
     }

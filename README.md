@@ -25,7 +25,7 @@ boundary.
 
 ## Prerequisites
 
-- Docker (for Postgres)
+- Docker (for Postgres, and MinIO if you want attachments locally)
 - Rust stable
 - The [Idealyst](https://github.com/IdealystIO/idealyst-native) CLI, for
   the console only: `cargo install --git https://github.com/IdealystIO/idealyst-native idealyst-cli`
@@ -39,21 +39,25 @@ init failure rather than a build error.
 
 ## Setup
 
-**1. Start Postgres.** Published on host port 55432 to avoid colliding
-with other projects on 5432/5433.
+**1. Start Postgres** (and MinIO, for attachments). Published on host
+ports 55432 and 59000/59001 to avoid colliding with other projects on
+5432/5433 and 9000.
 
 ```bash
 docker compose -p control-center-devc \
   -f .devcontainer/docker-compose.yml \
   -f .devcontainer/docker-compose.idealyst.yml \
   -f .devcontainer/docker-compose.host-db.yml \
-  up -d database
+  up -d database minio
 ```
 
 **2. Start the API host.** Migrations run automatically on connect, so
-this step also creates the schema.
+this step also creates the schema. The `MCPM_S3_*` variables point it at
+MinIO; leave them off and everything but attaching files still works.
 
 ```bash
+MCPM_S3_ENDPOINT=http://localhost:59000 \
+MCPM_S3_ACCESS_KEY=minioadmin MCPM_S3_SECRET_KEY=minioadmin \
 cargo run -p api --bin mcpm-web --features server     # http://127.0.0.1:3210
 ```
 
@@ -72,8 +76,8 @@ an unauthenticated one. See [Deploying it as a service](#deploying-it-as-a-servi
 idealyst dev --web --local --port 8090                # http://127.0.0.1:8090
 ```
 
-All three ports are deliberate. 5432, 5433 and 8080 are assumed to
-belong to other projects.
+All of these ports are deliberate. 5432, 5433, 8080 and 9000 are assumed
+to belong to other projects.
 
 ### Connecting agents
 
@@ -87,7 +91,10 @@ Agents reach mcpm over stdio through `.mcp.json`, already in this repo:
       "args": ["run", "--quiet", "-p", "mcpm-mcp"],
       "env": {
         "DATABASE_URL": "postgres://app:app@localhost:55432/app",
-        "MCPM_PROJECT_NAME": "control-center"
+        "MCPM_PROJECT_NAME": "control-center",
+        "MCPM_S3_ENDPOINT": "http://localhost:59000",
+        "MCPM_S3_ACCESS_KEY": "minioadmin",
+        "MCPM_S3_SECRET_KEY": "minioadmin"
       }
     }
   }
@@ -188,6 +195,87 @@ identity, and there are two kinds:
   before it reads the code.
 
 Revisions are append-only; the newest is current.
+
+## Attachments
+
+A document is prose. An attachment is a **file** — a design, a
+screenshot, a spec somebody sent, a sample of the data — pinned to a
+feature or a want with a **description written for the agent that will
+read it**: what the file is and what to take from it. The description
+is the part that travels: a worker's claim briefing lists the feature's
+attachments by name and description, and the worker fetches only what
+its module needs.
+
+- **People attach from the console; agents attach with a tool.** A
+  person picks a file on the feature's *Files* tab or in a want's
+  drawer (its menu: *Attach file*), writes the description, and the
+  console POSTs it to the host. An agent calls `attach_file` with the
+  file inline — text as `content`, anything else as `content_base64`,
+  up to 8 MiB decoded per call — which is how a worker leaves a results
+  CSV or a screenshot of a failing state on the record. Either way the
+  description is the contract, and `describe_attachment` lets any
+  agent sharpen one once it has read the file and can say what matters.
+- **A feature inherits its wants' files.** A file attached to an idea
+  reaches every feature the idea is composed into, marked *via* that
+  want, without being copied — un-link the want and the file goes with
+  it. On the feature's list those rows open the file and nothing else;
+  their edits are on the want's own drawer.
+- **The bytes live in an object store** — S3, or MinIO locally — and
+  the record (name, type, size, hash, who, when, the description) in
+  Postgres. `read_attachment` returns text-like files inline and every
+  file as a link good for an hour; the console opens a file through the
+  host, which 302s to the same kind of link.
+
+Configure the store with `MCPM_S3_ENDPOINT`, `MCPM_S3_ACCESS_KEY` and
+`MCPM_S3_SECRET_KEY` (the devcontainer's `MINIO_*` variables and the
+`AWS_*` pair are honoured too), and `MCPM_S3_BUCKET` to name the bucket
+(default `mcpm-attachments`; created on a custom endpoint, expected to
+exist on AWS). `MCPM_S3_PUBLIC_ENDPOINT` is for the case where the store
+is reached by one name from the server and another from a browser — a
+devcontainer's `http://minio:9000` versus the host's `localhost:59000` —
+because a presigned link signs the host it was minted for. Both the
+console host and the MCP server take the same variables; a server with
+none set serves the records and refuses only the bytes, saying why.
+
+## Discussion, and questions that hold the work
+
+Every feature, want and module has a discussion — the *Discussion* tab
+on a feature's board, a section in the module and want drawers — and
+agents read and write the same thread through `list_comments` and
+`add_comment`. A comment is Markdown and may carry files (the same
+attachments as above; a comment's files list on the feature's Files tab
+too). This is where a person and an agent talk about the work beside
+the work, and it is the human-in-the-loop surface:
+
+- **A question names who owes the answer, and holds the work until it
+  lands.** `ask_question` (or the composer's *Question* mode) takes an
+  `assigned_to` — a person's name as the console records it, the
+  manager agent, a worker, or nobody for anyone. While a question is
+  open on a **module**, its worker sees `blocked` and nobody can claim
+  it; on a **feature**, nothing in it is dispatchable (`next_work`
+  says why and `claim_module` refuses with `PENDING_RESOLUTION`); on
+  a **want**, it cannot be promoted. Nothing about this is stored as
+  state: the gate and the tree read open questions at the moment they
+  decide, so `dispatchable` and the claim cannot disagree.
+- **An answer is what releases it.** `answer_question` (or *Answer* on
+  the question's row) may be given by the assignee, by the asker
+  (withdrawing, or answering their own), by anyone if it was assigned
+  to nobody — and by a person at the console whoever it names, because
+  the person outranks the assignment. A blocked module goes back to
+  its worker if one still holds it.
+- **A worker's blocker is a question owed by the planner.**
+  `report_blocker` opens one, so blockers finally have a resolution
+  path: the module is held — for its own worker too — until the answer
+  lands, and the answer is on the record beside the problem.
+- **Agents are told what they owe.** `get_context` lists the open
+  questions assigned to the caller and puts answering them first in
+  `suggested_next`; the console's home screen lists every open question
+  and who it waits on. A claim briefing carries the newest of the
+  module's and feature's discussion.
+
+Notes can be edited and deleted by their author; an open question can
+be withdrawn by its asker; an answer, and an answered question, are
+history and stay.
 
 ## Wants
 
@@ -489,7 +577,7 @@ rotate or forget it.
 | `crates/mcpm-core` | Domain and Postgres store. The prerequisite gate, plan validation (cycles, ownership overlap), exclusive claims, checklist-proven completion, documents, the want pool, the append-only event ledger, and scoped memory search. Every invariant is enforced inside a transaction. |
 | `crates/mcpm-mcp` | The MCP server: 30 tools, three briefing prompts, and read-only `project://` resources, over stdio or authenticated HTTP. Also the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, the `#[server]` functions and `#[subscription]` the console calls, plus the `mcpm-web` host binary (feature-gated). |
-| `src/` | The Idealyst console: the want pool and capture screens, the plan editor, the module graph, the whitepaper, live feed, composed-from, the module and want drawers, and the edit menus on each. |
+| `src/` | The Idealyst console: the want pool and capture screens, the plan editor, the module graph, the whitepaper, the discussion and files tabs, live feed, composed-from, the module and want drawers (each with its discussion), and the edit menus on each. |
 
 ## Development
 

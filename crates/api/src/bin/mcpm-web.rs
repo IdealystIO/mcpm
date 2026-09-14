@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use mcpm_core::{from_bearer, redact_url, Store};
+use mcpm_core::{from_bearer, redact_url, FileProvider as _, S3Files, Store};
 use tower_http::cors::CorsLayer;
 
 #[tokio::main]
@@ -46,6 +46,31 @@ async fn main() {
         .await
         .expect("ensure project row");
 
+    // The object store attachments go to. Optional — a host without one
+    // still shows attachment records and refuses only uploads, saying
+    // why — but a half-configured one is refused at startup, because an
+    // operator's typo should not surface as a 502 on somebody's upload.
+    // One that is configured but not answering is a warning: the
+    // console is more than its Files tab, and each upload then fails
+    // with the store's own message rather than the host never starting.
+    let store = match S3Files::from_env() {
+        Ok(Some(files)) => {
+            if let Err(err) = files.ensure_bucket().await {
+                eprintln!("mcpm-web: object store not ready — uploads will fail until it is: {err}");
+            }
+            println!("mcpm-web: files {}", files.describe());
+            store.with_files(Arc::new(files))
+        }
+        Ok(None) => {
+            println!("mcpm-web: no object store configured — attachments cannot be uploaded here");
+            store
+        }
+        Err(err) => {
+            eprintln!("mcpm-web: refusing to start — {err}");
+            std::process::exit(1);
+        }
+    };
+
     let require_auth = api::auth_required();
     if require_auth {
         let live = store.live_key_count().await.expect("count live API keys");
@@ -60,11 +85,12 @@ async fn main() {
     }
 
     server::install_state(store.clone());
+    let gate_store = Arc::new(store);
     // The single interception seam the server-fn primitive offers. One
     // hook, installed once — see the crate's `DispatchHook` docs for why
     // it is a slot and not a list.
     server::install_dispatch_hook(ConsoleGate {
-        store: Arc::new(store),
+        store: gate_store.clone(),
         require_auth,
     });
     // FORCE-LINK: the bin must reference something from the `api` crate
@@ -73,7 +99,12 @@ async fn main() {
     // server-fn demo). This touch is that reference.
     let _ = api::Board::default();
 
-    let app: axum::Router = server::router().layer(cors(require_auth));
+    // The file routes sit beside `/_srv/*` under the same CORS layer.
+    // They gate themselves (see `api::files`), because the dispatch
+    // hook below only sees server-fn calls.
+    let app: axum::Router = server::router()
+        .merge(api::files::router((*gate_store).clone(), require_auth))
+        .layer(cors(require_auth));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -174,19 +205,11 @@ impl server::DispatchHook for ConsoleGate {
                 .and_then(from_bearer)
                 .map(str::to_string);
 
-            let caller = match presented {
-                Some(token) => match self.store.verify_key(&token).await {
-                    Ok(identity) => api::Caller {
-                        name: identity.agent_name,
-                        role: Some(identity.role),
-                    },
-                    Err(_) => return Err(unauthorized()),
-                },
-                // No credential. Fine on an open loopback host; the
-                // whole point of the gate otherwise.
-                None if !self.require_auth => api::Caller::local(),
-                None => return Err(unauthorized()),
-            };
+            // Resolved by the same function the file routes use, so
+            // the two surfaces admit exactly the same callers.
+            let caller = api::Caller::resolve(&self.store, presented.as_deref(), self.require_auth)
+                .await
+                .map_err(|()| unauthorized())?;
 
             ctx.insert(caller);
             next.run(ctx).await

@@ -7,13 +7,13 @@ use idea_ui::{size, typography_kind, variant, Button, Field, IdeaThemeRef, Popov
 use idea_ui_nav::sidebar_pinned;
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    component, current_breakpoint, presence, pressable, stylesheet, switch, ui, AlignItems, Easing,
+    component, current_breakpoint, stylesheet, switch, ui, AlignItems, Easing,
     Element,
     FlexDirection, FontWeight, IdealystSchema, IntoElement, JustifyContent, PresenceAnim,
     PresenceState, PressableHandle, Ref, StyleApplication,
 };
 
-use crate::components::bits::{Mono, StatusDot};
+use crate::components::bits::{Mono, StatusDot, tappable};
 use crate::components::sidebar::PIN_AT;
 use crate::model::{active_agent_count, Status};
 use crate::state::Console;
@@ -142,7 +142,7 @@ pub fn NavButton(props: &NavButtonProps) -> Element {
             let inner: Element = ui! {
                 text(style = NavGlyph()) { "\u{2261}" }
             };
-            pressable(vec![inner], move || console.toggle_nav())
+            tappable(vec![inner], move || console.toggle_nav())
                 .with_style(StyleApplication::new(nav_button_box_style()))
                 .into_element()
         },
@@ -211,7 +211,7 @@ pub fn KeyPill(props: &KeyPillProps) -> Element {
         },
     );
 
-    let pill = pressable(vec![label], move || console.show_key())
+    let pill = tappable(vec![label], move || console.show_key())
         .bind(trigger)
         .with_style(StyleApplication::new(key_pill_box_style()))
         .into_element();
@@ -219,19 +219,23 @@ pub fn KeyPill(props: &KeyPillProps) -> Element {
     // `presence` owns the timing so the panel can fade and lift on the
     // way in and back out — gating the Popover on a bare `if` would
     // drop the subtree on the same frame it was told to close.
-    let panel = presence(move || ui! { KeyPanel(console = console, anchor = Some(trigger)) })
-        .present(move || console.key_open.get())
-        .enter(PresenceAnim::new(
-            PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
-            140,
-            Easing::EaseOut,
-        ))
-        .exit(PresenceAnim::new(
-            PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
-            110,
-            Easing::EaseIn,
-        ))
-        .into_element();
+    let panel: Element = ui! {
+        presence(
+            present = move || console.key_open.get(),
+            enter = PresenceAnim::new(
+                PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
+                140,
+                Easing::EaseOut,
+            ),
+            exit = PresenceAnim::new(
+                PresenceState::default().opacity(0.0).translate_y(-4.0).scale(0.98),
+                110,
+                Easing::EaseIn,
+            ),
+        ) {
+            KeyPanel(console = console, anchor = Some(trigger))
+        }
+    };
 
     ui! {
         view(style = KeyAnchor()) {
