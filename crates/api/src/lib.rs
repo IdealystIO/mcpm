@@ -584,6 +584,27 @@ pub struct AgentDto {
     pub active_claims: i64,
     /// Comma-joined module names it currently holds.
     pub claim_names: String,
+    /// The health check registered for it, if any. `None` is "no check
+    /// configured", which the roster shows differently from "checked
+    /// and down".
+    #[serde(default)]
+    pub health: Option<AgentHealthDto>,
+}
+
+/// What the server's last probe of an agent's machine concluded.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentHealthDto {
+    pub url: String,
+    /// `up` / `down` / `gone` / `unreachable`, or empty before the first
+    /// probe.
+    pub state: String,
+    /// The probe's one-line reason: `HTTP 503`, `timed out after 8s`.
+    pub detail: String,
+    /// When the current state was first observed, as a stamp; empty
+    /// before the first probe.
+    pub since: String,
+    /// The last probe's time, as a stamp.
+    pub checked: String,
 }
 
 /// One committed event, announced. The console renders nothing out of
@@ -861,6 +882,13 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
             role: a.role,
             active_claims: a.active_claims,
             claim_names: a.claim_names,
+            health: a.health.map(|h| AgentHealthDto {
+                url: h.url,
+                state: h.state.map(|s| s.as_str().to_string()).unwrap_or_default(),
+                detail: h.detail,
+                since: stamp(h.since),
+                checked: stamp(h.checked_at),
+            }),
         })
         .collect();
     let tags = store
@@ -1884,6 +1912,12 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
         "key_revoked" => (
             format!("API key revoked: {}", s("key_id")),
             String::new(),
+        ),
+        // Only a CHANGE is recorded, so this reads as the transition it
+        // is: "attendance-modes is down" with the status line under it.
+        "agent_health" => (
+            format!("{} is {}", s("agent"), s("to")),
+            format!("{} at {}.", s("detail"), s("url")),
         ),
         other => (other.to_string(), String::new()),
     };

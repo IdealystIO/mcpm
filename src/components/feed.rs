@@ -13,7 +13,7 @@ use runtime_core::{
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
 use crate::model::{feed, features};
 use crate::state::Console;
-use crate::styles::{MonoTextSize, SectionLabel};
+use crate::styles::{status_tone, MonoTextSize, SectionLabel};
 
 /// Props for [`FeedView`].
 #[derive(Default, IdealystSchema)]
@@ -161,15 +161,32 @@ pub fn RosterCard(props: &RosterCardProps) -> Element {
     let scope = a.scope.clone();
     let level = a.level.to_string();
     let uptime = a.uptime.to_string();
+    // With a health check registered the tag answers "is the box
+    // there?" — the question the roster exists for — and the claims
+    // move to the lines under it. Without one, the tag is what the
+    // ledger can say: running while it holds a claim.
+    let checked = a.health.is_some();
+    let dot = a.health.as_ref().map(|h| h.tone).unwrap_or(state);
+    let health_label = a.health.as_ref().map(|h| h.label.clone()).unwrap_or_default();
+    let health_tone = status_tone(a.health.as_ref().map(|h| h.tone).unwrap_or(state));
+    let health_line = a.health.as_ref().map(|h| h.line.clone()).unwrap_or_default();
     ui! {
         view(style = RosterBox()) {
             Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
-                StatusDot(status = state)
+                StatusDot(status = dot)
                 Mono(content = id)
                 Spacer()
-                StatusBadge(status = state)
+                if checked {
+                    Badge(label = health_label, tone = health_tone)
+                }
+                if !checked {
+                    StatusBadge(status = state)
+                }
             }
             Typography(content = scope, kind = typography_kind::Caption, muted = true)
+            if checked {
+                Mono(content = health_line, size = MonoTextSize::Overline)
+            }
             Stack(axis = StackAxis::Row, align = StackAlign::Center) {
                 Mono(content = level, size = MonoTextSize::Overline)
                 Spacer()

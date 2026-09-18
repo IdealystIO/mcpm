@@ -55,9 +55,16 @@ thiserror = "2"
 # a success-shaped response carrying an error body.
 s3 = { package = "rust-s3", version = "0.37", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
 hex = "0.4"
+# Agent health probes. `reqwest` is already in the graph under rust-s3
+# with the same rustls + webpki roots, so this adds no second TLS
+# stack; `url` is what the allowlist parses a registration with, and it
+# is reqwest's own. `time` on tokio is the sweep timer.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+url = "2"
 # The event fan-out: one listener task, a broadcast to every subscriber.
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# `net` + `io-util`: the probe tests stand up a one-shot HTTP listener.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }

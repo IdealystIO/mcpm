@@ -15,7 +15,7 @@ use runtime_core::{
 
 use crate::components::bits::{Mono, StatusDot, tappable};
 use crate::components::sidebar::PIN_AT;
-use crate::model::{active_agent_count, Status};
+use crate::model::{live_agent_count, Status};
 use crate::state::Console;
 use crate::styles::MonoTextSize;
 
@@ -79,7 +79,7 @@ pub fn Header(props: &HeaderProps) -> Element {
     let agents = switch(
         move || console.rev.get(),
         move |_: &u64| {
-            let label = format!("{} agents live", active_agent_count());
+            let label = format!("{} agents live", live_agent_count());
             ui! {
                 Typography(content = label, kind = typography_kind::Caption, muted = true)
             }

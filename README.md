@@ -486,6 +486,55 @@ KEY            ROLE       AGENT       LABEL             LAST USED    STATE
 1a4a78a5ce04   worker     worker-03   worker-03         never        revoked 2026-09-01
 ```
 
+### Is the box actually there?
+
+A fleet of boxes each holding a key has a failure the ledger cannot
+see: a box that holds its claims and has stopped. A quota-parked agent,
+a reclaimed spot instance and a dev server mid-rebuild are one silence
+from here, and `last_seen` only says when it last spoke. So an agent
+may register a URL for its machine — the branch's dev server, the page
+a person would open to look at it — and the MCP server probes it on a
+timer:
+
+```
+get_context(agent_name=…, role=worker, health_url='https://box-a.dev.example.com/')
+issue_worker_key(agent_name='box-a', health_url='https://box-a.dev.example.com/')
+```
+
+The second form is for the manager that provisions the box: it knows
+the hostname before the box has ever spoken, and the box appears on the
+roster — registered, not yet probed — from the moment its key exists.
+The verdict is one of four, because they are four different things to
+do next:
+
+| state | what came back | what it means |
+| --- | --- | --- |
+| `up` | 2xx, 3xx, or a 4xx other than 404 | something at that name answered — a server that refuses us is still a server |
+| `down` | 5xx | the front door answered and nothing behind it is serving: a stopped instance behind a load-balancer rule that survives, a dev server rebuilding |
+| `gone` | 404 | nothing is registered at that name any more — a shared load balancer's or proxy's "no such host", which is what a removed or scaled-to-zero box looks like |
+| `unreachable` | no HTTP answer at all | the path from the server to the URL, not the box; kept apart from `down` so a broken tunnel does not read as a fleet outage |
+
+Only a CHANGE of state is an event (`agent_health`, with `from`, `to`
+and the status line), so a healthy fleet is quiet, the ledger says
+when a box went down, and the console's roster — which shows the state
+as the box's tag and "down since 14:02 · HTTP 503" under it — hears
+about it the way it hears about everything else. The header's "N
+agents live" counts a box with a check only when it is up.
+
+**It is off until the operator turns it on, and that is the safety
+argument.** A URL an agent hands us is a URL the server will fetch from
+inside the deployment's network, and a server that fetches whatever it
+is told is a proxy into that network for anyone holding a worker key.
+So `MCPM_HEALTH_HOSTS` names the host suffixes the server may probe
+(`.dev.example.com`; comma-separated; a bare hostname matches only
+itself), a registration under any other host is refused with the
+variable's name, redirects are never followed, hosts must be names
+rather than addresses, and no response body is ever read — the status
+line is the whole observation. `MCPM_HEALTH_INTERVAL_SECS` sets the
+sweep interval (30 by default). The prober runs in `mcpm-mcp --http`
+and nowhere else; a stdio session is a laptop, and a laptop does not
+probe the fleet.
+
 ### The MCP server over HTTP
 
 ```bash
@@ -493,7 +542,8 @@ mcpm-mcp --http --bind 0.0.0.0:3211
 ```
 
 `POST /mcp` carries one JSON-RPC message and answers with one reply;
-`GET /health` is an unauthenticated liveness probe. Every request needs
+`GET /health` is an unauthenticated liveness probe (of THIS server —
+the agents' own health checks are the section above). Every request needs
 `Authorization: Bearer <token>`, and a bad or missing one gets a `401`
 with a `WWW-Authenticate` challenge and the same error envelope the tools
 use.

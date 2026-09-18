@@ -375,6 +375,24 @@ the console; keep one tab, or use headless Chrome.
   verified FIRST, so nothing below it — the expiry, the key it is bound
   to — is observable without already holding the token, and a guesser
   only ever reaches `delegation_unknown`.
+- **A health URL is fetched by the server, so the allowlist is the
+  gate and every registration path goes through it.** `agents.health_url`
+  is agent-supplied and `run_prober` GETs it from inside the
+  deployment's network; without `HealthPolicy::accept` in front, a
+  worker key is a proxy into that network (instance metadata, the
+  database's port). So health is OFF until `MCPM_HEALTH_HOSTS` names
+  host suffixes, `Store::set_health_url` and `issue_worker_key` both
+  call `accept` before writing, redirects are refused (a 3xx is an
+  answer; where it points is a URL nobody checked), hosts must be
+  names, and the probe drops the body unread — `health_detail` is a
+  status line or a short error phrase, never content. Add a third way
+  to register a URL and it must call `accept` too. The prober runs in
+  `mcpm-mcp --http` only, and `HealthState::classify` is the one place
+  a status becomes a state (404 = gone, 5xx = down, anything else
+  answered = up, no answer = unreachable). `record_health` raises an
+  `agent_health` event on a CHANGE of state only, which is what the
+  console's roster refetches on and what "down since" is read from;
+  a probe that writes an event every sweep would bury the ledger.
 - **The auth posture is derived from `HOST`, not configured
   alongside it.** `api::auth_required()` is true whenever `HOST` is not
   loopback, so a reachable console host cannot be an unauthenticated

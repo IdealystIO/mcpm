@@ -80,7 +80,10 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     runs on its OWN box is a different case: give it a key of its own \
     with issue_worker_key, because a delegation token is honoured \
     alongside exactly one key and boxes sharing one key are one identity \
-    the ledger cannot split. Beyond tools \
+    the ledger cannot split. A box may also register a health_url (on \
+    issue_worker_key or its own get_context) — the URL of its dev \
+    server — and the server probes it so the roster shows whether the \
+    box is up, down, gone or unreachable rather than merely quiet. Beyond tools \
     there are prompts (manager_briefing, \
     worker_briefing, compose_wants) that brief a fresh agent for a role, \
     and read-only project:// resources for the board, the want pool, and \
@@ -244,7 +247,20 @@ async fn call_tool(
             (None, Some(key)) => (key.agent_name.clone(), key.role.as_str().to_string()),
             (None, None) => (str_arg(args, "agent_name")?, str_arg(args, "role")?),
         };
-        let ctx = store.get_context(&agent, &role).await?;
+        let mut ctx = store.get_context(&agent, &role).await?;
+        // `health_url` is NOT identity, so it is the one get_context
+        // argument a keyed caller is heard on: it is a fact about the
+        // machine the verified identity runs on, applied to that
+        // identity's own row and no other. A subagent is refused inside
+        // the store — the URL is its parent machine's to register.
+        if let Some(url) = opt_str_arg(args, "health_url") {
+            let actor = match &delegation {
+                Some(d) => Actor::delegated(&d.agent_name, &d.module_id),
+                None => Actor::new(&agent),
+            };
+            store.set_health_url(&actor, Some(&url)).await?;
+            ctx.you.health_url = Some(url.trim().to_string()).filter(|u| !u.is_empty());
+        }
         if session.key.is_none() && delegation.is_none() {
             session.declared = Some((agent, role));
         }
@@ -297,9 +313,10 @@ async fn call_tool(
         "issue_worker_key" => {
             let agent_name = str_arg(args, "agent_name")?;
             let label = opt_str_arg(args, "label");
+            let health_url = opt_str_arg(args, "health_url");
             to_value(
                 store
-                    .issue_worker_key(&actor, &agent_name, label.as_deref())
+                    .issue_worker_key(&actor, &agent_name, label.as_deref(), health_url.as_deref())
                     .await?,
             )
         }

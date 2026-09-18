@@ -35,7 +35,7 @@ mod tools;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
-use mcpm_core::{redact_url, ApiKeyInfo, FileProvider as _, McpmError, S3Files, Store};
+use mcpm_core::{redact_url, ApiKeyInfo, FileProvider as _, HealthPolicy, McpmError, S3Files, Store};
 use serde_json::Value;
 
 use crate::cli::Mode;
@@ -61,7 +61,7 @@ fn main() {
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let store = rt.block_on(connect());
+    let (store, health) = rt.block_on(connect());
 
     let outcome = match mode {
         Mode::Help => Ok(()),
@@ -70,7 +70,17 @@ fn main() {
             rt.block_on(run_stdio(&store));
             Ok(())
         }
-        Mode::Http { bind } => rt.block_on(http::serve(store, &bind)),
+        Mode::Http { bind } => rt.block_on(async {
+            // The prober lives here and nowhere else: this is the one
+            // long-running process a deployment has exactly one of, and
+            // it is up whenever a keyed box could be. Stdio is a local
+            // session that comes and goes; running it there would probe
+            // the fleet from every laptop.
+            if let Some(policy) = health.clone() {
+                tokio::spawn(mcpm_core::run_prober(Arc::new(store.clone()), policy));
+            }
+            http::serve(store, &bind).await
+        }),
         Mode::IssueKey { label, agent, role } => rt.block_on(async {
             let issued = store
                 .issue_key(OPERATOR, label.as_deref().unwrap_or(""), &agent, role)
@@ -113,7 +123,10 @@ fn main() {
     }
 }
 
-async fn connect() -> Store {
+/// The store, plus the health policy separately so the HTTP mode can
+/// start the prober with it; the store itself carries the policy too,
+/// which is what lets a registration be validated in any mode.
+async fn connect() -> (Store, Option<Arc<HealthPolicy>>) {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://app:app@localhost:55432/app".to_string());
     let project_name =
@@ -144,6 +157,30 @@ async fn connect() -> Store {
         std::process::exit(1);
     }
     eprintln!("mcpm-mcp: db {}", redact_url(&database_url));
+    // Health checks are off until the operator names the hosts the
+    // server may probe; the policy is the allowlist, and a registration
+    // outside it is refused with the variable's name.
+    let health = match HealthPolicy::from_env() {
+        Ok(Some(policy)) => {
+            eprintln!("mcpm-mcp: health {}", policy.describe());
+            Some(Arc::new(policy))
+        }
+        Ok(None) => {
+            eprintln!(
+                "mcpm-mcp: health checks off — set {} to the host suffixes agents may register",
+                mcpm_core::HEALTH_HOSTS_ENV
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!("mcpm-mcp: cannot start: {err}");
+            std::process::exit(1);
+        }
+    };
+    let store = match &health {
+        Some(policy) => store.with_health(policy.clone()),
+        None => store,
+    };
     // The object store is optional: a server without one still serves
     // attachment RECORDS (a briefing carries their descriptions) and
     // refuses only the bytes, saying why. A misconfigured one is not
@@ -152,7 +189,7 @@ async fn connect() -> Store {
     // pipe, and MinIO being down should cost that agent attachments,
     // not the whole project — so it is said loudly and the provider is
     // installed anyway, to fail per call with the store's own words.
-    match S3Files::from_env() {
+    let store = match S3Files::from_env() {
         Ok(Some(files)) => {
             if let Err(err) = files.ensure_bucket().await {
                 eprintln!("mcpm-mcp: object store not ready — attachments will fail until it is: {err}");
@@ -168,7 +205,8 @@ async fn connect() -> Store {
             eprintln!("mcpm-mcp: cannot start: {err}");
             std::process::exit(1);
         }
-    }
+    };
+    (store, health)
 }
 
 /// The stdio transport. One session for the life of the pipe: the agent

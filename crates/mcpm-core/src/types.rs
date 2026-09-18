@@ -934,6 +934,10 @@ pub struct Context {
 pub struct AgentIdentity {
     pub name: String,
     pub role: String,
+    /// The URL this server probes to see whether your machine is up,
+    /// if one is registered. Set it with `health_url` on `get_context`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1072,6 +1076,28 @@ pub struct AgentOverview {
     pub active_claims: i64,
     /// Comma-joined names of the modules it currently holds.
     pub claim_names: String,
+    /// The health check registered for it, if any, with its verdict.
+    pub health: Option<AgentHealth>,
+}
+
+/// A registered health check and what the last probe made of it.
+/// `state` is `None` between registration and the first sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentHealth {
+    pub url: String,
+    pub state: Option<crate::HealthState>,
+    /// The probe's one-line reason: `HTTP 503`, `timed out after 8s`.
+    pub detail: String,
+    pub checked_at: Option<DateTime<Utc>>,
+    /// When the current state was first observed.
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// One agent the prober has to visit.
+#[derive(Debug, Clone)]
+pub struct HealthTarget {
+    pub name: String,
+    pub url: String,
 }
 
 /// Generic acknowledgement carrying the follow-on facts an agent needs.

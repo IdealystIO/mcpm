@@ -30,6 +30,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{McpmError, ErrorCode};
 use crate::files::{self, FileProvider};
+use crate::health::{HealthPolicy, HealthState, HealthVerdict};
 use crate::ids::{
     id_level, new_attachment_id, new_comment_id, new_document_id, new_id, new_memory_id,
     new_want_id, normalize_tag, Level,
@@ -109,6 +110,10 @@ pub struct Store {
     /// descriptions are what a briefing carries), but nothing can be
     /// attached or fetched until one is installed.
     files: Option<Arc<dyn FileProvider>>,
+    /// Which health URLs this server will agree to probe. `None` on a
+    /// server with no `MCPM_HEALTH_HOSTS`: nothing is probed and no URL
+    /// can be registered, and the refusal says so.
+    health: Option<Arc<HealthPolicy>>,
 }
 
 impl Store {
@@ -145,6 +150,7 @@ impl Store {
             url: database_url.to_string(),
             events: Arc::new(OnceCell::new()),
             files: None,
+            health: None,
         })
     }
 
@@ -157,6 +163,31 @@ impl Store {
     /// Whether this store can hold attachment bytes.
     pub fn has_files(&self) -> bool {
         self.files.is_some()
+    }
+
+    /// Turn health checks on: URLs under the policy's hosts may be
+    /// registered, and a prober (see [`crate::run_prober`]) may sweep them.
+    pub fn with_health(mut self, policy: Arc<HealthPolicy>) -> Store {
+        self.health = Some(policy);
+        self
+    }
+
+    /// The health policy, or the refusal every registration path gives
+    /// when there is none. One function so the wording is one place.
+    fn health_policy(&self) -> Result<&HealthPolicy> {
+        self.health.as_deref().ok_or_else(|| {
+            McpmError::new(
+                ErrorCode::PlanInvalid,
+                "Health checks are not configured on this server.",
+                json!({ "env": crate::HEALTH_HOSTS_ENV }),
+                format!(
+                    "The operator turns them on by setting {} to the host suffixes the server \
+                     may probe (e.g. `.dev.example.com`). Until then a health_url is refused \
+                     and nothing else about your call is affected — retry without it.",
+                    crate::HEALTH_HOSTS_ENV
+                ),
+            )
+        })
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -233,13 +264,14 @@ impl Store {
     }
 
     pub async fn get_context(&self, agent: &str, role: &str) -> Result<Context> {
-        sqlx::query(
+        let health_url: Option<String> = sqlx::query_scalar(
             "INSERT INTO agents (name, role) VALUES ($1, $2)
-             ON CONFLICT (name) DO UPDATE SET role = $2, last_seen = now()",
+             ON CONFLICT (name) DO UPDATE SET role = $2, last_seen = now()
+             RETURNING health_url",
         )
         .bind(agent)
         .bind(role)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
         let project = sqlx::query("SELECT name, repo_path, description FROM project WHERE id = 1")
@@ -309,6 +341,7 @@ impl Store {
             you: AgentIdentity {
                 name: agent.to_string(),
                 role: role.to_string(),
+                health_url,
             },
             features,
             your_claims,
@@ -350,7 +383,9 @@ impl Store {
                         AS active_claims,
                     (SELECT COALESCE(string_agg(m.name, ', '), '') FROM modules m
                      WHERE m.claimed_by = a.name AND m.status IN ('in_progress','blocked'))
-                        AS claim_names
+                        AS claim_names,
+                    a.health_url, a.health_state, a.health_detail,
+                    a.health_checked_at, a.health_since
              FROM agents a ORDER BY a.first_seen",
         )
         .fetch_all(&self.pool)
@@ -362,8 +397,139 @@ impl Store {
                 role: r.get("role"),
                 active_claims: r.get("active_claims"),
                 claim_names: r.get("claim_names"),
+                health: r.get::<Option<String>, _>("health_url").map(|url| AgentHealth {
+                    url,
+                    state: r
+                        .get::<Option<String>, _>("health_state")
+                        .as_deref()
+                        .and_then(HealthState::parse),
+                    detail: r.get("health_detail"),
+                    checked_at: r.get("health_checked_at"),
+                    since: r.get("health_since"),
+                }),
             })
             .collect())
+    }
+
+    // -----------------------------------------------------------------
+    // Agent health
+    // -----------------------------------------------------------------
+
+    /// Register — or with `None`, clear — the URL this server probes to
+    /// see whether `actor`'s machine is up. An agent may only set its
+    /// OWN: the URL is a fact about the machine the key lives on, and a
+    /// delegated identity is a subagent of that machine, not the machine,
+    /// so it is refused rather than allowed to rewrite its parent's.
+    ///
+    /// The URL goes through [`HealthPolicy::accept`] first, always; that
+    /// gate is what makes fetching an agent-supplied URL safe at all.
+    pub async fn set_health_url(&self, actor: &Actor, url: Option<&str>) -> Result<Ack> {
+        if actor.is_delegated() {
+            return Err(McpmError::new(
+                ErrorCode::Forbidden,
+                "A delegated identity cannot register a health check.",
+                json!({ "agent": actor.name, "scope": actor.scope }),
+                "The health URL belongs to the machine whose key you run under; the agent \
+                 holding that key registers it. Retry without health_url.",
+            ));
+        }
+        let accepted = match url.map(str::trim).filter(|u| !u.is_empty()) {
+            Some(raw) => Some(self.health_policy()?.accept(raw)?),
+            None => None,
+        };
+        // A changed URL resets the verdict: what was known was about the
+        // old address.
+        sqlx::query(
+            "INSERT INTO agents (name, role, health_url) VALUES ($1, 'worker', $2)
+             ON CONFLICT (name) DO UPDATE SET
+                 health_url        = EXCLUDED.health_url,
+                 health_state      = CASE WHEN agents.health_url IS NOT DISTINCT FROM EXCLUDED.health_url
+                                          THEN agents.health_state END,
+                 health_detail     = CASE WHEN agents.health_url IS NOT DISTINCT FROM EXCLUDED.health_url
+                                          THEN agents.health_detail ELSE '' END,
+                 health_checked_at = CASE WHEN agents.health_url IS NOT DISTINCT FROM EXCLUDED.health_url
+                                          THEN agents.health_checked_at END,
+                 health_since      = CASE WHEN agents.health_url IS NOT DISTINCT FROM EXCLUDED.health_url
+                                          THEN agents.health_since END",
+        )
+        .bind(&actor.name)
+        .bind(&accepted)
+        .execute(&self.pool)
+        .await?;
+        Ok(match accepted {
+            Some(url) => Ack::new(format!(
+                "Health check registered: {url}. It is probed every {}s; the roster shows \
+                 the verdict.",
+                self.health.as_ref().map(|p| p.interval.as_secs()).unwrap_or(crate::DEFAULT_INTERVAL_SECS)
+            )),
+            None => Ack::new("Health check cleared."),
+        })
+    }
+
+    /// Every agent with a URL to probe.
+    pub async fn health_targets(&self) -> Result<Vec<HealthTarget>> {
+        let rows = sqlx::query(
+            "SELECT name, health_url FROM agents WHERE health_url IS NOT NULL ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| HealthTarget { name: r.get("name"), url: r.get("health_url") })
+            .collect())
+    }
+
+    /// Write one probe's verdict. Every probe stamps `checked_at`; only
+    /// a CHANGE of state moves `since` and raises an `agent_health`
+    /// event — a box that is up stays quiet, and the ledger records the
+    /// transitions, which is what "down since 14:02" is read from and
+    /// what tells the console to refetch the roster. Returns whether the
+    /// state changed.
+    pub async fn record_health(&self, agent: &str, verdict: &HealthVerdict) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT health_url, health_state FROM agents WHERE name = $1 FOR UPDATE",
+        )
+        .bind(agent)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // Cleared or deleted between the sweep's read and now: nothing
+        // to record against.
+        let Some(row) = row else { return Ok(false) };
+        let Some(url) = row.get::<Option<String>, _>("health_url") else { return Ok(false) };
+        let before = row.get::<Option<String>, _>("health_state");
+        let changed = before.as_deref() != Some(verdict.state.as_str());
+        sqlx::query(
+            "UPDATE agents SET
+                 health_state = $2, health_detail = $3, health_checked_at = now(),
+                 health_since = CASE WHEN $4 THEN now() ELSE health_since END
+             WHERE name = $1",
+        )
+        .bind(agent)
+        .bind(verdict.state.as_str())
+        .bind(&verdict.detail)
+        .bind(changed)
+        .execute(&mut *tx)
+        .await?;
+        if changed {
+            record_event(
+                &mut tx,
+                "agent_health",
+                None,
+                None,
+                Some(agent),
+                json!({
+                    "agent": agent,
+                    "from": before,
+                    "to": verdict.state.as_str(),
+                    "detail": verdict.detail,
+                    "url": url,
+                }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
     }
 
     async fn feature_rollups(&self) -> Result<Vec<FeatureRollup>> {
@@ -4392,6 +4558,7 @@ impl Store {
         issuer: &Actor,
         agent_name: &str,
         label: Option<&str>,
+        health_url: Option<&str>,
     ) -> Result<IssuedKey> {
         if issuer.is_delegated() {
             return Err(McpmError::new(
@@ -4411,6 +4578,14 @@ impl Store {
                  that identifies the box, e.g. the branch slug it runs.",
             ));
         }
+        // Validated before anything is written, so a refused URL costs
+        // no key. The manager provisioning a box knows its hostname
+        // before the box has ever spoken, which is why this rides the
+        // key rather than waiting for the box's own get_context.
+        let health_url = match health_url.map(str::trim).filter(|u| !u.is_empty()) {
+            Some(raw) => Some(self.health_policy()?.accept(raw)?),
+            None => None,
+        };
         if let Some(existing) = sqlx::query(
             "SELECT id FROM api_keys
              WHERE agent_name = $1 AND revoked_at IS NULL AND role = 'worker'",
@@ -4447,14 +4622,22 @@ impl Store {
                  operator to revoke the keys of boxes that are gone.",
             ));
         }
-        self.insert_key(
-            &issuer.name,
-            label.unwrap_or("").trim(),
-            agent_name,
-            KeyRole::Worker,
-            "issue_worker_key",
-        )
-        .await
+        let issued = self
+            .insert_key(
+                &issuer.name,
+                label.unwrap_or("").trim(),
+                agent_name,
+                KeyRole::Worker,
+                "issue_worker_key",
+            )
+            .await?;
+        if let Some(url) = health_url {
+            // The box's row exists from here on, before it has called
+            // get_context: the roster shows it as registered and
+            // unprobed, and the first sweep says whether it is up.
+            self.set_health_url(&Actor::new(agent_name), Some(&url)).await?;
+        }
+        Ok(issued)
     }
 
     /// The insert both issuance paths share, so a key issued by an

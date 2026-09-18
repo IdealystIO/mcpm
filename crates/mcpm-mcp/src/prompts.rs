@@ -96,9 +96,10 @@ Give each worker an identity, or they do not have one — how depends on where i
 agent_name) for each and pass the token into worker_briefing as delegation_token. \
 Without it every subagent IS this machine: the ledger cannot tell them apart, they \
 can complete each other's modules, and each inherits your MANAGER authority.\n\
-   - A worker on ANOTHER box needs a key, not a token: issue_worker_key(agent_name) \
-once per box, put the token it returns in that box's environment, and reuse it \
-thereafter. A delegation token is honoured alongside exactly ONE key, so boxes \
+   - A worker on ANOTHER box needs a key, not a token: issue_worker_key(agent_name, \
+health_url) once per box, put the token it returns in that box's environment, and \
+reuse it thereafter. health_url is the box's dev server; with it the roster says \
+whether the box is UP rather than merely quiet, so give it when you know the hostname. A delegation token is honoured alongside exactly ONE key, so boxes \
 sharing a key are one identity and mutual exclusion between them does not hold. If \
 you must also scope such a box to a single module, mint_worker(..., \
 for_key_id=<that box's key_id>) binds the token to its key instead of yours.\n\

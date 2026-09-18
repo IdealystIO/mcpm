@@ -13,6 +13,7 @@
 
 mod error;
 mod files;
+mod health;
 mod ids;
 mod keys;
 mod redact;
@@ -21,6 +22,10 @@ mod types;
 
 pub use error::{McpmError, ErrorCode};
 pub use files::{FileProvider, MemoryFiles, S3Files, DEFAULT_BUCKET, S3_ENV};
+pub use health::{
+    probe, probe_client, run_prober, sweep, HealthPolicy, HealthState, HealthVerdict,
+    DEFAULT_INTERVAL_SECS, HEALTH_HOSTS_ENV, HEALTH_INTERVAL_ENV, PROBE_TIMEOUT,
+};
 pub use ids::{
     id_level, new_attachment_id, new_comment_id, new_document_id, new_id, new_want_id, normalize_tag, Level,
     PROJECT_SUBJECT,

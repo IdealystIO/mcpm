@@ -237,9 +237,23 @@ impl Feed {
 pub struct AgentRow {
     pub id: String,
     pub level: String,
+    /// Running while it holds a claim.
     pub state: Status,
     pub uptime: String,
     pub scope: String,
+    /// Whether the machine behind it is up, when a check is registered.
+    pub health: Option<AgentHealthRow>,
+}
+
+/// The server's verdict on an agent's machine, ready to draw: the tone
+/// is borrowed from [`Status`] because the dot and badge palette is
+/// keyed on it, and the line is the whole fact ("down since Sep 18
+/// 14:02 · HTTP 503").
+pub struct AgentHealthRow {
+    pub tone: Status,
+    pub label: String,
+    pub line: String,
+    pub up: bool,
 }
 
 /// One idea in the pool. `state` is derived server-side: an open want
@@ -418,8 +432,22 @@ impl Module {
     }
 }
 
+/// Agents holding a claim right now.
 pub fn active_agent_count() -> usize {
     agents().iter().filter(|a| a.state == Status::Running).count()
+}
+
+/// Agents whose machine is known to be up — or, for one with no health
+/// check registered, one that holds a claim, which is the best the
+/// ledger alone can say.
+pub fn live_agent_count() -> usize {
+    agents()
+        .iter()
+        .filter(|a| match &a.health {
+            Some(h) => h.up,
+            None => a.state == Status::Running,
+        })
+        .count()
 }
 
 // ---------------------------------------------------------------------
@@ -1235,7 +1263,31 @@ fn map_agent(a: &api::AgentDto) -> AgentRow {
         } else {
             format!("Holds: {}", a.claim_names)
         },
+        health: a.health.as_ref().map(map_health),
     }
+}
+
+fn map_health(h: &api::AgentHealthDto) -> AgentHealthRow {
+    // Neutral for the two "nothing there" answers, danger for the one
+    // that means a registered box is not serving, warning for the one
+    // that is about the path to it rather than the box.
+    let (tone, label) = match h.state.as_str() {
+        "up" => (Status::Done, "up"),
+        "down" => (Status::Violation, "down"),
+        "gone" => (Status::Queued, "gone"),
+        "unreachable" => (Status::Planning, "unreachable"),
+        _ => (Status::Queued, "checking"),
+    };
+    let mut line = if h.since.is_empty() {
+        format!("{label} \u{b7} not probed yet")
+    } else {
+        format!("{label} since {}", h.since)
+    };
+    if !h.detail.is_empty() && h.state != "up" {
+        line.push_str(" \u{b7} ");
+        line.push_str(&h.detail);
+    }
+    AgentHealthRow { tone, label: label.to_string(), line, up: h.state == "up" }
 }
 
 #[cfg(test)]

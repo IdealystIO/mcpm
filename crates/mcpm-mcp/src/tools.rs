@@ -71,7 +71,8 @@ fn tree_tools() -> Value {
                 "properties": {
                     "agent_name": { "type": "string", "description": "Your stable agent name, e.g. 'agent.feature.invoicing' or 'agent.mod.schema'." },
                     "role": { "type": "string", "enum": ["manager", "worker", "observer"], "description": "manager = owns a feature end to end; worker = owns one module." },
-                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." },
+                    "health_url": { "type": "string", "description": "Optional. The URL of YOUR machine's dev server (the one a person would open to look at your branch). The server probes it on a timer and the roster shows whether the box is up, down, gone, or unreachable — so a manager can tell a box that is thinking from one that was reclaimed. Only hosts the server is configured to probe are accepted; an empty string clears it. Not for subagents: the URL is the machine's, and the agent holding its key registers it." }
                 },
                 "required": ["agent_name", "role"]
             }
@@ -220,7 +221,8 @@ fn tree_tools() -> Value {
                 "type": "object",
                 "properties": {
                     "agent_name": { "type": "string", "description": "The name the ledger records for every write that box makes. Make it identify the box — the branch slug it runs, for instance. One live key per name." },
-                    "label": { "type": "string", "description": "Human note for --list-keys and the console. Defaults to the agent name." }
+                    "label": { "type": "string", "description": "Human note for --list-keys and the console. Defaults to the agent name." },
+                    "health_url": { "type": "string", "description": "Optional. The URL of the box's dev server, if you already know its hostname when you provision it. The server probes it on a timer and the roster shows up / down / gone / unreachable for the box from before it has ever spoken. Only hosts the server is configured to probe are accepted; a refused URL issues no key." }
                 },
                 "required": ["agent_name"]
             }

@@ -737,7 +737,7 @@ async fn a_token_can_be_bound_to_the_key_of_the_box_that_will_use_it() {
         let (feature_id, modules) = seed(&store).await;
         let laptop = manager_key(&store).await;
         let remote = store
-            .issue_worker_key(&Actor::new("laptop"), "box.branch-a", None)
+            .issue_worker_key(&Actor::new("laptop"), "box.branch-a", None, None)
             .await
             .expect("issue the box a key");
 
@@ -854,11 +854,11 @@ async fn a_manager_can_give_each_box_an_identity_of_its_own() {
         let manager = Actor::new("laptop");
 
         let a = store
-            .issue_worker_key(&manager, "box.branch-a", Some("Branch A"))
+            .issue_worker_key(&manager, "box.branch-a", Some("Branch A"), None)
             .await
             .expect("issue A");
         let b = store
-            .issue_worker_key(&manager, "box.branch-b", None)
+            .issue_worker_key(&manager, "box.branch-b", None, None)
             .await
             .expect("issue B");
 
@@ -905,25 +905,25 @@ async fn one_live_worker_key_per_agent_name() {
     with_scratch("dlgdupname", |store, _url| async move {
         let manager = Actor::new("laptop");
         let first = store
-            .issue_worker_key(&manager, "box.branch-a", None)
+            .issue_worker_key(&manager, "box.branch-a", None, None)
             .await
             .expect("issue");
 
         let err = store
-            .issue_worker_key(&manager, "box.branch-a", None)
+            .issue_worker_key(&manager, "box.branch-a", None, None)
             .await
             .expect_err("a second live key under one name is refused");
         assert_eq!(err.code, ErrorCode::PlanConflict);
         assert_eq!(err.data["key_id"], serde_json::json!(first.info.id));
 
         // Whitespace is not a second box either.
-        assert!(store.issue_worker_key(&manager, "  box.branch-a  ", None).await.is_err());
-        assert!(store.issue_worker_key(&manager, "   ", None).await.is_err());
+        assert!(store.issue_worker_key(&manager, "  box.branch-a  ", None, None).await.is_err());
+        assert!(store.issue_worker_key(&manager, "   ", None, None).await.is_err());
 
         // Rotation works, once the old key is actually withdrawn.
         store.revoke_key("operator", &first.info.id).await.expect("revoke");
         store
-            .issue_worker_key(&manager, "box.branch-a", None)
+            .issue_worker_key(&manager, "box.branch-a", None, None)
             .await
             .expect("re-issue after revocation");
     })
@@ -955,7 +955,7 @@ async fn issuing_a_key_is_the_managers_act_alone() {
         let delegated = Actor::delegated(&minted.agent_name, &minted.module_id);
 
         let err = store
-            .issue_worker_key(&delegated, "box.sneaky", None)
+            .issue_worker_key(&delegated, "box.sneaky", None, None)
             .await
             .expect_err("a delegated identity cannot create credentials");
         assert_eq!(err.code, ErrorCode::Forbidden);
