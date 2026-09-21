@@ -6,12 +6,12 @@ use std::rc::Rc;
 use idea_ui::{size, typography_kind, variant, Badge, Button, IdeaThemeRef, Spacer, Stack,
     StackAlign, StackAxis, StackGap, Typography};
 use runtime_core::{
-    component, stylesheet, ui, AlignItems, Element, FlexDirection, FlexWrap, FontWeight,
-    IdealystSchema,
+    component, memo, rx, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
+    FontWeight, IdealystSchema, Reactive,
 };
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot};
-use crate::model::{feed, features};
+use crate::model::{AgentRow, EventItem, Status};
 use crate::state::Console;
 use crate::styles::{status_tone, MonoTextSize, SectionLabel};
 
@@ -33,31 +33,50 @@ pub struct FeedViewProps {
 /// and refreshes on a tick, and the control at the bottom reads the
 /// next older page. A feed is the one part of a feature that grows
 /// without bound, so nothing here ever asks for all of it.
+///
+/// The rows are a keyed list over the feed's signal: an event that
+/// lands is one row inserted at the top, and the rows below it — and
+/// the scroll position — stay where they were. The roster is keyed
+/// the same way on agent names, and each card reads its agent live.
 #[component]
 pub fn FeedView(props: &FeedViewProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let fi = props.feature;
-    let feats = features();
-    let feature_id = feats[fi].id.clone();
-    let held = feed(&feature_id);
-    let loaded = held.is_some();
-    let event_count = held.as_ref().map(|f| f.events.len()).unwrap_or(0);
-    let has_older = held.as_ref().is_some_and(|f| !f.exhausted && !f.events.is_empty());
-    let blank = if loaded { "No events yet for this feature." } else { "Loading the ledger\u{2026}" };
-    let roster_count = crate::model::agents().len();
+    // The feature's id is fixed for the life of this view (the pane it
+    // sits in is keyed on it), but the closures below re-read it so
+    // they stay `Copy`.
+    let feature_id = data.feature(fi)().map(|f| f.id.clone()).unwrap_or_default();
+    let held = move || {
+        let feats = data.features.get();
+        let fid = &feats.get(fi)?.id;
+        data.feeds.get().get(fid).cloned()
+    };
+    let events = memo(move || held().map(|f| f.events.clone()).unwrap_or_default());
+    let blank = move || match held() {
+        Some(f) if f.events.is_empty() => Some("No events yet for this feature."),
+        None => Some("Loading the ledger\u{2026}"),
+        Some(_) => None,
+    };
+    let last_seq = move || held().and_then(|f| f.events.last().map(|e| e.seq));
+    let has_older = move || held().is_some_and(|f| !f.exhausted && !f.events.is_empty());
+    let roster = memo(move || data.agents.get().iter().map(|a| a.id.clone()).collect::<Vec<String>>());
     let older_id = feature_id.clone();
     let on_older: Rc<dyn Fn()> = Rc::new(move || console.load_older_events(&older_id));
     ui! {
         scroll_view(style = FeedScroll()) {
             view(style = FeedRow()) {
                 view(style = EventsCol()) {
-                    if event_count == 0 {
-                        Typography(content = blank, kind = typography_kind::BodySm, muted = true)
+                    match blank() {
+                        Some(word) => {
+                            Typography(content = word.to_string(), kind = typography_kind::BodySm, muted = true)
+                        }
+                        None => {}
                     }
-                    for i in 0..event_count {
-                        EventRow(feature = feature_id.clone(), index = i, last = i + 1 == event_count)
+                    for e in events, key = e.seq {
+                        EventRow(event = e.clone(), last = rx!(last_seq() == Some(e.seq)))
                     }
-                    if has_older {
+                    if has_older() {
                         view(style = OlderRow()) {
                             Button(
                                 label = "Load older",
@@ -70,8 +89,8 @@ pub fn FeedView(props: &FeedViewProps) -> Element {
                 }
                 view(style = RosterCol()) {
                     text(style = SectionLabel()) { "Agents" }
-                    for i in 0..roster_count {
-                        RosterCard(index = i)
+                    for name in roster, key = name.clone() {
+                        RosterCard(console = console, agent = name.clone())
                     }
                 }
             }
@@ -80,25 +99,26 @@ pub fn FeedView(props: &FeedViewProps) -> Element {
 }
 
 /// Props for [`EventRow`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct EventRowProps {
-    /// The feature whose feed this row is in.
-    pub feature: String,
-    /// Event index (newest first).
-    pub index: usize,
-    /// Whether this is the last row (no trailing rail).
-    pub last: bool,
+    /// The event.
+    pub event: EventItem,
+    /// Whether this is the last row (no trailing rail). Live: the
+    /// row that was last grows a rail when an older page lands under
+    /// it.
+    pub last: Reactive<bool>,
+}
+
+impl Default for EventRowProps {
+    fn default() -> Self {
+        Self { event: EventItem::default(), last: Reactive::Static(false) }
+    }
 }
 
 /// One event ledger entry.
 #[component]
 pub fn EventRow(props: &EventRowProps) -> Element {
-    let Some(held) = feed(&props.feature) else {
-        return ui! { view {} };
-    };
-    let Some(e) = held.events.get(props.index) else {
-        return ui! { view {} };
-    };
+    let e = &props.event;
     let time = e.time.to_string();
     let kind = e.kind.to_string();
     let status = e.status;
@@ -107,7 +127,7 @@ pub fn EventRow(props: &EventRowProps) -> Element {
     let has_body = !body.is_empty();
     let agent = e.agent.to_string();
     let tool = e.tool.to_string();
-    let last = props.last;
+    let last = props.last.clone();
     ui! {
         view(style = EventGrid()) {
             view(style = TimeCell()) {
@@ -115,7 +135,7 @@ pub fn EventRow(props: &EventRowProps) -> Element {
             }
             view(style = RailCell()) {
                 StatusDot(status = status)
-                if !last {
+                if !last.get() {
                     view(style = RailLine()) {}
                 }
             }
@@ -149,72 +169,114 @@ pub fn EventRow(props: &EventRowProps) -> Element {
 /// Props for [`RosterCard`].
 #[derive(Default, IdealystSchema)]
 pub struct RosterCardProps {
-    /// Roster index into [`crate::model::agents`].
-    pub index: usize,
+    /// Console state handles.
+    pub console: Console,
+    /// The agent's name.
+    pub agent: String,
 }
 
-/// One agent card in the roster column.
+/// One agent card in the roster column. Built once per name on the
+/// roster; everything on it is read live, so an announcement moves
+/// the words and the ring keeps turning.
 #[component]
 pub fn RosterCard(props: &RosterCardProps) -> Element {
-    let agents = crate::model::agents();
-    let a = &agents[props.index];
-    let id = a.id.to_string();
-    let state = a.state;
-    let scope = a.scope.clone();
-    let level = a.level.to_string();
-    let uptime = a.uptime.to_string();
+    let data = props.console.data;
+    let a = data.agent(props.agent.clone());
+    let state = {
+        let a = a.clone();
+        memo(move || a().map(|a| a.state).unwrap_or_default())
+    };
     // With a health check registered the tag answers "is the box
     // there?" — the question the roster exists for — and the claims
     // move to the lines under it. Without one, the tag is what the
     // ledger can say: running while it holds a claim.
-    let checked = a.health.is_some();
-    let dot = a.health.as_ref().map(|h| h.tone).unwrap_or(state);
-    // Spinning while it holds a claim, wrote to the ledger inside the
-    // live window, and its box — if checked — is up. A quota-parked box
-    // holds its claim and says nothing: still dot.
-    let live = state == crate::model::Status::Running
-        && crate::model::within_live_window(a.quiet_secs)
-        && a.health.as_ref().is_none_or(|h| h.up);
-    let health_label = a.health.as_ref().map(|h| h.label.clone()).unwrap_or_default();
-    let health_tone = status_tone(a.health.as_ref().map(|h| h.tone).unwrap_or(state));
-    let health_line = a.health.as_ref().map(|h| h.line.clone()).unwrap_or_default();
+    let dot = {
+        let a = a.clone();
+        memo(move || a().map(|a| a.health.as_ref().map(|h| h.tone).unwrap_or(a.state)).unwrap_or_default())
+    };
+    let live = {
+        let a = a.clone();
+        memo(move || {
+            let now = data.clock.get();
+            a().is_some_and(|a| a.live_at(now))
+        })
+    };
+    let field = |pick: fn(&AgentRow) -> String| {
+        let a = a.clone();
+        rx!(a().map(|a| pick(&a)).unwrap_or_default())
+    };
+    let id = field(|a| a.id.clone());
+    let scope = field(|a| a.scope.clone());
+    let level = field(|a| a.level.clone());
+    let uptime = field(|a| a.uptime.clone());
+    let seen = field(|a| format!("seen {}", a.last_seen));
+    let health_line = field(|a| a.health.as_ref().map(|h| h.line.clone()).unwrap_or_default());
+    let word_at = field(|a| a.last_word.as_ref().map(|w| format!("{} on {}", w.at, w.subject)).unwrap_or_default());
+    // The health tag: remade when the verdict changes, and only then.
+    let health = {
+        let a = a.clone();
+        move || a().and_then(|a| a.health.as_ref().map(|h| (h.label.clone(), h.tone)))
+    };
+    let checked = {
+        let health = health.clone();
+        move || health().is_some()
+    };
     // The last thing it said, in its own words — the pulse the roster
     // exists for once a box is known to be up.
-    let word = a.last_word.as_ref().map(|w| format!("\u{201c}{}\u{201d}", w.text));
-    let word_at = a.last_word.as_ref().map(|w| format!("{} on {}", w.at, w.subject)).unwrap_or_default();
-    let seen = format!("seen {}", a.last_seen);
+    let word = {
+        let a = a.clone();
+        move || a().and_then(|a| a.last_word.as_ref().map(|w| format!("\u{201c}{}\u{201d}", w.text)))
+    };
     // Held-but-quiet says so in words here as on the card (rule 30).
-    let quiet = (state == crate::model::Status::Running
-        && a.quiet_secs >= crate::model::LIVE_WINDOW_SECS)
-        .then(|| format!("quiet {}", crate::model::quiet_label(a.quiet_secs)));
+    let quiet = {
+        let a = a.clone();
+        move || {
+            let now = data.clock.get();
+            a().and_then(|a| a.quiet_at(now))
+        }
+    };
+    let tag = switch(
+        move || (health(), state.get()),
+        move |(health, state): &(Option<(String, Status)>, Status)| match health {
+            Some((label, tone)) => {
+                let (label, tone) = (label.clone(), status_tone(*tone));
+                ui! { Badge(label = label, tone = tone) }
+            }
+            None => {
+                let state = *state;
+                ui! { StatusBadge(status = state) }
+            }
+        },
+    );
     ui! {
         view(style = RosterBox()) {
             Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
                 StatusDot(status = dot, live = live)
                 Mono(content = id)
                 Spacer()
-                if checked {
-                    Badge(label = health_label, tone = health_tone)
-                }
-                if !checked {
-                    StatusBadge(status = state)
-                }
+                tag
             }
             Typography(content = scope, kind = typography_kind::Caption, muted = true)
-            if checked {
-                Mono(content = health_line, size = MonoTextSize::Overline)
+            if checked() {
+                Mono(content = health_line.clone(), size = MonoTextSize::Overline)
             }
-            if let Some(word) = word {
-                view(style = WordBox()) {
-                    text(style = WordText()) { word }
-                    Mono(content = word_at, size = MonoTextSize::Overline)
+            match word() {
+                Some(word) => {
+                    view(style = WordBox()) {
+                        text(style = WordText()) { word.clone() }
+                        Mono(content = word_at.clone(), size = MonoTextSize::Overline)
+                    }
                 }
+                None => {}
             }
             Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
                 Mono(content = level, size = MonoTextSize::Overline)
                 Spacer()
-                if let Some(quiet) = quiet {
-                    Mono(content = quiet, size = MonoTextSize::Overline, tone = crate::styles::MonoTextTone::Warning)
+                match quiet() {
+                    Some(quiet) => {
+                        Mono(content = quiet.clone(), size = MonoTextSize::Overline, tone = crate::styles::MonoTextTone::Warning)
+                    }
+                    None => {}
                 }
                 Mono(content = uptime, size = MonoTextSize::Overline)
                 Mono(content = seen, size = MonoTextSize::Overline)

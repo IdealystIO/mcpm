@@ -130,6 +130,14 @@ pub struct Board {
     /// questions are owed to the person reading.
     #[serde(default)]
     pub you: String,
+    /// The server's clock when this board was read, as Unix seconds.
+    /// The console keeps the offset to its own clock and measures
+    /// every `last_heard` against it, so liveness never depends on
+    /// the reader's machine agreeing with the host about the time —
+    /// and the board itself carries no clock-derived field that
+    /// would make every poll look like a change.
+    #[serde(default)]
+    pub now: i64,
 }
 
 /// An open question, wherever it sits.
@@ -208,26 +216,22 @@ pub struct FeatureRollupDto {
     /// "MMM D HH:MM" of the first and last ledger entry, or empty.
     pub started: String,
     pub last_activity: String,
-    /// Seconds since an agent HOLDING a module here last wrote to the
-    /// ledger, or -1 when nobody holds one or no holder has written.
-    /// Computed here so the console needs no clock of its own.
-    #[serde(default = "minus_one")]
-    pub quiet_secs: i64,
+    /// When an agent HOLDING a module here last wrote to the ledger,
+    /// as Unix seconds; `None` when nobody holds one or no holder has
+    /// written. A stamp and not a duration: the console measures it
+    /// against [`Board::now`], so an idle poll returns an identical
+    /// board and nothing on screen is rebuilt for it.
+    #[serde(default)]
+    pub last_heard: Option<i64>,
     /// The newest announcement anywhere in the feature.
     #[serde(default)]
     pub last_word: Option<AnnouncementDto>,
 }
 
-/// Serde default for the `quiet_secs` fields: "no reading".
-fn minus_one() -> i64 {
-    -1
-}
-
-/// Seconds between `t` and now, or -1 for `None`. Never negative: a
-/// clock skew between the database and this host reads as "just now".
+/// A stamp as Unix seconds, for the `last_heard` fields.
 #[cfg(feature = "server")]
-fn quiet_since(t: Option<chrono::DateTime<chrono::Utc>>) -> i64 {
-    t.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)).unwrap_or(-1)
+fn epoch(t: Option<chrono::DateTime<chrono::Utc>>) -> Option<i64> {
+    t.map(|t| t.timestamp())
 }
 
 /// The latest thing an agent said it was doing, on a module, a
@@ -322,13 +326,14 @@ pub struct ModuleDto {
     pub block_body: String,
     /// "MMM D HH:MM" of its first claim, or empty.
     pub spawned: String,
-    /// Seconds since the agent holding this module last wrote to the
-    /// ledger (on anything), or -1 when nobody holds it or the holder
-    /// has never written. A running module with a small number here is
-    /// MOVING; one with a large number is held by a box that has gone
-    /// quiet, which is the failure this exists to make visible.
-    #[serde(default = "minus_one")]
-    pub quiet_secs: i64,
+    /// When the agent holding this module last wrote to the ledger
+    /// (on anything), as Unix seconds; `None` when nobody holds it or
+    /// the holder has never written. A running module heard from a
+    /// moment ago is MOVING; one silent for an hour is held by a box
+    /// that has gone quiet, which is the failure this exists to make
+    /// visible.
+    #[serde(default)]
+    pub last_heard: Option<i64>,
     /// Open questions on this module.
     #[serde(default)]
     pub open_questions: Vec<QuestionDto>,
@@ -640,9 +645,10 @@ pub struct AgentDto {
     /// "MMM D HH:MM" it last registered or announced.
     #[serde(default)]
     pub last_seen: String,
-    /// Seconds since its newest ledger write, or -1 if it never wrote.
-    #[serde(default = "minus_one")]
-    pub quiet_secs: i64,
+    /// Its newest ledger write, as Unix seconds; `None` if it never
+    /// wrote.
+    #[serde(default)]
+    pub last_heard: Option<i64>,
     /// The newest thing it announced.
     #[serde(default)]
     pub last_word: Option<AnnouncementDto>,
@@ -912,7 +918,7 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
             tasks_added: r.tasks_added,
             started: stamp(r.started),
             last_activity: stamp(r.last_activity),
-            quiet_secs: quiet_since(r.last_heard),
+            last_heard: epoch(r.last_heard),
             last_word: r.last_word.as_ref().map(announcement_dto),
         })
         .collect();
@@ -950,7 +956,7 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
                 checked: stamp(h.checked_at),
             }),
             last_seen: stamp(Some(a.last_seen)),
-            quiet_secs: quiet_since(a.last_activity),
+            last_heard: epoch(a.last_activity),
             last_word: a.last_word.as_ref().map(announcement_dto),
         })
         .collect();
@@ -988,6 +994,7 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
         },
         questions,
         you: caller.name.clone(),
+        now: chrono::Utc::now().timestamp(),
     })
 }
 
@@ -1059,7 +1066,7 @@ pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerErr
                     .and_then(|x| x.first_claim)
                     .map(|t| t.format("%b %-d %H:%M").to_string())
                     .unwrap_or_default(),
-                quiet_secs: quiet_since(marks.and_then(|x| x.last_activity)),
+                last_heard: epoch(marks.and_then(|x| x.last_activity)),
                 rejected,
                 block_title,
                 block_body,

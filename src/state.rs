@@ -150,9 +150,13 @@ pub struct Console {
     pub last_want: Signal<Option<String>>,
     /// Dark-mode flag; drives `install_idea_theme_reactive` in `app()`.
     pub dark: Signal<bool>,
-    /// Data revision: bumped whenever a read lands that changed the
-    /// model, so every view keyed on it re-reads [`crate::model`].
-    pub rev: Signal<u64>,
+    /// What the screen draws, as signals — see [`crate::model::Data`].
+    pub data: crate::model::Data,
+    /// Knowledge revision: bumped when a memory is committed or
+    /// superseded anywhere, and on the fallback poll. The knowledge
+    /// screen's search is a server query with no cache here, so this
+    /// is what tells it to run again.
+    pub know_rev: Signal<u64>,
     /// The feed's "load older" request: the feature id whose next
     /// older page the reader asked for. The sync loop fetches it and
     /// clears this.
@@ -341,7 +345,8 @@ pub fn use_console() -> Console {
         last_module: signal(None),
         last_want: signal(None),
         dark: signal(false),
-        rev: signal(0),
+        data: crate::model::Data::new(),
+        know_rev: signal(0),
         feed_older: signal(None),
         connected: signal(false),
         pool_query: signal(String::new()),

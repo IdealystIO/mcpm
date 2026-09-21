@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use idea_ui::{typography_kind, Badge, Spacer, Tooltip, Typography};
 use runtime_core::animation::{AnimProp, AnimatedValue, LoopFactory, Repeat, SequenceFactory, TweenTo};
-use runtime_core::{after_animation_frame, component, on_scope_drop, pressable, ui, Element,
-    GluePressable, IdealystSchema, IntoElement, Ref, StyleApplication, ViewHandle};
+use runtime_core::{after_animation_frame, component, on_scope_drop, pressable, switch, ui, VariantEnum,
+    Element, GluePressable, IdealystSchema, IntoElement, Reactive, Ref, StyleApplication,
+    ViewHandle};
 
 use crate::model::Status;
 use crate::styles::{
-    live_ring_style, status_dot, status_tone, Dot, MonoText, MonoTextSize, MonoTextTone, Tick,
+    live_ring_style, status_dot, status_tone, MonoText, MonoTextSize, MonoTextTone, Tick,
     TickState,
 };
 
@@ -37,28 +38,53 @@ pub fn tappable(children: Vec<Element>, on_press: impl Fn() + 'static) -> GluePr
 }
 
 /// Props for [`StatusDot`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct StatusDotProps {
-    /// Status whose semantic color the dot takes.
-    pub status: Status,
+    /// Status whose semantic color the dot takes. Live: the dot
+    /// recolours in place when it changes.
+    pub status: Reactive<Status>,
     /// Something is happening here RIGHT NOW — an agent holds it and
     /// has written to the ledger recently. The dot becomes a spinning
     /// ring in the same ink. Liveness is recent activity, never a
     /// status: a claimed module whose box has gone quiet is exactly
     /// the case the still dot exists to show (UX_GUIDELINES rule 30).
-    pub live: bool,
+    ///
+    /// Live too, and that is the point: the ring is mounted when this
+    /// turns true and dropped when it turns false, and nothing else
+    /// about the row has to be rebuilt for either. A ring that is
+    /// spinning keeps spinning through every poll.
+    pub live: Reactive<bool>,
+}
+
+impl Default for StatusDotProps {
+    fn default() -> Self {
+        Self { status: Reactive::Static(Status::default()), live: Reactive::Static(false) }
+    }
 }
 
 /// A small round indicator colored by status — spinning while live.
 #[component]
 pub fn StatusDot(props: &StatusDotProps) -> Element {
-    if props.live {
-        return live_ring();
-    }
-    let style = Dot().tone(status_dot(props.status));
-    ui! {
-        view(style = style) {}
-    }
+    let status = props.status.clone();
+    let live = props.live.clone();
+    switch(
+        move || live.get(),
+        move |&on: &bool| {
+            if on {
+                return live_ring();
+            }
+            let status = status.clone();
+            // The colour is a closure so a status change recolours
+            // this node rather than replacing it.
+            // idealyst-lint-disable-next-line prefer-ui-macro
+            runtime_core::view(Vec::new())
+                .with_style(move || {
+                    StyleApplication::new(crate::styles::dot_style())
+                        .with("tone", status_dot(status.get()).as_variant_str().to_string())
+                })
+                .into_element()
+        },
+    )
 }
 
 /// The spinning arc that replaces the dot while something is live.
@@ -109,39 +135,55 @@ fn live_ring() -> Element {
 }
 
 /// Props for [`StatusBadge`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct StatusBadgeProps {
-    /// Status rendered as a soft idea-ui badge.
-    pub status: Status,
+    /// Status rendered as a soft idea-ui badge. Live: the pill is
+    /// remade when the status changes and only then.
+    pub status: Reactive<Status>,
+}
+
+impl Default for StatusBadgeProps {
+    fn default() -> Self {
+        Self { status: Reactive::Static(Status::default()) }
+    }
 }
 
 /// The status pill: idea-ui `Badge` with the console's tone mapping.
 #[component]
 pub fn StatusBadge(props: &StatusBadgeProps) -> Element {
-    let label = props.status.label();
-    let tone = status_tone(props.status);
-    ui! {
-        Badge(label = label, tone = tone)
-    }
+    let status = props.status.clone();
+    // `Badge`'s tone is a build-time prop, so a status change remakes
+    // the pill — a node with no state and no motion, which is fine.
+    switch(
+        move || status.get(),
+        move |&status: &Status| {
+            let label = status.label();
+            let tone = status_tone(status);
+            ui! {
+                Badge(label = label, tone = tone)
+            }
+        },
+    )
 }
 
 /// Props for [`Mono`].
 #[derive(IdealystSchema)]
 pub struct MonoProps {
-    /// The text to render in the console's monospace stack.
-    pub content: String,
+    /// The text to render in the console's monospace stack. Live:
+    /// pass `rx!(…)` and the text updates in place.
+    pub content: Reactive<String>,
     /// Type size arm of the [`MonoText`] sheet.
     pub size: MonoTextSize,
-    /// Color arm of the [`MonoText`] sheet.
-    pub tone: MonoTextTone,
+    /// Color arm of the [`MonoText`] sheet. Live: the node restyles.
+    pub tone: Reactive<MonoTextTone>,
 }
 
 impl Default for MonoProps {
     fn default() -> Self {
         Self {
-            content: String::new(),
+            content: Reactive::Static(String::new()),
             size: MonoTextSize::Caption,
-            tone: MonoTextTone::Muted,
+            tone: Reactive::Static(MonoTextTone::Muted),
         }
     }
 }
@@ -150,30 +192,55 @@ impl Default for MonoProps {
 #[component]
 pub fn Mono(props: &MonoProps) -> Element {
     let content = props.content.clone();
-    let style = MonoText().size(props.size).tone(props.tone);
+    let size = props.size;
+    let tone = props.tone.clone();
+    if tone.is_static() {
+        let style = MonoText().size(size).tone(tone.get());
+        return ui! {
+            text(style = style) { move || content.get() }
+        };
+    }
+    let style = move || {
+        StyleApplication::new(crate::styles::mono_text_style())
+            .with("size", size.as_variant_str().to_string())
+            .with("tone", tone.get().as_variant_str().to_string())
+    };
     ui! {
-        text(style = style) { content }
+        text(style = style) { move || content.get() }
     }
 }
 
 /// Props for [`Ticks`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct TicksProps {
-    /// One entry per task; `true` = done.
-    pub ticks: Vec<bool>,
+    /// One entry per task; `true` = done. Live: the strip is remade
+    /// when a tick flips, and only then.
+    pub ticks: Reactive<Vec<bool>>,
+}
+
+impl Default for TicksProps {
+    fn default() -> Self {
+        Self { ticks: Reactive::Static(Vec::new()) }
+    }
 }
 
 /// The per-task progress strip on a module card.
 #[component]
 pub fn Ticks(props: &TicksProps) -> Element {
     let ticks = props.ticks.clone();
-    ui! {
-        view(style = TickRow()) {
-            for done in ticks {
-                view(style = Tick().state(if done { TickState::On } else { TickState::Off })) {}
+    switch(
+        move || ticks.get(),
+        move |ticks: &Vec<bool>| {
+            let ticks = ticks.clone();
+            ui! {
+                view(style = TickRow()) {
+                    for done in ticks {
+                        view(style = Tick().state(if done { TickState::On } else { TickState::Off })) {}
+                    }
+                }
             }
-        }
-    }
+        },
+    )
 }
 
 runtime_core::stylesheet! {

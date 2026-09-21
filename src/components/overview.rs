@@ -11,15 +11,13 @@
 
 use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, ProgressCap, Typography};
 use runtime_core::{
-    component, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FontWeight,
-    IdealystSchema, IntoElement, StyleApplication,
+    component, memo, rx, stylesheet, switch, ui, AlignItems, Element, FlexDirection,
+    FontWeight, IdealystSchema, IntoElement, StyleApplication,
 };
+use std::rc::Rc;
 
 use crate::components::bits::{Mono, StatusDot, tappable};
-use crate::model::{
-    active_agent_count, attention, features, in_play, project_name, recent, want_counts,
-    AttentionTarget,
-};
+use crate::model::{active_agent_count, in_play_of, Attention, AttentionTarget, EventItem};
 use crate::state::Console;
 use crate::styles::{status_tone, MonoTextSize, MonoTextTone, SectionLabel};
 
@@ -31,28 +29,102 @@ pub struct OverviewViewProps {
 }
 
 /// The project home screen.
+///
+/// Built once. The head reads its counts live; each of the three
+/// cards is remade only when its own list changes shape — the
+/// attention rows when something new is stuck or clears, the play
+/// rows when a feature enters or leaves play, the activity rows when
+/// an event lands — and a play row reads its feature live after that,
+/// so a poll moves a percentage and a ring without touching a node.
 #[component]
 pub fn OverviewView(props: &OverviewViewProps) -> Element {
     let console = props.console;
-    switch(
-        move || console.rev.get(),
-        move |_: &u64| overview_body(console),
-    )
-}
+    let data = console.data;
+    let name = rx!(data.project.get());
+    let meta = rx!(format!(
+        "{} features in play \u{b7} {} agents working \u{b7} {} loose ideas",
+        in_play_of(&data.features.get()).len(),
+        active_agent_count(&data.agents.get()),
+        data.want_counts.get().0,
+    ));
+    let attention_count = rx!(format!("{}", data.attention.get().len()));
 
-fn overview_body(console: Console) -> Element {
-    let name = project_name();
-    let playing = in_play();
-    let (loose, _, _) = want_counts();
-    let meta = format!(
-        "{} features in play \u{b7} {} agents working \u{b7} {loose} loose ideas",
-        playing.len(),
-        active_agent_count(),
+    let attention_card = switch(
+        move || data.attention.get(),
+        move |rows: &Rc<Vec<Attention>>| {
+            let rows = rows.clone();
+            let attention_count = rows.len();
+            ui! {
+                view(style = SurfaceCard()) {
+                    for i in 0..attention_count {
+                        AttentionRow(console = console, row = rows[i].clone(), first = i == 0)
+                    }
+                    if attention_count == 0 {
+                        view(style = BlankRow()) {
+                            Typography(
+                                content = "Nothing is waiting on you.",
+                                kind = typography_kind::BodySm,
+                                muted = true,
+                            )
+                        }
+                    }
+                }
+            }
+        },
     );
-    let attention_rows = attention();
-    let attention_count = attention_rows.len();
-    let play_count = playing.len();
-    let event_count = recent().len().min(6);
+
+    let play_card = switch(
+        move || in_play_of(&data.features.get()),
+        move |playing: &Vec<usize>| {
+            let playing = playing.clone();
+            let play_count = playing.len();
+            ui! {
+                view(style = SurfaceCard()) {
+                    for i in 0..play_count {
+                        PlayRow(
+                            console = console,
+                            feature = playing[i],
+                            first = i == 0,
+                        )
+                    }
+                    if play_count == 0 {
+                        view(style = BlankRow()) {
+                            Typography(
+                                content = "No features in play.",
+                                kind = typography_kind::BodySm,
+                                muted = true,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    );
+
+    let activity_card = switch(
+        move || data.recent.get(),
+        move |events: &Rc<Vec<EventItem>>| {
+            let events = events.clone();
+            let event_count = events.len().min(6);
+            ui! {
+                view(style = SurfaceCard()) {
+                    view(style = FeedPad()) {
+                        for i in 0..event_count {
+                            ActivityRow(event = events[i].clone(), last = i + 1 == event_count)
+                        }
+                        if event_count == 0 {
+                            Typography(
+                                content = "No events yet.",
+                                kind = typography_kind::BodySm,
+                                muted = true,
+                            )
+                        }
+                        LedgerLink(console = console)
+                    }
+                }
+            }
+        },
+    );
 
     ui! {
         view(style = OverviewBox()) {
@@ -70,65 +142,18 @@ fn overview_body(console: Console) -> Element {
                     view(style = Section()) {
                         view(style = SectionHead()) {
                             text(style = SectionLabel()) { "Needs attention" }
-                            Mono(
-                                content = format!("{attention_count}"),
-                                size = MonoTextSize::Overline,
-                            )
+                            Mono(content = attention_count, size = MonoTextSize::Overline)
                         }
-                        view(style = SurfaceCard()) {
-                            for i in 0..attention_count {
-                                AttentionRow(console = console, index = i, first = i == 0)
-                            }
-                            if attention_count == 0 {
-                                view(style = BlankRow()) {
-                                    Typography(
-                                        content = "Nothing is waiting on you.",
-                                        kind = typography_kind::BodySm,
-                                        muted = true,
-                                    )
-                                }
-                            }
-                        }
+                        attention_card
                     }
                     view(style = SplitRow()) {
                         view(style = SplitWide()) {
                             text(style = SectionLabel()) { "Work in play" }
-                            view(style = SurfaceCard()) {
-                                for i in 0..play_count {
-                                    PlayRow(
-                                        console = console,
-                                        feature = playing[i],
-                                        first = i == 0,
-                                    )
-                                }
-                                if play_count == 0 {
-                                    view(style = BlankRow()) {
-                                        Typography(
-                                            content = "No features in play.",
-                                            kind = typography_kind::BodySm,
-                                            muted = true,
-                                        )
-                                    }
-                                }
-                            }
+                            play_card
                         }
                         view(style = SplitNarrow()) {
                             text(style = SectionLabel()) { "Latest activity" }
-                            view(style = SurfaceCard()) {
-                                view(style = FeedPad()) {
-                                    for i in 0..event_count {
-                                        ActivityRow(index = i, last = i + 1 == event_count)
-                                    }
-                                    if event_count == 0 {
-                                        Typography(
-                                            content = "No events yet.",
-                                            kind = typography_kind::BodySm,
-                                            muted = true,
-                                        )
-                                    }
-                                    LedgerLink(console = console)
-                                }
-                            }
+                            activity_card
                         }
                     }
                 }
@@ -142,8 +167,8 @@ fn overview_body(console: Console) -> Element {
 pub struct AttentionRowProps {
     /// Console state handles.
     pub console: Console,
-    /// Index into [`attention`].
-    pub index: usize,
+    /// The row.
+    pub row: Attention,
     /// Whether this is the first row (no divider above it).
     pub first: bool,
 }
@@ -152,10 +177,7 @@ pub struct AttentionRowProps {
 #[component]
 pub fn AttentionRow(props: &AttentionRowProps) -> Element {
     let console = props.console;
-    let rows = attention();
-    let Some(row) = rows.get(props.index) else {
-        return ui! { view {} };
-    };
+    let row = &props.row;
     let kind = row.kind;
     let status = row.status;
     let title = row.title.clone();
@@ -205,24 +227,30 @@ pub struct PlayRowProps {
 #[component]
 pub fn PlayRow(props: &PlayRowProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let index = props.feature;
-    let feats = features();
-    let Some(f) = feats.get(index) else {
-        return ui! { view {} };
-    };
-    let name = f.name.clone();
-    let status = f.status;
-    let live = f.live();
-    let fraction = f.fraction();
-    let pct = f.pct_label();
-    let (mods_done, mods_total) = f.module_count();
-    let meta = format!(
-        "{mods_done}/{mods_total} modules \u{b7} {} ready \u{b7} {}",
-        f.ready_count(),
-        f.agent,
-    );
+    let f = data.feature(index);
+    let status = memo(move || f().map(|f| f.status).unwrap_or_default());
+    let live = memo(move || {
+        let now = data.clock.get();
+        f().is_some_and(|f| f.live_at(now))
+    });
+    let name = rx!(f().map(|f| f.name.clone()).unwrap_or_default());
+    let fraction = rx!(f().map(|f| f.fraction()).unwrap_or(0.0));
+    let tone = rx!(status_tone(status.get()));
+    let pct = rx!(f().map(|f| f.pct_label()).unwrap_or_default());
+    let meta = rx!(f()
+        .map(|f| {
+            let (mods_done, mods_total) = f.module_count();
+            format!(
+                "{mods_done}/{mods_total} modules \u{b7} {} ready \u{b7} {}",
+                f.ready_count(),
+                f.agent,
+            )
+        })
+        .unwrap_or_default());
     let first = if props.first { "yes" } else { "no" };
-    let word = f.last_word.as_ref().map(|w| w.line());
+    let word = move || f().and_then(|f| f.last_word.as_ref().map(|w| w.line()));
 
     let inner: Element = ui! {
         view(style = RowInner()) {
@@ -234,15 +262,18 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
                     }
                 }
                 Typography(content = meta, kind = typography_kind::Caption, muted = true)
-                if let Some(word) = word {
-                    Typography(content = word, kind = typography_kind::Caption)
+                match word() {
+                    Some(word) => {
+                        Typography(content = word.clone(), kind = typography_kind::Caption)
+                    }
+                    None => {}
                 }
             }
             view(style = ProgressSlot()) {
                 Mono(content = pct, size = MonoTextSize::Overline)
                 Progress(
                     value = fraction,
-                    tone = status_tone(status),
+                    tone = tone,
                     cap = ProgressCap::Rounded,
                 )
             }
@@ -257,8 +288,8 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
 /// Props for [`ActivityRow`].
 #[derive(Default, IdealystSchema)]
 pub struct ActivityRowProps {
-    /// Index into [`recent`], newest first.
-    pub index: usize,
+    /// The event.
+    pub event: EventItem,
     /// Whether this is the last row — its connector stops here.
     pub last: bool,
 }
@@ -266,10 +297,7 @@ pub struct ActivityRowProps {
 /// One line of the project-wide ledger.
 #[component]
 pub fn ActivityRow(props: &ActivityRowProps) -> Element {
-    let events = recent();
-    let Some(event) = events.get(props.index) else {
-        return ui! { view {} };
-    };
+    let event = &props.event;
     let time = event.time.clone();
     let title = event.title.clone();
     let agent = event.agent.clone();
@@ -308,12 +336,11 @@ pub struct LedgerLinkProps {
 #[component]
 pub fn LedgerLink(props: &LedgerLinkProps) -> Element {
     let console = props.console;
-    let target = in_play().first().copied();
     let inner: Element = ui! {
         text(style = LinkText()) { "Open the full ledger \u{2192}" }
     };
     tappable(vec![inner], move || {
-        if let Some(fi) = target {
+        if let Some(fi) = in_play_of(&console.data.features.get()).first().copied() {
             console.select_feature(fi);
             console.view.set("feed".to_string());
         }

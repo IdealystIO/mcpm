@@ -10,7 +10,7 @@
 use idea_ui::{tone, typography_kind, variant, Badge, Grid, IdeaThemeRef, Spacer, Stack,
     StackAlign, StackAxis, StackGap, Tag, Typography};
 use runtime_core::{
-    component, stylesheet, ui, AlignItems, Cursor, Easing, Element,
+    component, memo, rx, stylesheet, switch, ui, AlignItems, Cursor, Easing, Element,
     FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, Position,
     PresenceAnim, PresenceState, StyleApplication,
 };
@@ -20,7 +20,7 @@ use crate::components::discussion::Discussion;
 use crate::components::bits::{Mono, StatusBadge, StatusDot, tappable};
 use crate::components::document::DocumentView;
 use crate::components::edits::{module_entries, want_entries, ActionMenu};
-use crate::model::{features, module_detail, want_by_id};
+use crate::model::{features, want_by_id};
 use crate::state::{Console, Edit};
 use crate::styles::{MonoTextSize, MonoTextTone, SectionLabel};
 
@@ -72,83 +72,183 @@ pub struct ModulePanelProps {
 /// `presence` rebuilds its child through an `Fn` closure, which can
 /// only capture `Copy` values — so the panel's markup has to live
 /// behind props rather than in captured locals.
+///
+/// Built once per module. The header reads the module live; each
+/// list below — prerequisites, tasks, history — is remade when its
+/// own rows change and left alone otherwise, inside the one scroller,
+/// so a task ticked on a box moves one row and not the reader.
 #[component]
 pub fn ModulePanel(props: &ModulePanelProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let (fi, mi) = (props.feature, props.module);
-    let feats = features();
-    let f = &feats[fi];
-    let m = &f.modules[mi];
-    let feature_id = f.id.clone();
-    let module_id = m.id.clone();
+    let f = data.feature(fi);
+    let m = data.module(fi, mi);
+    // Both ids are fixed for the life of this panel: the host keys it
+    // on the module.
+    let feature_id = f().map(|f| f.id.clone()).unwrap_or_default();
+    let module_id = m().map(|m| m.id.clone()).unwrap_or_default();
     let entries = module_entries(&feature_id, &module_id);
+    let dependent_id = module_id.clone();
+    let tasks_feature_id = feature_id.clone();
+    let menu_id = format!("module:{module_id}");
+    let discussion_id = module_id.clone();
 
-    let path = format!("{}  \u{25b8}  Module", f.name);
-    let name = m.name.clone();
-    let status = m.status;
-    let live = m.live();
-    let agent = match m.quiet_for() {
-        Some(quiet) => format!("{} \u{b7} quiet {quiet}", m.agent),
-        None => m.agent.to_string(),
-    };
-    let description = m.description.trim().to_string();
-    let has_description = !description.is_empty();
-    let done = m.tasks.iter().filter(|t| t.done).count();
-    let total = m.tasks.len();
-    let added = m.tasks.iter().filter(|t| t.added).count();
-    let column = format!("column {}", m.depth);
-    let spawned = if m.spawned.is_empty() { "not spawned".to_string() } else { m.spawned.to_string() };
-    let task_label = format!("{done} of {total} checked off");
-    let block = m.block.clone();
-    // Each prerequisite by its index, so its row opens the same drawer
-    // onto it; `waiting` marks the ones still holding this module back.
-    let prereqs: Vec<(usize, bool)> = m
-        .depends_on
-        .iter()
-        .filter_map(|id| f.module_index(id))
-        .map(|i| (i, m.waiting_on.iter().any(|w| *w == f.modules[i].id)))
-        .collect();
-    let has_prereqs = !prereqs.is_empty();
-    let owns: Vec<String> = m.owns.clone();
-    let has_owns = !owns.is_empty();
-    let tasks: Vec<(String, String, bool, bool)> = m
-        .tasks
-        .iter()
-        .map(|t| (t.id.clone(), t.label.to_string(), t.done, t.added))
-        .collect();
-    let summary = m.summary.clone().unwrap_or_default();
-    let has_summary = !summary.is_empty();
-    let word = m.last_word.as_ref().map(|w| w.line());
+    let path = rx!(f().map(|f| format!("{}  \u{25b8}  Module", f.name)).unwrap_or_default());
+    let name = rx!(m().map(|m| m.name.clone()).unwrap_or_default());
+    let status = memo(move || m().map(|m| m.status).unwrap_or_default());
+    let live = memo(move || {
+        let now = data.clock.get();
+        m().is_some_and(|m| m.live_at(now))
+    });
+    let agent = rx!({
+        let now = data.clock.get();
+        m().map(|m| m.agent_line_at(now).0).unwrap_or_default()
+    });
+    let description = move || m().map(|m| m.description.trim().to_string()).unwrap_or_default();
+    let done = move || m().map(|m| m.tasks.iter().filter(|t| t.done).count()).unwrap_or(0);
+    let total = move || m().map(|m| m.tasks.len()).unwrap_or(0);
+    let added = rx!(format!("{}", m().map(|m| m.tasks.iter().filter(|t| t.added).count()).unwrap_or(0)));
+    let column = rx!(m().map(|m| format!("column {}", m.depth)).unwrap_or_default());
+    let spawned = rx!(m()
+        .map(|m| if m.spawned.is_empty() { "not spawned".to_string() } else { m.spawned.clone() })
+        .unwrap_or_default());
+    let tasks_done = rx!(format!("{} / {}", done(), total()));
+    let task_label = rx!(format!("{} of {} checked off", done(), total()));
+    let block = move || m().and_then(|m| m.block.clone());
+    let summary = move || m().and_then(|m| m.summary.clone()).unwrap_or_default();
+    let word = move || m().and_then(|m| m.last_word.as_ref().map(|w| w.line()));
     // The handoff and history are their own read, fetched when the
     // drawer opens; until it lands both sections say so rather than
     // claiming there is nothing.
-    let detail = module_detail(&m.id);
-    let detail_loaded = detail.is_some();
-    let (handoff_present, handoff_body, handoff_meta) =
-        match detail.as_ref().and_then(|d| d.handoff.as_ref()) {
-            Some(d) => (true, d.body.clone(), d.meta()),
-            None => (false, String::new(), String::new()),
-        };
-    let handoff_empty = if detail_loaded { "No handoff written." } else { "Loading\u{2026}" };
-    let history: Vec<(String, String, String, String, bool)> = detail
-        .as_ref()
-        .map(|d| {
-            d.history
-                .iter()
-                .map(|h| {
-                    (
-                        h.title.to_string(),
-                        h.body.to_string(),
-                        h.at.to_string(),
-                        h.from.to_string(),
-                        h.from == "server.gate",
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let has_history = !history.is_empty();
-    let discussion_id = module_id.clone();
+    let detail = {
+        let module_id = module_id.clone();
+        move || data.modules.get().get(&module_id).cloned()
+    };
+
+    // Each prerequisite by its index, so its row opens the same drawer
+    // onto it; `waiting` marks the ones still holding this module back.
+    let prereqs = switch(
+        move || {
+            match (f(), m()) {
+                (Some(f), Some(m)) => m
+                    .depends_on
+                    .iter()
+                    .filter_map(|id| f.module_index(id))
+                    .map(|i| (i, m.waiting_on.iter().any(|w| *w == f.modules[i].id)))
+                    .collect::<Vec<(usize, bool)>>(),
+                _ => Vec::new(),
+            }
+        },
+        move |prereqs: &Vec<(usize, bool)>| {
+            let prereqs = prereqs.clone();
+            let has_prereqs = !prereqs.is_empty();
+            let dependent = dependent_id.clone();
+            ui! {
+                view(style = SectionCol()) {
+                    text(style = SectionLabel()) { "Prerequisites" }
+                    if !has_prereqs {
+                        Typography(content = "None.", kind = typography_kind::BodySm, muted = true)
+                    }
+                    for (index, waiting) in prereqs {
+                        PrereqRow(
+                            console = console,
+                            feature = fi,
+                            module = index,
+                            waiting = waiting,
+                            dependent = dependent.clone(),
+                        )
+                    }
+                }
+            }
+        },
+    );
+
+    let owns = switch(
+        move || m().map(|m| m.owns.clone()).unwrap_or_default(),
+        move |owns: &Vec<String>| {
+            let owns = owns.clone();
+            let has_owns = !owns.is_empty();
+            ui! {
+                if has_owns {
+                    view(style = SectionCol()) {
+                        text(style = SectionLabel()) { "Owns" }
+                        for path in owns {
+                            Mono(content = path, tone = MonoTextTone::Text)
+                        }
+                    }
+                }
+            }
+        },
+    );
+
+    let tasks = switch(
+        move || m().map(|m| m.tasks.clone()).unwrap_or_default(),
+        move |tasks: &Vec<crate::model::Task>| {
+            let tasks = tasks.clone();
+            let feature_id = tasks_feature_id.clone();
+            ui! {
+                view(style = SectionCol()) {
+                    for t in tasks {
+                        TaskRow(
+                            console = console,
+                            feature = feature_id.clone(),
+                            task = t.id.clone(),
+                            label = t.label.clone(),
+                            done = t.done,
+                            added = t.added,
+                        )
+                    }
+                }
+            }
+        },
+    );
+
+    let handoff_detail = detail.clone();
+    let handoff = switch(
+        move || handoff_detail().map(|d| d.handoff.clone()),
+        move |held: &Option<Option<crate::model::Document>>| {
+            let detail_loaded = held.is_some();
+            let (handoff_present, handoff_body, handoff_meta) = match held.as_ref().and_then(|d| d.as_ref()) {
+                Some(d) => (true, d.body.clone(), d.meta()),
+                None => (false, String::new(), String::new()),
+            };
+            let handoff_empty = if detail_loaded { "No handoff written." } else { "Loading\u{2026}" };
+            ui! {
+                DocumentView(
+                    console = console,
+                    present = handoff_present,
+                    body = handoff_body,
+                    meta = handoff_meta,
+                    empty = handoff_empty,
+                )
+            }
+        },
+    );
+
+    let history = switch(
+        move || detail().map(|d| d.history.clone()).unwrap_or_default(),
+        move |history: &Vec<crate::model::ModuleEvent>| {
+            let history = history.clone();
+            let has_history = !history.is_empty();
+            ui! {
+                if has_history {
+                    view(style = SectionCol()) {
+                        text(style = SectionLabel()) { "History" }
+                        for h in history {
+                            HistoryRow(
+                                title = h.title.clone(),
+                                body = h.body.clone(),
+                                at = h.at.clone(),
+                                from = h.from.clone(),
+                                gate = h.from == "server.gate",
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    );
 
     let close = tappable(
         vec![ui! { text(style = CloseGlyph()) { "\u{d7}" } }],
@@ -176,58 +276,42 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                                 }
                             }
                             Spacer()
-                            ActionMenu(console = console, id = format!("module:{module_id}"), entries = entries.clone())
+                            ActionMenu(console = console, id = menu_id.clone(), entries = entries.clone())
                             close
                         }
 
-                        if has_description {
-                            Typography(content = description, kind = typography_kind::BodySm, muted = true)
+                        if !description().is_empty() {
+                            Typography(content = rx!(description()), kind = typography_kind::BodySm, muted = true)
                         }
 
-                        if let Some(word) = word {
-                            view(style = WordBox()) {
-                                text(style = WordText()) { word }
+                        match word() {
+                            Some(word) => {
+                                view(style = WordBox()) {
+                                    text(style = WordText()) { word.clone() }
+                                }
                             }
+                            None => {}
                         }
 
                         Grid(columns = 2u32, gap = StackGap::Xs) {
                             StatCell(label = "depth", value = column)
                             StatCell(label = "spawned", value = spawned)
-                            StatCell(label = "tasks done", value = format!("{done} / {total}"))
-                            StatCell(label = "ad hoc", value = format!("{added}"))
+                            StatCell(label = "tasks done", value = tasks_done)
+                            StatCell(label = "ad hoc", value = added)
                         }
 
-                        if let Some((title, body)) = block {
-                            view(style = BlockBox()) {
-                                text(style = BlockTitle()) { title }
-                                text(style = BlockBody()) { body }
-                            }
-                        }
-
-                        view(style = SectionCol()) {
-                            text(style = SectionLabel()) { "Prerequisites" }
-                            if !has_prereqs {
-                                Typography(content = "None.", kind = typography_kind::BodySm, muted = true)
-                            }
-                            for (index, waiting) in prereqs {
-                                PrereqRow(
-                                    console = console,
-                                    feature = fi,
-                                    module = index,
-                                    waiting = waiting,
-                                    dependent = module_id.clone(),
-                                )
-                            }
-                        }
-
-                        if has_owns {
-                            view(style = SectionCol()) {
-                                text(style = SectionLabel()) { "Owns" }
-                                for path in owns {
-                                    Mono(content = path, tone = MonoTextTone::Text)
+                        match block() {
+                            Some((title, body)) => {
+                                view(style = BlockBox()) {
+                                    text(style = BlockTitle()) { title.clone() }
+                                    text(style = BlockBody()) { body.clone() }
                                 }
                             }
+                            None => {}
                         }
+
+                        prereqs
+                        owns
 
                         view(style = SectionCol()) {
                             Stack(axis = StackAxis::Row, align = StackAlign::Center) {
@@ -235,46 +319,24 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                                 Spacer()
                                 Typography(content = task_label, kind = typography_kind::Caption, muted = true)
                             }
-                            for (task_id, label, task_done, task_added) in tasks {
-                                TaskRow(
-                                    console = console,
-                                    feature = feature_id.clone(),
-                                    task = task_id,
-                                    label = label,
-                                    done = task_done,
-                                    added = task_added,
-                                )
-                            }
+                            tasks
                         }
 
-                        if has_summary {
+                        if !summary().is_empty() {
                             view(style = SectionCol()) {
                                 text(style = SectionLabel()) { "Summary" }
-                                Typography(content = summary, kind = typography_kind::BodySm)
+                                Typography(content = rx!(summary()), kind = typography_kind::BodySm)
                             }
                         }
 
                         view(style = SectionCol()) {
                             text(style = SectionLabel()) { "Handoff" }
-                            DocumentView(
-                                console = console,
-                                present = handoff_present,
-                                body = handoff_body,
-                                meta = handoff_meta,
-                                empty = handoff_empty,
-                            )
+                            handoff
                         }
 
                         Discussion(console = console, subject = discussion_id.clone(), compact = true)
 
-                        if has_history {
-                            view(style = SectionCol()) {
-                                text(style = SectionLabel()) { "History" }
-                                for (title, body, at, from, gate) in history {
-                                    HistoryRow(title = title, body = body, at = at, from = from, gate = gate)
-                                }
-                            }
-                        }
+                        history
                     }
                 }
         }
@@ -572,12 +634,18 @@ fn panel_motion(
 const PANEL_SLIDE_PX: f32 = 32.0;
 
 /// Props for [`StatCell`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct StatCellProps {
     /// Uppercase stat label.
     pub label: &'static str,
-    /// Stat value.
-    pub value: String,
+    /// Stat value. Live: moves in place.
+    pub value: runtime_core::Reactive<String>,
+}
+
+impl Default for StatCellProps {
+    fn default() -> Self {
+        Self { label: "", value: runtime_core::Reactive::Static(String::new()) }
+    }
 }
 
 /// One cell of the drawer's stat grid.

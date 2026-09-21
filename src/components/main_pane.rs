@@ -9,7 +9,7 @@ use std::rc::Rc;
 use idea_ui::{typography_kind, Button, Field, IdeaThemeRef, Popover, Spacer, Tab, Tabs, Typography};
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    component, signal, stylesheet, switch, ui, AlignItems, Easing, Element,
+    component, effect, memo, rx, signal, stylesheet, switch, ui, AlignItems, Easing, Element,
     FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent,
     PresenceAnim, PresenceState, PressableHandle, Ref, StyleApplication,
 };
@@ -26,7 +26,7 @@ use crate::components::knowledge::KnowledgeView;
 use crate::components::overview::OverviewView;
 use crate::components::plan_editor::PlanEditor;
 use crate::components::wants::{CaptureView, WantsView};
-use crate::model::features;
+use crate::model::Status;
 use crate::state::Console;
 use crate::styles::MonoTextSize;
 
@@ -41,33 +41,26 @@ pub struct MainPaneProps {
 #[component]
 pub fn MainPane(props: &MainPaneProps) -> Element {
     let console = props.console;
+    let data = console.data;
     switch(
         move || {
-            // The wants pane deliberately does NOT read `rev`: it owns
-            // its own data-keyed switches, and rebuilding it here would
-            // recreate the capture editor under the user's cursor every
-            // time a poll landed.
             let pane = console.pane.get();
-            // Neither the pool nor the features screen reads `rev`
-            // here: both own their own data-keyed switches, and
-            // rebuilding them from this one would recreate the field
-            // the user is typing into every time a poll landed.
-            let rev = if pane == "wants" || pane == "features" || pane == "knowledge"
-                || pane == "overview" || pane == "capture" || pane == "plan"
-            {
-                0
-            } else {
-                console.rev.get()
-            };
-            // Deliberately NOT keyed on the drawer target: opening a
-            // module used to rebuild the whole pane behind the drawer,
-            // which threw away the very node the selection highlight
-            // wanted to animate. Every surface that draws a selection
-            // now reads `Console::selected` itself.
-            (pane, console.feature.get(), console.view.get(), rev)
+            let fi = console.feature.get();
+            // Keyed on WHICH feature and view are showing, and on
+            // whether that feature exists yet — never on its data.
+            // Everything inside reads the feature live, so a poll
+            // moves a count in the header and a ring on a card
+            // without a node here being rebuilt. Deliberately not
+            // keyed on the drawer target either: opening a module used
+            // to rebuild the whole pane behind the drawer, which threw
+            // away the very node the selection highlight wanted to
+            // animate. Every surface that draws a selection reads
+            // `Console::selected` itself.
+            let id = data.features.get().get(fi).map(|f| f.id.clone());
+            (pane, fi, console.view.get(), id)
         },
-        move |state: &(String, usize, String, u64)| {
-            let (pane, fi, active_view, _rev) = state.clone();
+        move |state: &(String, usize, String, Option<String>)| {
+            let (pane, fi, active_view, id) = state.clone();
             if pane == "overview" {
                 return ui! { OverviewView(console = console) };
             }
@@ -86,10 +79,10 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             if pane == "knowledge" {
                 return ui! { KnowledgeView(console = console) };
             }
-            if features().get(fi).is_none() {
+            let Some(feature_id) = id else {
                 return empty_pane(console);
-            }
-            pane_body(console, fi, active_view)
+            };
+            pane_body(console, fi, feature_id, active_view)
         },
     )
 }
@@ -97,7 +90,7 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
 /// Shown before the first snapshot lands, or when the store holds no
 /// features yet.
 fn empty_pane(console: Console) -> Element {
-    let loaded = crate::model::loaded();
+    let loaded = console.data.loaded.get();
     let (title, body) = if loaded {
         (
             "No features yet",
@@ -121,25 +114,79 @@ fn empty_pane(console: Console) -> Element {
     }
 }
 
-fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
-    let feats = features();
-    let f = &feats[fi];
-    let sources = f.sources.len();
-    let has_sources = sources > 0;
-    let description = f.description.trim().to_string();
-    let has_description = !description.is_empty();
-    let (paper_present, paper_body, paper_meta) = match &f.whitepaper {
-        Some(d) => (true, d.body.clone(), d.meta()),
-        None => (false, String::new(), String::new()),
-    };
+fn pane_body(console: Console, fi: usize, feature_id: String, active_view: String) -> Element {
+    let data = console.data;
+    let f = data.feature(fi);
     let is_graph = active_view == "graph";
     let is_paper = active_view == "whitepaper";
     let is_feed = active_view == "feed";
     let is_origin = active_view == "origin";
     let is_files = active_view == "files";
     let is_discussion = active_view == "discussion";
-    let feature_id = f.id.clone();
-    let pending = f.open_questions.len();
+    let pending = move || f().map(|f| f.open_questions.len()).unwrap_or(0);
+    let pending_line = rx!({
+        let n = pending();
+        format!(
+            "{n} open question{} \u{2014} nothing in this feature is dispatchable until answered.",
+            if n == 1 { "" } else { "s" }
+        )
+    });
+
+    // The whitepaper: remade when the document changes (a new
+    // revision, a description edit), which is the one time its text
+    // has to be re-laid. Inside the scroller, so the scroll survives
+    // everything else.
+    let paper = switch(
+        move || f().map(|f| (f.description.trim().to_string(), f.whitepaper.clone())),
+        move |held: &Option<(String, Option<Rc<crate::model::Document>>)>| {
+            let (description, paper) = held.clone().unwrap_or_default();
+            let has_description = !description.is_empty();
+            let (paper_present, paper_body, paper_meta) = match &paper {
+                Some(d) => (true, d.body.clone(), d.meta()),
+                None => (false, String::new(), String::new()),
+            };
+            ui! {
+                view(style = PaperCol()) {
+                    if has_description {
+                        Typography(content = description, kind = typography_kind::Body, muted = true)
+                    }
+                    DocumentView(
+                        console = console,
+                        present = paper_present,
+                        body = paper_body,
+                        meta = paper_meta,
+                        empty = "No whitepaper written.",
+                    )
+                }
+            }
+        },
+    );
+
+    // The origin list: remade when the feature's sources change.
+    let origin = switch(
+        move || f().map(|f| f.sources.clone()).unwrap_or_default(),
+        move |sources: &Rc<Vec<crate::model::WantSource>>| {
+            let sources = sources.clone();
+            let count = sources.len();
+            let has_sources = count > 0;
+            ui! {
+                view(style = OriginBox()) {
+                    if has_sources {
+                        for i in 0..count {
+                            OriginRow(console = console, source = sources[i].clone(), first = i == 0)
+                        }
+                    }
+                    if !has_sources {
+                        Typography(
+                            content = "No wants recorded.",
+                            kind = typography_kind::BodySm,
+                            muted = true,
+                        )
+                    }
+                }
+            }
+        },
+    );
 
     ui! {
         view(style = PaneBox()) {
@@ -154,12 +201,9 @@ fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
                 scroll_view(style = PaneScroll()) {
                     view(style = PanePad()) {
                         view(style = PaperCol()) {
-                            if pending > 0 {
+                            if pending() > 0 {
                                 Typography(
-                                    content = format!(
-                                        "{pending} open question{} \u{2014} nothing in this feature is dispatchable until answered.",
-                                        if pending == 1 { "" } else { "s" }
-                                    ),
+                                    content = pending_line.clone(),
                                     kind = typography_kind::BodySm,
                                     muted = true,
                                 )
@@ -172,18 +216,7 @@ fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
             if is_paper {
                 scroll_view(style = PaneScroll()) {
                     view(style = PanePad()) {
-                        view(style = PaperCol()) {
-                            if has_description {
-                                Typography(content = description, kind = typography_kind::Body, muted = true)
-                            }
-                            DocumentView(
-                                console = console,
-                                present = paper_present,
-                                body = paper_body,
-                                meta = paper_meta,
-                                empty = "No whitepaper written.",
-                            )
-                        }
+                        paper
                     }
                 }
             }
@@ -193,20 +226,7 @@ fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
             if is_origin {
                 scroll_view(style = PaneScroll()) {
                     view(style = PanePad()) {
-                        view(style = OriginBox()) {
-                            if has_sources {
-                                for i in 0..sources {
-                                    OriginRow(console = console, feature = fi, index = i)
-                                }
-                            }
-                            if !has_sources {
-                                Typography(
-                                    content = "No wants recorded.",
-                                    kind = typography_kind::BodySm,
-                                    muted = true,
-                                )
-                            }
-                        }
+                        origin
                     }
                 }
             }
@@ -219,10 +239,10 @@ fn pane_body(console: Console, fi: usize, active_view: String) -> Element {
 pub struct OriginRowProps {
     /// Console state handles.
     pub console: Console,
-    /// Feature index.
-    pub feature: usize,
-    /// Index into that feature's want sources.
-    pub index: usize,
+    /// The want this feature was composed from.
+    pub source: crate::model::WantSource,
+    /// First of its list — no rule above it.
+    pub first: bool,
 }
 
 /// One loose idea this feature was composed from — the idea in the
@@ -234,13 +254,11 @@ pub struct OriginRowProps {
 #[component]
 pub fn OriginRow(props: &OriginRowProps) -> Element {
     let console = props.console;
-    let feats = features();
-    let source = &feats[props.feature].sources[props.index];
-    let id = source.id.clone();
-    let body = source.body.clone();
+    let id = props.source.id.clone();
+    let body = props.source.body.clone();
     // Rows share one card surface (rule 13), so they are separated by a
     // rule rather than each carrying a border of its own.
-    let first = if props.index == 0 { "yes" } else { "no" };
+    let first = if props.first { "yes" } else { "no" };
 
     let inner: Element = ui! {
         view(style = OriginRowInner()) {
@@ -271,43 +289,63 @@ pub struct FeatureHeadProps {
 /// number there was a fraction of the same work, and spelled out as
 /// six labelled columns they pushed the tabs — the only controls in
 /// the header — most of a screen down (rule 16).
+///
+/// Built once per feature. Every value reads the feature live: the
+/// rollup line moves as tasks land, the ring turns while a box is
+/// writing, and the tab labels' counts follow the data through an
+/// effect on the tabs signal.
 #[component]
 pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
     let console = props.console;
-    let feats = features();
-    let f = &feats[props.feature];
-    let feature_id = f.id.clone();
-    let name = f.name.clone();
-    let status = f.status;
-    let live = f.live();
-    let agent = f.agent.to_string();
-    let (_tasks_done, _tasks_total, tasks_added) = f.task_count();
-    let elapsed = f.elapsed.to_string();
-    let mut meta = f.meta_line();
-    if tasks_added > 0 {
-        meta.push_str(&format!(" \u{b7} {tasks_added} ad hoc"));
-    }
-    meta.push_str(&format!(" \u{b7} {elapsed}"));
-    let word = f.last_word.as_ref().map(|w| w.line());
+    let data = console.data;
+    let fi = props.feature;
+    let f = data.feature(fi);
+    let status = memo(move || f().map(|f| f.status).unwrap_or_default());
+    let live = memo(move || {
+        let now = data.clock.get();
+        f().is_some_and(|f| f.live_at(now))
+    });
+    let name = rx!(f().map(|f| f.name.clone()).unwrap_or_default());
+    let agent = rx!(f().map(|f| f.agent.clone()).unwrap_or_default());
+    let meta = rx!(f()
+        .map(|f| {
+            let (_tasks_done, _tasks_total, tasks_added) = f.task_count();
+            let mut meta = f.meta_line();
+            if tasks_added > 0 {
+                meta.push_str(&format!(" \u{b7} {tasks_added} ad hoc"));
+            }
+            meta.push_str(&format!(" \u{b7} {}", f.elapsed));
+            meta
+        })
+        .unwrap_or_default());
+    let word = move || f().and_then(|f| f.last_word.as_ref().map(|w| w.line()));
 
-    let file_count = f.attachments.len();
-    let pending = f.open_questions.len()
-        + f.modules.iter().map(|m| m.open_questions.len()).sum::<usize>();
-    let tabs = signal(vec![
-        Tab::new("graph", "Graph"),
-        Tab::new("whitepaper", "Whitepaper"),
-        Tab::new(
-            "discussion",
-            if pending > 0 { format!("Discussion ({pending} open)") } else { "Discussion".to_string() },
-        ),
-        Tab::new(
-            "files",
-            if file_count > 0 { format!("Files ({file_count})") } else { "Files".to_string() },
-        ),
-        Tab::new("feed", "Activity"),
-        Tab::new("origin", "Composed from"),
-    ]);
+    let counts = move || {
+        f()
+            .map(|f| {
+                let pending = f.open_questions.len()
+                    + f.modules.iter().map(|m| m.open_questions.len()).sum::<usize>();
+                (pending, f.attachments.len())
+            })
+            .unwrap_or_default()
+    };
+    let tabs = signal(head_tabs(counts()));
+    effect!({
+        tabs.set(head_tabs(counts()));
+    });
     let on_change: Rc<dyn Fn(String)> = Rc::new(move |id| console.view.set(id));
+
+    // The menu's entries depend on the feature's state (shelved,
+    // done); remade when that changes.
+    let menu = switch(
+        move || f().map(|f| (f.id.clone(), f.status, f.shelved)),
+        move |held: &Option<(String, Status, bool)>| {
+            let id = held.as_ref().map(|(id, _, _)| id.clone()).unwrap_or_default();
+            ui! {
+                ActionMenu(console = console, id = "feature".to_string(), entries = feature_entries(&id))
+            }
+        },
+    );
 
     ui! {
         view(style = HeadBox()) {
@@ -326,7 +364,7 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
                 }
                 Spacer()
                 FeatureSwitcher(console = console)
-                ActionMenu(console = console, id = "feature".to_string(), entries = feature_entries(&feature_id))
+                menu
             }
             view(style = HeadMetaRow()) {
                 view(style = HeadTitleSlot()) {
@@ -336,12 +374,33 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
                     Mono(content = agent, size = MonoTextSize::Overline)
                 }
             }
-            if let Some(word) = word {
-                Typography(content = word, kind = typography_kind::Caption)
+            match word() {
+                Some(word) => {
+                    Typography(content = word.clone(), kind = typography_kind::Caption)
+                }
+                None => {}
             }
             Tabs(tabs = tabs, active = console.view, on_change = on_change)
         }
     }
+}
+
+/// The view tabs, with the counts two of them carry.
+fn head_tabs((pending, file_count): (usize, usize)) -> Vec<Tab> {
+    vec![
+        Tab::new("graph", "Graph"),
+        Tab::new("whitepaper", "Whitepaper"),
+        Tab::new(
+            "discussion",
+            if pending > 0 { format!("Discussion ({pending} open)") } else { "Discussion".to_string() },
+        ),
+        Tab::new(
+            "files",
+            if file_count > 0 { format!("Files ({file_count})") } else { "Files".to_string() },
+        ),
+        Tab::new("feed", "Activity"),
+        Tab::new("origin", "Composed from"),
+    ]
 }
 
 /// Props for [`Crumb`].
@@ -445,10 +504,15 @@ pub fn SwitcherPanel(props: &SwitcherPanelProps) -> Element {
     let dismiss: Rc<dyn Fn()> = Rc::new(move || console.switcher_open.set(false));
     let on_query: Rc<dyn Fn(String)> = Rc::new(move |t| console.switcher_query.set(t));
 
+    let data = console.data;
     let rows = switch(
-        move || (console.switcher_query.get(), console.feature.get(), console.rev.get()),
-        move |(query, sel, _rev): &(String, usize, u64)| {
-            let matched = crate::model::filter_features(query, "all");
+        move || {
+            let query = console.switcher_query.get();
+            let matched = crate::model::filter_features_of(&data.features.get(), &query, "all");
+            (matched, console.feature.get())
+        },
+        move |(matched, sel): &(Vec<usize>, usize)| {
+            let matched = matched.clone();
             let count = matched.len();
             let sel = *sel;
             ui! {
@@ -511,14 +575,12 @@ pub struct SwitcherRowProps {
 #[component]
 pub fn SwitcherRow(props: &SwitcherRowProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let index = props.index;
-    let feats = features();
-    let Some(f) = feats.get(index) else {
-        return ui! { view {} };
-    };
-    let name = f.name.clone();
-    let status = f.status;
-    let pct = f.pct_label();
+    let f = data.feature(index);
+    let name = rx!(f().map(|f| f.name.clone()).unwrap_or_default());
+    let status = memo(move || f().map(|f| f.status).unwrap_or_default());
+    let pct = rx!(f().map(|f| f.pct_label()).unwrap_or_default());
     let arm = if props.selected { "on" } else { "off" };
 
     let inner: Element = ui! {

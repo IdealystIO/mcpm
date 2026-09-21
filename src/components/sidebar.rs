@@ -21,12 +21,12 @@
 use idea_ui::{typography_kind, Badge, IdeaThemeRef, Progress, ProgressCap, Spacer, Typography};
 use idea_ui_nav::sidebar_pinned;
 use runtime_core::{
-    component, stylesheet, switch, ui, AlignItems, Breakpoint, Element, FlexDirection,
+    component, memo, rx, stylesheet, switch, ui, AlignItems, Breakpoint, Element, FlexDirection,
     FontWeight, IdealystSchema, IntoElement, StyleApplication,
 };
 
 use crate::components::bits::{Mono, StatusDot, tappable};
-use crate::model::{completed_count, features, in_play, rail_features, want_counts};
+use crate::model::{in_play_of, rail_features_of, Status};
 use crate::state::Console;
 use crate::styles::{status_tone, MonoTextSize, SectionLabel};
 
@@ -56,15 +56,16 @@ pub struct SidebarProps {
 pub fn Sidebar(props: &SidebarProps) -> Element {
     let console = props.console;
 
+    let data = console.data;
     // The destinations. Rebuilt on pane (for the selected arm) and on
-    // rev (for the counts) — never on `nav_open`, which is carried by
-    // the reactive width below so the collapse can animate.
+    // the two counts it shows — never on `nav_open`, which is carried
+    // by the reactive width below so the collapse can animate, and
+    // never on a poll that changed neither.
     let nav = switch(
-        move || (console.pane.get(), console.rev.get()),
-        move |(pane, _rev): &(String, u64)| {
+        move || (console.pane.get(), data.features.get().len(), data.want_counts.get().0),
+        move |(pane, total, loose): &(String, usize, usize)| {
             let pane = pane.clone();
-            let total = features().len();
-            let (loose, _, _) = want_counts();
+            let (total, loose) = (*total, *loose);
             let on_feature = pane == "feature" || pane == "features";
             ui! {
                 view(style = NavGroup()) {
@@ -111,16 +112,26 @@ pub fn Sidebar(props: &SidebarProps) -> Element {
         },
     );
 
+    // The rail's MEMBERSHIP is the key: which features it lists, in
+    // what order, and which is selected. A poll that moves a count or
+    // a spinner changes none of that, so the rows stay mounted and
+    // read their own feature through the data signals. A feature
+    // finishing (it leaves the rail) or being planned (it joins) is
+    // what rebuilds the list.
     let rail = switch(
-        move || (console.pane.get(), console.feature.get(), console.rev.get()),
-        move |(pane, sel, _rev): &(String, usize, u64)| {
-            let (pane, sel) = (pane.clone(), *sel);
-            let visible = rail_features(sel);
+        move || {
+            let sel = console.feature.get();
+            let visible = rail_features_of(&data.features.get(), sel);
+            (console.pane.get(), sel, visible)
+        },
+        move |(pane, sel, visible): &(String, usize, Vec<usize>)| {
+            let (pane, sel, visible) = (pane.clone(), *sel, visible.clone());
             let count = visible.len();
-            let playing = in_play().len();
-            let total = features().len();
             let on_feature = pane == "feature";
-            let scope = format!("{playing} of {total}");
+            let scope = rx!({
+                let feats = data.features.get();
+                format!("{} of {}", in_play_of(&feats).len(), feats.len())
+            });
             ui! {
                 view(style = RailBox()) {
                     view(style = RailHead()) {
@@ -241,19 +252,26 @@ pub struct RailFeatureProps {
 /// Two lines, not the three a card took — the rail's job is to be
 /// scanned, and at three lines each four features filled it and the
 /// rest became a scroll.
+///
+/// Built once per membership of the rail and never for a poll: every
+/// value on it is read live off the feature's signal, so the name,
+/// the percentage, the bar and the ring move in place — and a ring
+/// that is turning keeps turning.
 #[component]
 pub fn RailFeature(props: &RailFeatureProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let index = props.index;
-    let feats = features();
-    let Some(f) = feats.get(index) else {
-        return ui! { view {} };
-    };
-    let name = f.name.clone();
-    let status = f.status;
-    let live = f.live();
-    let fraction = f.fraction();
-    let pct = f.pct_label();
+    let f = data.feature(index);
+    let status = memo(move || f().map(|f| f.status).unwrap_or_default());
+    let live = memo(move || {
+        let now = data.clock.get();
+        f().is_some_and(|f| f.live_at(now))
+    });
+    let name = rx!(f().map(|f| f.name.clone()).unwrap_or_default());
+    let pct = rx!(f().map(|f| f.pct_label()).unwrap_or_default());
+    let fraction = rx!(f().map(|f| f.fraction()).unwrap_or(0.0));
+    let tone = rx!(status_tone(status.get()));
     let arm = if props.selected { "on" } else { "off" };
 
     let inner: Element = ui! {
@@ -278,7 +296,7 @@ pub fn RailFeature(props: &RailFeatureProps) -> Element {
             view(style = RailBarSlot()) {
                 Progress(
                     value = fraction,
-                    tone = status_tone(status),
+                    tone = tone,
                     cap = ProgressCap::Rounded,
                 )
             }
@@ -309,12 +327,16 @@ pub struct AllFeaturesLinkProps {
 #[component]
 pub fn AllFeaturesLink(props: &AllFeaturesLinkProps) -> Element {
     let console = props.console;
-    let total = features().len();
-    let done = completed_count();
-    let label = if done == 0 {
-        format!("All {total} features \u{2192}")
-    } else {
-        format!("All {total} features, {done} complete \u{2192}")
+    let data = console.data;
+    let label = move || {
+        let feats = data.features.get();
+        let total = feats.len();
+        let done = feats.iter().filter(|f| f.status == Status::Done).count();
+        if done == 0 {
+            format!("All {total} features \u{2192}")
+        } else {
+            format!("All {total} features, {done} complete \u{2192}")
+        }
     };
 
     let inner: Element = ui! {

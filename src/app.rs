@@ -96,10 +96,12 @@ pub fn app() -> Element {
     // `switch` is keyed on the STICKY target so the panel keeps drawing
     // itself while it slides away.
     // The module is held by id and resolved to its index in the
-    // feature's graph here, on every rebuild: the graph may not have
-    // loaded yet when the drawer is asked for (the home screen's
-    // attention list opens into any feature), and it arrives a rev
-    // later.
+    // feature's graph: the graph may not have loaded yet when the
+    // drawer is asked for (the home screen's attention list opens
+    // into any feature), and it arrives a read later. The switch is
+    // keyed on that INDEX, so the panel is built once per module and
+    // restyles itself from the data signals after — a task ticked
+    // while the drawer is open moves one row, not the scroll position.
     let drawer_host: Element = ui! {
         presence(
             present = move || console.selected.get().is_some(),
@@ -108,12 +110,17 @@ pub fn app() -> Element {
         ) {
             {
                 switch(
-                    move || (console.feature.get(), console.last_module.get(), console.rev.get()),
-                    move |(fi, sel, _rev): &(usize, Option<String>, u64)| {
-                        match sel.as_deref().and_then(|id| drawer_target(*fi, id)) {
-                            Some(mi) => ui! { Drawer(console = console, feature = *fi, module = mi) },
-                            None => ui! { view {} },
-                        }
+                    move || {
+                        let fi = console.feature.get();
+                        let id = console.last_module.get();
+                        let target = id
+                            .as_deref()
+                            .and_then(|id| drawer_target(&console.data.features.get(), fi, id));
+                        (fi, id, target)
+                    },
+                    move |(fi, _id, target): &(usize, Option<String>, Option<usize>)| match target {
+                        Some(mi) => ui! { Drawer(console = console, feature = *fi, module = *mi) },
+                        None => ui! { view {} },
                     },
                 )
             }
@@ -133,9 +140,16 @@ pub fn app() -> Element {
         ) {
             {
                 switch(
-                    move || (console.last_want.get(), console.rev.get()),
-                    move |(id, _rev): &(Option<String>, u64)| match id {
-                        Some(id) if model::want_by_id(id).is_some() => ui! {
+                    move || {
+                        let id = console.last_want.get();
+                        let known = id.as_deref().is_some_and(|id| {
+                            console.data.wants.get().iter().any(|w| w.id == id)
+                                || console.data.open_want.get().is_some_and(|w| w.id == id)
+                        });
+                        (id, known)
+                    },
+                    move |(id, known): &(Option<String>, bool)| match id {
+                        Some(id) if *known => ui! {
                             WantDrawer(console = console, want = id.clone())
                         },
                         _ => ui! { view {} },
@@ -221,8 +235,8 @@ pub fn app() -> Element {
     }
 }
 
-fn drawer_target(fi: usize, module_id: &str) -> Option<usize> {
-    model::features().get(fi)?.module_index(module_id)
+fn drawer_target(features: &[Rc<model::Feature>], fi: usize, module_id: &str) -> Option<usize> {
+    features.get(fi)?.module_index(module_id)
 }
 
 /// Which reads the screen needs loaded right now. Computed every frame
@@ -308,6 +322,7 @@ fn start_sync(console: Console, key: String) {
     // off the very first fetch, and any event tick or local capture
     // that lands while the page is young, until the window elapsed.
     let mut last_poll: Option<u64> = None;
+    let mut last_step: i64 = -1;
     let mut seen_nudge: u64 = 0;
     let mut seen_seq: i64 = 0;
     let mut last_wanted = Wanted::default();
@@ -398,6 +413,12 @@ fn start_sync(console: Console, key: String) {
                     stale_pool = true;
                     stale_want = true;
                 }
+                // The knowledge screen queries the server on every
+                // change to the base; nothing else on screen moves
+                // for a memory.
+                if untyped || tick.kind.starts_with("memory") {
+                    console.know_rev.update(|r| r + 1);
+                }
             }
         }
         // A local write (a capture, a plan edit) bumps `refresh` so its
@@ -421,6 +442,15 @@ fn start_sync(console: Console, key: String) {
             stale_pool = true;
             stale_want = true;
             stale_threads = true;
+            console.know_rev.update(|r| r + 1);
+        }
+        // The clock every liveness reading is taken against: written
+        // once per step, so its readers wake once per step and a frame
+        // stages nothing.
+        let step = model::clock_step(model::now_secs());
+        if step != last_step {
+            last_step = step;
+            console.data.tick_clock();
         }
         // A selection change is stale by definition: the new target
         // may be cached, but it has not been refreshed since it was
@@ -454,7 +484,7 @@ fn start_sync(console: Console, key: String) {
         };
         let bump = move |changed: bool| {
             if changed {
-                console.rev.update(|r| r + 1);
+                model::publish(console.data);
             }
         };
 
@@ -619,7 +649,7 @@ fn fetch_module(console: Console, in_flight: &InFlight, now: u64, module_id: Str
         match result {
             Ok(detail) => {
                 if model::apply_module(detail) {
-                    console.rev.update(|r| r + 1);
+                    model::publish(console.data);
                 }
             }
             Err(err) => runtime_core::log_warn!("module fetch failed: {err:?}"),
@@ -639,7 +669,7 @@ fn fetch_thread(console: Console, in_flight: &InFlight, now: u64, subject: Strin
         match result {
             Ok(page) => {
                 if model::apply_comments(page) {
-                    console.rev.update(|r| r + 1);
+                    model::publish(console.data);
                 }
             }
             Err(err) => runtime_core::log_warn!("discussion fetch failed: {err:?}"),
@@ -662,7 +692,7 @@ fn fetch_feed(console: Console, in_flight: &InFlight, now: u64, feature_id: Stri
             match result {
                 Ok(page) => {
                     if model::apply_events(page) {
-                        console.rev.update(|r| r + 1);
+                        model::publish(console.data);
                     }
                 }
                 Err(err) => runtime_core::log_warn!("feed fetch failed: {err:?}"),

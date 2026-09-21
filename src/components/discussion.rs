@@ -28,7 +28,7 @@ use crate::components::attachments::AttachmentRow;
 use crate::components::bits::Mono;
 use crate::components::document::md_theme;
 use crate::components::edits::{ActionMenu, MenuEntry};
-use crate::model::{self, thread, Comment};
+use crate::model::{self, Comment};
 use crate::state::{Console, Edit, PickedBlob};
 use crate::styles::{MonoTextSize, SectionLabel};
 
@@ -44,34 +44,52 @@ pub struct DiscussionProps {
 }
 
 /// The thread and its composer.
+///
+/// The list is keyed on the thread itself — remade when a comment
+/// lands or is edited, and for nothing else — and the composer sits
+/// outside it, so a reply arriving mid-sentence never rebuilds the
+/// field being typed into.
 #[component]
 pub fn Discussion(props: &DiscussionProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let subject = props.subject.clone();
     let compact = props.compact;
-    let loaded = model::has_thread(&subject);
-    let comments: Rc<Vec<Comment>> = thread(&subject).unwrap_or_default();
-    let count = comments.len();
-    let has_comments = count > 0;
     let composer_subject = subject.clone();
+    let key_subject = subject.clone();
+    let list = switch(
+        move || data.threads.get().get(&key_subject).cloned(),
+        move |held: &Option<Rc<Vec<Comment>>>| {
+            let loaded = held.is_some();
+            let comments: Rc<Vec<Comment>> = held.clone().unwrap_or_default();
+            let count = comments.len();
+            let has_comments = count > 0;
+            let subject = subject.clone();
+            ui! {
+                view(style = ThreadCol()) {
+                    if !loaded {
+                        Typography(content = "Loading\u{2026}", kind = typography_kind::BodySm, muted = true)
+                    }
+                    if loaded && !has_comments {
+                        Typography(content = "Nothing said yet.", kind = typography_kind::BodySm, muted = true)
+                    }
+                    if has_comments {
+                        view(style = ThreadList()) {
+                            for i in 0..count {
+                                CommentRow(console = console, subject = subject.clone(), comment = comments[i].clone(), first = i == 0)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    );
     ui! {
         view(style = ThreadCol()) {
             if compact {
                 text(style = SectionLabel()) { "Discussion" }
             }
-            if !loaded {
-                Typography(content = "Loading\u{2026}", kind = typography_kind::BodySm, muted = true)
-            }
-            if loaded && !has_comments {
-                Typography(content = "Nothing said yet.", kind = typography_kind::BodySm, muted = true)
-            }
-            if has_comments {
-                view(style = ThreadList()) {
-                    for i in 0..count {
-                        CommentRow(console = console, subject = subject.clone(), comment = comments[i].clone(), first = i == 0)
-                    }
-                }
-            }
+            list
             Composer(console = console, subject = composer_subject.clone())
         }
     }

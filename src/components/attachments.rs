@@ -24,7 +24,7 @@ use runtime_core::{
 };
 
 use crate::components::edits::{choose, ActionMenu, MenuEntry};
-use crate::model::{self, features, want_by_id, Attachment};
+use crate::model::{self, want_by_id, Attachment};
 use crate::state::{Console, Edit, PickedBlob};
 use crate::styles::SectionLabel;
 use crate::components::bits::tappable;
@@ -44,28 +44,26 @@ pub struct FilesViewProps {
 
 /// A feature's files: its own, then the files of the wants it was
 /// composed from (each marked with the idea it came in through).
+///
+/// The list is keyed on the files themselves: remade when one is
+/// attached, described or removed, and left alone by everything else.
 #[component]
 pub fn FilesView(props: &FilesViewProps) -> Element {
     let console = props.console;
-    let feats = features();
-    let f = &feats[props.feature];
-    let subject = f.id.clone();
-    let files: Rc<Vec<Attachment>> = f.attachments.clone();
-    let count = files.len();
-    let has_files = count > 0;
-    let attach_subject = subject.clone();
+    let data = console.data;
+    let fi = props.feature;
+    let subject = data.feature(fi);
     let attach: Rc<dyn Fn()> = Rc::new(move || {
-        choose(console, Edit::AttachFile { subject: attach_subject.clone() });
+        choose(console, Edit::AttachFile { subject: subject().map(|f| f.id.clone()).unwrap_or_default() });
     });
-
-    ui! {
-        scroll_view(style = FilesScroll()) {
-            view(style = FilesPad()) {
+    let list = switch(
+        move || data.features.get().get(fi).map(|f| (f.id.clone(), f.attachments.clone())),
+        move |held: &Option<(String, Rc<Vec<Attachment>>)>| {
+            let (subject, files) = held.clone().unwrap_or_default();
+            let count = files.len();
+            let has_files = count > 0;
+            ui! {
                 view(style = FilesCol()) {
-                    view(style = FilesBar()) {
-                        Spacer()
-                        Button(label = "Attach file", on_click = attach, size = size::Sm)
-                    }
                     if has_files {
                         view(style = FilesCard()) {
                             for i in 0..count {
@@ -81,6 +79,20 @@ pub fn FilesView(props: &FilesViewProps) -> Element {
                     if !has_files {
                         Typography(content = "No files attached.", kind = typography_kind::BodySm, muted = true)
                     }
+                }
+            }
+        },
+    );
+
+    ui! {
+        scroll_view(style = FilesScroll()) {
+            view(style = FilesPad()) {
+                view(style = FilesCol()) {
+                    view(style = FilesBar()) {
+                        Spacer()
+                        Button(label = "Attach file", on_click = attach, size = size::Sm)
+                    }
+                    list
                 }
             }
         }

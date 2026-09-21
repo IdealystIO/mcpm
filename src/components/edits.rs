@@ -1042,11 +1042,11 @@ fn tags_of(text: &str) -> Vec<String> {
 
 fn with_feature<T>(feature: &str, f: impl FnOnce(&model::Feature) -> T) -> Option<T> {
     let feats = features();
-    feats.iter().find(|x| x.id == feature).map(f)
+    feats.iter().find(|x| x.id == feature).map(|x| f(x))
 }
 
 fn with_module<T>(feature: &str, module: &str, f: impl FnOnce(&model::Module) -> T) -> Option<T> {
-    with_feature(feature, |feat| feat.modules.iter().find(|m| m.id == module).map(f)).flatten()
+    with_feature(feature, |feat| feat.modules.iter().find(|m| m.id == module).map(|m| f(m))).flatten()
 }
 
 fn feature_name(feature: &str) -> String {

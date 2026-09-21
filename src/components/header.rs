@@ -7,7 +7,7 @@ use idea_ui::{size, typography_kind, variant, Button, Field, IdeaThemeRef, Popov
 use idea_ui_nav::sidebar_pinned;
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
-    component, current_breakpoint, stylesheet, switch, ui, AlignItems, Easing,
+    component, current_breakpoint, rx, stylesheet, switch, ui, AlignItems, Easing,
     Element,
     FlexDirection, FontWeight, IdealystSchema, IntoElement, JustifyContent, PresenceAnim,
     PresenceState, PressableHandle, Ref, StyleApplication,
@@ -37,9 +37,9 @@ pub fn Header(props: &HeaderProps) -> Element {
     let console = props.console;
 
     let identity = switch(
-        move || console.rev.get(),
-        move |_: &u64| {
-            let name = crate::model::project_name();
+        move || console.data.project.get(),
+        move |name: &String| {
+            let name = name.clone();
             ui! {
                 view(style = TitleRow()) {
                     Typography(
@@ -76,15 +76,11 @@ pub fn Header(props: &HeaderProps) -> Element {
         },
     );
 
-    let agents = switch(
-        move || console.rev.get(),
-        move |_: &u64| {
-            let label = format!("{} agents live", live_agent_count());
-            ui! {
-                Typography(content = label, kind = typography_kind::Caption, muted = true)
-            }
-        },
-    );
+    // Live text: the count moves in place as agents come and go.
+    let agents = rx!(format!("{} agents live", live_agent_count(&console.data.agents.get())));
+    let agents = ui! {
+        Typography(content = agents, kind = typography_kind::Caption, muted = true)
+    };
 
     ui! {
         view(style = HeaderBar()) {

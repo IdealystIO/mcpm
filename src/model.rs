@@ -31,6 +31,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use runtime_core::{signal, Signal};
+
 /// Execution status shared by features, modules, events, and agents.
 /// `Violation` is a display state: a module whose claim bounced off the
 /// gate because a prerequisite was still open (`premature_claim` on the
@@ -59,6 +61,7 @@ impl Status {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Task {
     pub id: String,
     pub label: String,
@@ -68,6 +71,7 @@ pub struct Task {
 
 /// One ledger entry that touched a module, as the drawer's history
 /// shows it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ModuleEvent {
     pub title: String,
     pub body: String,
@@ -181,6 +185,7 @@ impl Word {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Module {
     pub id: String,
     pub name: String,
@@ -202,9 +207,10 @@ pub struct Module {
     pub open_questions: Vec<Question>,
     /// The latest thing an agent announced on this module.
     pub last_word: Option<Word>,
-    /// Seconds since the holder last wrote to the ledger; -1 = no
-    /// reading (unclaimed, or a holder that has never written).
-    pub quiet_secs: i64,
+    /// When the holder last wrote to the ledger, as Unix seconds;
+    /// `None` = no reading (unclaimed, or a holder that has never
+    /// written). Measured against [`now_secs`] at read time.
+    pub last_heard: Option<i64>,
     pub tasks: Vec<Task>,
 }
 
@@ -216,6 +222,12 @@ pub const LIVE_WINDOW_SECS: i64 = 20 * 60;
 /// `true` when a reading exists and is inside [`LIVE_WINDOW_SECS`].
 pub fn within_live_window(quiet_secs: i64) -> bool {
     (0..LIVE_WINDOW_SECS).contains(&quiet_secs)
+}
+
+/// Seconds between a stamp and `now`; -1 for no stamp. Never
+/// negative: a stamp from the future reads as "just now".
+pub fn quiet_secs(last_heard: Option<i64>, now: i64) -> i64 {
+    last_heard.map(|t| (now - t).max(0)).unwrap_or(-1)
 }
 
 /// "3m", "2h 10m", "1d 4h" — how long something has been quiet, for
@@ -232,6 +244,7 @@ pub fn quiet_label(secs: i64) -> String {
 
 /// What a module's drawer adds to its card. Read with [`module_detail`];
 /// `None` until [`apply_module`] has landed it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ModuleDetail {
     pub handoff: Option<Document>,
     /// Every ledger entry whose subject is this module, oldest first.
@@ -251,6 +264,7 @@ pub enum Readiness {
     Done,
 }
 
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct EventItem {
     /// Ledger sequence. The only orderable key an event carries — the
     /// `time` string is a clock reading, so merging two features' feeds
@@ -267,6 +281,7 @@ pub struct EventItem {
 
 /// One feature's ledger as far as it has been read: newest first, and
 /// whether the oldest row here is the oldest there is.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Feed {
     pub events: Vec<EventItem>,
     pub exhausted: bool,
@@ -279,6 +294,7 @@ impl Feed {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentRow {
     pub id: String,
     pub level: String,
@@ -290,16 +306,35 @@ pub struct AgentRow {
     pub health: Option<AgentHealthRow>,
     /// When it last registered or announced, as a stamp.
     pub last_seen: String,
-    /// Seconds since its newest ledger write; -1 = never wrote.
-    pub quiet_secs: i64,
+    /// Its newest ledger write, as Unix seconds; `None` = never wrote.
+    pub last_heard: Option<i64>,
     /// The latest thing it announced.
     pub last_word: Option<Word>,
+}
+
+impl AgentRow {
+    /// Spinning while it holds a claim, wrote to the ledger inside the
+    /// live window, and its box — if checked — is up. A quota-parked
+    /// box holds its claim and says nothing: still dot.
+    pub fn live_at(&self, now: i64) -> bool {
+        self.state == Status::Running
+            && within_live_window(quiet_secs(self.last_heard, now))
+            && self.health.as_ref().is_none_or(|h| h.up)
+    }
+
+    /// "quiet 47m" once a held claim has gone silent past the window.
+    pub fn quiet_at(&self, now: i64) -> Option<String> {
+        let quiet = quiet_secs(self.last_heard, now);
+        (self.state == Status::Running && quiet >= LIVE_WINDOW_SECS)
+            .then(|| format!("quiet {}", quiet_label(quiet)))
+    }
 }
 
 /// The server's verdict on an agent's machine, ready to draw: the tone
 /// is borrowed from [`Status`] because the dot and badge palette is
 /// keyed on it, and the line is the whole fact ("down since Sep 18
 /// 14:02 · HTTP 503").
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentHealthRow {
     pub tone: Status,
     pub label: String,
@@ -347,6 +382,7 @@ impl WantState {
 }
 
 /// One tag in the registry.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TagRow {
     pub name: String,
     pub label: String,
@@ -358,6 +394,7 @@ pub struct TagRow {
 /// No rationale here: the link's rationale is read off the want itself
 /// (`Want::features`) when its drawer opens, so a feature's origin list
 /// and the pool cannot disagree about why an idea was read in.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct WantSource {
     pub id: String,
     pub body: String,
@@ -368,6 +405,7 @@ pub struct WantSource {
 /// The counts come from the board's rollup and not from `modules`, so
 /// a feature row is right before its detail has loaded and stays
 /// consistent with the rail after.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Feature {
     pub id: String,
     pub name: String,
@@ -389,7 +427,7 @@ pub struct Feature {
     pub detail_loaded: bool,
     /// Topological order: every module after all of its prerequisites,
     /// ties by depth then name. Shared with the detail cache.
-    pub modules: Rc<Vec<Module>>,
+    pub modules: Rc<Vec<Rc<Module>>>,
     pub whitepaper: Option<Rc<Document>>,
     /// The loose ideas this feature was composed from.
     pub sources: Rc<Vec<WantSource>>,
@@ -401,9 +439,10 @@ pub struct Feature {
     pub last_word: Option<Word>,
     /// Modules an agent holds right now.
     pub modules_running: usize,
-    /// Seconds since a HOLDER of one of its modules last wrote to the
-    /// ledger; -1 = nobody holds one, or no holder has written.
-    pub quiet_secs: i64,
+    /// When a HOLDER of one of its modules last wrote to the ledger,
+    /// as Unix seconds; `None` = nobody holds one, or no holder has
+    /// written.
+    pub last_heard: Option<i64>,
 }
 
 // ---------------------------------------------------------------------
@@ -490,43 +529,108 @@ impl Module {
     }
 
     /// Held AND moving: an agent has it and wrote to the ledger inside
-    /// the live window.
-    pub fn live(&self) -> bool {
-        self.status == Status::Running && within_live_window(self.quiet_secs)
+    /// the live window, measured at `now` (see [`now_secs`]).
+    pub fn live_at(&self, now: i64) -> bool {
+        self.status == Status::Running && within_live_window(quiet_secs(self.last_heard, now))
     }
 
     /// Held but NOT moving: the holder has been silent past the
     /// window. `None` while it is live, unclaimed, or unmeasured.
-    pub fn quiet_for(&self) -> Option<String> {
-        (self.status == Status::Running && self.quiet_secs >= LIVE_WINDOW_SECS)
-            .then(|| quiet_label(self.quiet_secs))
+    pub fn quiet_for_at(&self, now: i64) -> Option<String> {
+        let quiet = quiet_secs(self.last_heard, now);
+        (self.status == Status::Running && quiet >= LIVE_WINDOW_SECS).then(|| quiet_label(quiet))
     }
+
+    /// The agent slot as a card shows it — who holds the module, and
+    /// for how long it has been quiet — with the tone that goes with it.
+    pub fn agent_line_at(&self, now: i64) -> (String, AgentTone) {
+        match self.quiet_for_at(now) {
+            Some(quiet) => (format!("{} \u{b7} quiet {quiet}", self.agent), AgentTone::Quiet),
+            None => (
+                self.agent.clone(),
+                match self.agent.as_str() {
+                    "ready" => AgentTone::Ready,
+                    "waiting" => AgentTone::Waiting,
+                    _ => AgentTone::Plain,
+                },
+            ),
+        }
+    }
+}
+
+/// How a module's agent slot reads: the holder, the readiness word
+/// standing in for one, or a holder that has gone quiet.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentTone {
+    #[default]
+    Plain,
+    Ready,
+    Waiting,
+    Quiet,
 }
 
 impl Feature {
     /// Something in it is moving right now: a module is held and the
     /// ledger heard from the feature inside the live window.
-    pub fn live(&self) -> bool {
-        self.modules_running > 0 && within_live_window(self.quiet_secs)
+    pub fn live_at(&self, now: i64) -> bool {
+        self.modules_running > 0 && within_live_window(quiet_secs(self.last_heard, now))
     }
 }
 
 /// Agents holding a claim right now.
-pub fn active_agent_count() -> usize {
-    agents().iter().filter(|a| a.state == Status::Running).count()
+pub fn active_agent_count(agents: &[Rc<AgentRow>]) -> usize {
+    agents.iter().filter(|a| a.state == Status::Running).count()
 }
 
 /// Agents whose machine is known to be up — or, for one with no health
 /// check registered, one that holds a claim, which is the best the
 /// ledger alone can say.
-pub fn live_agent_count() -> usize {
-    agents()
+pub fn live_agent_count(agents: &[Rc<AgentRow>]) -> usize {
+    agents
         .iter()
         .filter(|a| match &a.health {
             Some(h) => h.up,
             None => a.state == Status::Running,
         })
         .count()
+}
+
+/// The features still being worked, as indices into the list given.
+pub fn in_play_of(features: &[Rc<Feature>]) -> Vec<usize> {
+    features
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.status != Status::Done)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The rail's rows over the list given: everything still in play,
+/// plus whichever one is selected — see [`rail_features`].
+pub fn rail_features_of(features: &[Rc<Feature>], selected: usize) -> Vec<usize> {
+    features
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| f.status != Status::Done || *i == selected)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The all-features screen's rows over the list given — see
+/// [`filter_features`].
+pub fn filter_features_of(features: &[Rc<Feature>], query: &str, status: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    features
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| match status {
+            "open" => f.status != Status::Done,
+            "done" => f.status == Status::Done,
+            _ => true,
+        })
+        .filter(|(_, f)| needle.is_empty() || f.name.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -538,7 +642,7 @@ pub fn live_agent_count() -> usize {
 struct Detail {
     raw: api::FeatureDetail,
     description: String,
-    modules: Rc<Vec<Module>>,
+    modules: Rc<Vec<Rc<Module>>>,
     whitepaper: Option<Rc<Document>>,
     sources: Rc<Vec<WantSource>>,
     attachments: Rc<Vec<Attachment>>,
@@ -547,9 +651,14 @@ struct Detail {
 
 struct Current {
     board: Option<api::Board>,
+    /// The server's clock minus this process's, in seconds, from the
+    /// newest board. Every liveness reading is taken against the
+    /// server's idea of now, so a reader whose machine is minutes off
+    /// still sees the same spinners the host would.
+    clock_offset: Option<i64>,
     project_name: String,
-    features: Rc<Vec<Feature>>,
-    agents: Rc<Vec<AgentRow>>,
+    features: Rc<Vec<Rc<Feature>>>,
+    agents: Rc<Vec<Rc<AgentRow>>>,
     tags: Rc<Vec<TagRow>>,
     attention: Rc<Vec<Attention>>,
     recent: Rc<Vec<EventItem>>,
@@ -578,6 +687,7 @@ struct Current {
 thread_local! {
     static CURRENT: RefCell<Current> = RefCell::new(Current {
         board: None,
+        clock_offset: None,
         project_name: "control-center".into(),
         features: Rc::new(Vec::new()),
         agents: Rc::new(Vec::new()),
@@ -599,12 +709,21 @@ thread_local! {
     });
 }
 
-pub fn features() -> Rc<Vec<Feature>> {
+pub fn features() -> Rc<Vec<Rc<Feature>>> {
     CURRENT.with(|c| c.borrow().features.clone())
 }
 
-pub fn agents() -> Rc<Vec<AgentRow>> {
-    CURRENT.with(|c| c.borrow().agents.clone())
+/// This process's clock, in seconds. On web it counts from page load,
+/// which is why it is only ever read through [`now_secs`].
+fn local_secs() -> i64 {
+    (runtime_core::time::now_micros() / 1_000_000) as i64
+}
+
+/// Now, as Unix seconds on the SERVER's clock: the local clock plus
+/// the offset the newest board established. Before any board has
+/// arrived there is nothing to measure, and the local clock stands in.
+pub fn now_secs() -> i64 {
+    local_secs() + CURRENT.with(|c| c.borrow().clock_offset).unwrap_or(0)
 }
 
 /// The feature at `index`'s id, or `None` past the end.
@@ -620,11 +739,6 @@ pub fn has_detail(feature_id: &str) -> bool {
 /// A module's drawer contents, once [`apply_module`] has landed them.
 pub fn module_detail(module_id: &str) -> Option<Rc<ModuleDetail>> {
     CURRENT.with(|c| c.borrow().modules.get(module_id).map(|(_, d)| d.clone()))
-}
-
-/// A subject's discussion, once read.
-pub fn thread(subject_id: &str) -> Option<Rc<Vec<Comment>>> {
-    CURRENT.with(|c| c.borrow().threads.get(subject_id).map(|(_, t)| t.clone()))
 }
 
 /// Whether a subject's discussion has been read at all.
@@ -654,31 +768,15 @@ pub fn feed(feature_id: &str) -> Option<Rc<Feed>> {
     CURRENT.with(|c| c.borrow().feeds.get(feature_id).cloned())
 }
 
-/// The features the sidebar rail shows: everything still in play, plus
-/// whichever one is selected.
-///
-/// A finished feature is the bulk of a long-lived project and the part
-/// nobody is steering, so the rail — which exists to be scanned while
-/// work is happening — drops it. `selected` is the exception: opening a
-/// completed feature from the all-features screen must not make its own
-/// card vanish out from under the reader.
-pub fn rail_features(selected: usize) -> Vec<usize> {
-    features()
-        .iter()
-        .enumerate()
-        .filter(|(i, f)| f.status != Status::Done || *i == selected)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Where an [`Attention`] row goes when it is opened.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum AttentionTarget {
     /// A module drawer: `(feature index, module id)`. The module is
     /// addressed by id because its feature's graph may not be loaded
     /// yet when the row is pressed.
     Module(usize, String),
     /// The want pool screen.
+    #[default]
     Pool,
     /// An open question: `(level, subject id, feature id)` — see
     /// `Console::open_question`.
@@ -693,6 +791,7 @@ pub enum AttentionTarget {
 /// (UX_GUIDELINES rule 21). The server derives each from the module's
 /// own state rather than from the newest event of some kind, so the
 /// row disappears by itself the moment the work moves.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Attention {
     /// Short kind word for the row's pill.
     pub kind: &'static str,
@@ -706,33 +805,6 @@ pub struct Attention {
     pub target: AttentionTarget,
 }
 
-/// Everything across the project that has stopped and is waiting on a
-/// person, worst first: rejected claims, then blocked modules, then the
-/// uncomposed pool.
-///
-/// Ordered by how much it costs to leave alone. A rejected claim is an
-/// agent that tried and was refused — it is not coming back on its own.
-/// A blocked module has already escalated. Loose wants are only ever
-/// the tail: nothing is stalled on them.
-pub fn attention() -> Rc<Vec<Attention>> {
-    CURRENT.with(|c| c.borrow().attention.clone())
-}
-
-/// The features still being worked, as indices into [`features`].
-pub fn in_play() -> Vec<usize> {
-    features()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| f.status != Status::Done)
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// The project-wide ledger's newest entries, newest first.
-pub fn recent() -> Rc<Vec<EventItem>> {
-    CURRENT.with(|c| c.borrow().recent.clone())
-}
-
 /// The first feature still in play, for the console to land on.
 ///
 /// Without this the console opens on index 0, which on a mature project
@@ -742,46 +814,9 @@ pub fn first_open_feature() -> Option<usize> {
     features().iter().position(|f| f.status != Status::Done)
 }
 
-/// How many features the rail is leaving out, for the all-features
-/// entry to name.
-pub fn completed_count() -> usize {
-    features().iter().filter(|f| f.status == Status::Done).count()
-}
-
-/// The all-features screen's rows, as indices into [`features`].
-///
-/// `query` matches the feature name case-insensitively; `status` is
-/// "all" / "open" / "done". Open is defined as "not complete" rather
-/// than as a list of the other states, so a feature can never be
-/// unreachable under every filter the way an enumerated list lets
-/// happen when a new state is added.
-pub fn filter_features(query: &str, status: &str) -> Vec<usize> {
-    let needle = query.trim().to_lowercase();
-    features()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| {
-            let state_ok = match status {
-                "open" => f.status != Status::Done,
-                "done" => f.status == Status::Done,
-                _ => true,
-            };
-            let text_ok = needle.is_empty() || f.name.to_lowercase().contains(&needle);
-            state_ok && text_ok
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// The page of the pool the wants screen is showing.
 pub fn wants() -> Rc<Vec<Want>> {
     CURRENT.with(|c| c.borrow().wants.clone())
-}
-
-/// How many wants the pool's current filters match in total, across
-/// every page.
-pub fn want_total() -> usize {
-    CURRENT.with(|c| c.borrow().want_total)
 }
 
 /// One idea by id: the one whose drawer is open, else from the page on
@@ -827,19 +862,170 @@ pub fn tag_names() -> Vec<String> {
     tags().iter().map(|t| t.name.clone()).collect()
 }
 
-/// Pool counts as `(loose, composed, declined)`, project-wide.
-pub fn want_counts() -> (usize, usize, usize) {
-    CURRENT.with(|c| c.borrow().want_counts)
-}
-
-pub fn project_name() -> String {
-    CURRENT.with(|c| c.borrow().project_name.clone())
-}
-
 /// Whether the board has arrived at least once (distinguishes
 /// "connecting" from "the project genuinely has no features yet").
 pub fn loaded() -> bool {
     CURRENT.with(|c| c.borrow().loaded)
+}
+
+// ---------------------------------------------------------------------
+// What the screen subscribes to
+// ---------------------------------------------------------------------
+
+/// The cache as signals: one per kind of thing on screen, written by
+/// [`publish`] after a read lands. Every write is equality-guarded, so
+/// a poll that returns the same board wakes nobody, and a tick on one
+/// feature's feed wakes only the readers of feeds. A view reads these
+/// through a `memo` of the one entity it draws and restyles in place;
+/// nothing keys a `switch` on "something changed somewhere".
+///
+/// Created once in `app()` — a signal made inside a component body is
+/// owned by that body's scope and dies with it, which is why these are
+/// not lazily made in the cache.
+#[derive(Clone, Copy)]
+pub struct Data {
+    pub project: Signal<String>,
+    /// Whether the board has arrived at least once.
+    pub loaded: Signal<bool>,
+    /// The name this console's writes are recorded under.
+    pub you: Signal<String>,
+    /// Every feature, oldest first, with its graph once visited.
+    pub features: Signal<Rc<Vec<Rc<Feature>>>>,
+    pub agents: Signal<Rc<Vec<Rc<AgentRow>>>>,
+    pub attention: Signal<Rc<Vec<Attention>>>,
+    /// The project-wide ledger's newest entries, newest first.
+    pub recent: Signal<Rc<Vec<EventItem>>>,
+    pub tags: Signal<Rc<Vec<TagRow>>>,
+    /// `(loose, composed, declined)`.
+    pub want_counts: Signal<(usize, usize, usize)>,
+    /// Feeds by feature id, as far as each has been read.
+    pub feeds: Signal<Rc<HashMap<String, Rc<Feed>>>>,
+    /// Drawer contents by module id.
+    pub modules: Signal<Rc<HashMap<String, Rc<ModuleDetail>>>>,
+    /// Discussions by subject id.
+    pub threads: Signal<Rc<HashMap<String, Rc<Vec<Comment>>>>>,
+    /// The page of the pool the wants screen is showing.
+    pub wants: Signal<Rc<Vec<Want>>>,
+    pub want_total: Signal<usize>,
+    /// The idea whose drawer is open, whatever page it is on.
+    pub open_want: Signal<Option<Rc<Want>>>,
+    /// Now on the server's clock, as Unix seconds, in steps of
+    /// [`CLOCK_STEP_SECS`]. What every liveness reading subscribes to,
+    /// so a spinner stops by itself when its box has been quiet for
+    /// the window — without a fetch, and without rebuilding anything
+    /// but the ring.
+    pub clock: Signal<i64>,
+}
+
+/// How often [`Data::clock`] moves. Coarse on purpose: a reading only
+/// changes meaning at the twenty-minute window and the minute label.
+pub const CLOCK_STEP_SECS: i64 = 30;
+
+impl Data {
+    pub fn new() -> Self {
+        Self {
+            project: signal("control-center".to_string()),
+            loaded: signal(false),
+            you: signal(String::new()),
+            features: signal(Rc::new(Vec::new())),
+            agents: signal(Rc::new(Vec::new())),
+            attention: signal(Rc::new(Vec::new())),
+            recent: signal(Rc::new(Vec::new())),
+            tags: signal(Rc::new(Vec::new())),
+            want_counts: signal((0, 0, 0)),
+            feeds: signal(Rc::new(HashMap::new())),
+            modules: signal(Rc::new(HashMap::new())),
+            threads: signal(Rc::new(HashMap::new())),
+            wants: signal(Rc::new(Vec::new())),
+            want_total: signal(0),
+            open_want: signal(None),
+            clock: signal(0),
+        }
+    }
+
+    /// Move the clock to the current step. A no-op inside a step.
+    pub fn tick_clock(&self) {
+        self.clock.set(clock_step(now_secs()));
+    }
+
+    /// One feature by index, as a `Copy` closure over the root signal.
+    /// A view's memos and `rx!` bindings call this rather than chaining
+    /// off a memo of their own: a memo's first compute is a staged
+    /// write, and a dependent built in the same turn would read the
+    /// committed (empty) value and compute twice.
+    pub fn feature(self, index: usize) -> impl Fn() -> Option<Rc<Feature>> + Copy {
+        move || self.features.get().get(index).cloned()
+    }
+
+    /// One module by feature and module index — see [`Data::feature`].
+    pub fn module(self, feature: usize, module: usize) -> impl Fn() -> Option<Rc<Module>> + Copy {
+        move || self.features.get().get(feature).and_then(|f| f.modules.get(module).cloned())
+    }
+
+    /// One agent by name — see [`Data::feature`].
+    pub fn agent(self, name: String) -> impl Fn() -> Option<Rc<AgentRow>> + Clone {
+        move || self.agents.get().iter().find(|a| a.id == name).cloned()
+    }
+}
+
+/// `now` rounded down to its [`CLOCK_STEP_SECS`] step.
+pub fn clock_step(now: i64) -> i64 {
+    now - now.rem_euclid(CLOCK_STEP_SECS)
+}
+
+impl Default for Data {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Copy the cache into the signals. Every set compares against what
+/// the signal holds, so only what changed reaches the screen. The
+/// cache borrow is released before the first write: a write stages a
+/// flush, and nothing that runs in it may find the cache borrowed.
+pub fn publish(data: Data) {
+    let (project, loaded, you, features, agents, attention, recent, tags, want_counts) =
+        CURRENT.with(|c| {
+            let cur = c.borrow();
+            (
+                cur.project_name.clone(),
+                cur.loaded,
+                cur.you.clone(),
+                cur.features.clone(),
+                cur.agents.clone(),
+                cur.attention.clone(),
+                cur.recent.clone(),
+                cur.tags.clone(),
+                cur.want_counts,
+            )
+        });
+    let (feeds, modules, threads, wants, want_total, open_want) = CURRENT.with(|c| {
+        let cur = c.borrow();
+        (
+            Rc::new(cur.feeds.clone()),
+            Rc::new(cur.modules.iter().map(|(k, (_, d))| (k.clone(), d.clone())).collect::<HashMap<_, _>>()),
+            Rc::new(cur.threads.iter().map(|(k, (_, t))| (k.clone(), t.clone())).collect::<HashMap<_, _>>()),
+            cur.wants.clone(),
+            cur.want_total,
+            cur.open_want.as_ref().map(|(_, w)| Rc::new(w.clone())),
+        )
+    });
+    data.project.set(project);
+    data.loaded.set(loaded);
+    data.you.set(you);
+    data.features.set(features);
+    data.agents.set(agents);
+    data.attention.set(attention);
+    data.recent.set(recent);
+    data.tags.set(tags);
+    data.want_counts.set(want_counts);
+    data.feeds.set(feeds);
+    data.modules.set(modules);
+    data.threads.set(threads);
+    data.wants.set(wants);
+    data.want_total.set(want_total);
+    data.open_want.set(open_want);
+    data.tick_clock();
 }
 
 // ---------------------------------------------------------------------
@@ -848,13 +1034,20 @@ pub fn loaded() -> bool {
 
 /// Store the board. Returns true when the data changed (callers bump
 /// `Console::rev` to re-render).
-pub fn apply_board(board: api::Board) -> bool {
+pub fn apply_board(mut board: api::Board) -> bool {
     CURRENT.with(|c| {
         let mut cur = c.borrow_mut();
+        // The clock is the one field that differs on every read; it
+        // is taken off the board before the comparison so an idle
+        // poll is a no-op, and kept as an offset for `now_secs`.
+        if board.now > 0 {
+            cur.clock_offset = Some(board.now - local_secs());
+        }
+        board.now = 0;
         let changed = cur.board.as_ref() != Some(&board) || !cur.loaded;
         if changed {
             cur.project_name = board.project.name.clone();
-            cur.agents = Rc::new(board.agents.iter().map(map_agent).collect());
+            cur.agents = Rc::new(board.agents.iter().map(|a| Rc::new(map_agent(a))).collect());
             cur.tags = Rc::new(
                 board
                     .tags
@@ -891,7 +1084,7 @@ pub fn apply_feature(detail: api::FeatureDetail) -> bool {
         }
         let mapped = Detail {
             description: detail.description.clone(),
-            modules: Rc::new(detail.modules.iter().map(|m| map_module(m)).collect()),
+            modules: Rc::new(detail.modules.iter().map(|m| Rc::new(map_module(m))).collect()),
             whitepaper: detail.whitepaper.as_ref().map(|d| Rc::new(map_document(d))),
             sources: Rc::new(
                 detail
@@ -1033,7 +1226,7 @@ pub fn set_open_want(want: api::WantDto) -> bool {
 /// Recompose the feature list from the board and the detail cache.
 fn rebuild(cur: &mut Current) {
     let Some(board) = cur.board.as_ref() else { return };
-    let features: Vec<Feature> = board
+    let features: Vec<Rc<Feature>> = board
         .features
         .iter()
         .map(|r| {
@@ -1071,9 +1264,10 @@ fn rebuild(cur: &mut Current) {
                 open_questions: detail.map(|d| d.open_questions.clone()).unwrap_or_default(),
                 last_word: r.last_word.as_ref().map(map_word),
                 modules_running: r.modules_running.max(0) as usize,
-                quiet_secs: r.quiet_secs,
+                last_heard: r.last_heard,
             }
         })
+        .map(Rc::new)
         .collect();
     let index_of = |id: &str| features.iter().position(|f| f.id == id);
     let mut attention: Vec<Attention> = board
@@ -1248,7 +1442,7 @@ fn map_module(m: &api::ModuleDto) -> Module {
         block,
         open_questions: m.open_questions.iter().map(map_question).collect(),
         last_word: m.last_word.as_ref().map(map_word),
-        quiet_secs: m.quiet_secs,
+        last_heard: m.last_heard,
         tasks: m
             .tasks
             .iter()
@@ -1350,7 +1544,7 @@ fn map_agent(a: &api::AgentDto) -> AgentRow {
         },
         health: a.health.as_ref().map(map_health),
         last_seen: a.last_seen.clone(),
-        quiet_secs: a.quiet_secs,
+        last_heard: a.last_heard,
         last_word: a.last_word.as_ref().map(map_word),
     }
 }

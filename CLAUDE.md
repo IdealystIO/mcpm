@@ -250,7 +250,7 @@ the console; keep one tab, or use headless Chrome.
   read, fetched when they are on screen. The scheduler is `start_sync` in `src/app.rs`:
   it computes what the screen needs each frame, what a tick has made
   stale, and issues the difference. A view that spawns its own fetch
-  breaks that — a rev bump rebuilds it, it fetches again, and the
+  breaks that — a data change rebuilds it, it fetches again, and the
   console quietly doubles its traffic. And nothing may grow back into
   the board: it was once the whole project (every tree, every document
   body, 500 events per feature, on every tick), and it did not scale.
@@ -327,10 +327,39 @@ the console; keep one tab, or use headless Chrome.
   and used by both the editor's highlighting and the server function
   that writes. Never add a second parser — drift between them means the
   UI colors something different from what it stores.
-- **Keep the capture composer outside any `switch` keyed on
-  `Console.rev`.** A background poll would rebuild the text node and
-  steal focus mid-sentence. Its buffers live on `Console` for the same
-  reason. The comment composer's buffers (`comment_*`) are there too,
+- **The console updates in place; nothing keys a `switch` on "the
+  data changed".** A read that lands goes through `model::publish`
+  into the signals on `Console::data` (one per kind of thing on
+  screen, every write equality-guarded), and a view reads the one
+  entity it draws through `Data::feature` / `Data::module` /
+  `Data::agent` inside `memo`, `rx!` and style closures — so a poll
+  moves a percentage, a tick, a word and a ring without rebuilding a
+  node, and a ring that is turning keeps turning. A `switch` keys on
+  SHAPE only: which feature and view are showing, which rows a list
+  has, which modules and edges a graph has. There used to be one
+  global revision counter that every screen keyed on; every event
+  and every 30-second poll remounted the whole tree, which restarted
+  the spinners, reset every scroller and flickered. Do not bring it
+  back for a new screen: key on the data the screen draws, and read
+  the rest live. Three traps on the way:
+  - `if let` inside `ui!` is a plain, build-time branch. `if` and
+    `match` are reactive when their condition reads a signal; an
+    `if let Some(x) = m()` is not, and the branch silently never
+    updates. Write `match m() { Some(x) => { … } None => {} }`.
+  - Do not chain a memo off a memo built in the same body. A memo's
+    first compute is a staged write, so a dependent memo or `rx!`
+    built in the same turn reads the committed (empty) value,
+    computes twice, and the debug runtime warns `staged-read` for
+    every line. Read the root signal through the `Data` accessors,
+    which are `Copy` closures, and keep `memo` for the change-gated
+    keys — `live`, `status`, a switch scrutinee.
+  - Liveness is measured against `Data::clock`, the server's time in
+    30-second steps, and the wire carries `last_heard` stamps, never
+    a "seconds since" — a duration would make every poll a change.
+- **Keep the capture composer outside any `switch` keyed on data
+  that a poll can move.** A background poll would rebuild the text
+  node and steal focus mid-sentence. Its buffers live on `Console` for
+  the same reason. The comment composer's buffers (`comment_*`) are there too,
   and are AIMED at one subject by `start_sync` (`aim_composer`) rather
   than by the surface that renders them: three surfaces can show a
   composer (feature tab, module drawer, want drawer), all bound to the

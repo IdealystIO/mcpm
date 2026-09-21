@@ -14,13 +14,15 @@ use std::collections::HashMap;
 
 use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Typography};
 use runtime_core::{
-    component, signal, stylesheet, ui, AlignItems, Element, FlexDirection, IdealystSchema,
-    IntoElement, Length, Position, Signal, StyleApplication, StyleRules, Tokenized, VariantEnum,
+    component, memo, signal, stylesheet, switch, ui, AlignItems, Element, FlexDirection,
+    IdealystSchema, IntoElement, Length, Memo, Position, Signal, StyleApplication, StyleRules,
+    Tokenized, VariantEnum,
 };
+use std::rc::Rc;
 
 use crate::components::bits::Hint;
 use crate::components::module_card::{ModuleCard, CARD_H, CARD_W};
-use crate::model::{features, Module, Status};
+use crate::model::{Module, Status};
 use crate::state::Console;
 
 /// Gap between columns, in px. Wide enough to hold the vertical run of
@@ -49,26 +51,65 @@ pub struct GraphViewProps {
 }
 
 /// The module graph for one feature.
+///
+/// Laid out once per SHAPE — the set of modules, their prerequisites
+/// and their columns — and never for a poll: a card reads its module
+/// live, and an edge reads the two statuses that colour it live, so
+/// a task landing on a box moves a tick and a module finishing turns
+/// its edges green with nothing relaid and both scrollers where they
+/// were. Adding a module or a dependency is what draws a new graph.
 #[component]
 pub fn GraphView(props: &GraphViewProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let fi = props.feature;
-    let feats = features();
-    let f = &feats[fi];
-    let count = f.modules.len();
-    if count == 0 {
-        // Two different blanks: the graph has not been read yet, or it
-        // has and there is nothing in it.
-        let word = if f.detail_loaded { "No modules planned." } else { "Loading the graph\u{2026}" };
-        return ui! {
-            view(style = GraphBlank()) {
-                Typography(content = word, kind = typography_kind::BodySm, muted = true)
+    let f = data.feature(fi);
+    // The statuses every edge colours itself from, by module index.
+    let statuses = memo(move || {
+        f().map(|f| f.modules.iter().map(|m| m.status).collect::<Vec<Status>>()).unwrap_or_default()
+    });
+    switch(
+        move || {
+            f()
+                .map(|f| {
+                    let shape: Vec<(String, Vec<String>, usize)> = f
+                        .modules
+                        .iter()
+                        .map(|m| (m.id.clone(), m.depends_on.clone(), m.depth))
+                        .collect();
+                    (shape, f.detail_loaded)
+                })
+                .unwrap_or_default()
+        },
+        move |(shape, detail_loaded): &(Vec<(String, Vec<String>, usize)>, bool)| {
+            if shape.is_empty() {
+                // Two different blanks: the graph has not been read
+                // yet, or it has and there is nothing in it.
+                let word = if *detail_loaded { "No modules planned." } else { "Loading the graph\u{2026}" };
+                return ui! {
+                    view(style = GraphBlank()) {
+                        Typography(content = word, kind = typography_kind::BodySm, muted = true)
+                    }
+                };
             }
-        };
-    }
+            // The layout is taken from the modules as they are now;
+            // only their shape is keyed, and the shape is what the
+            // layout reads.
+            let modules = f().map(|f| f.modules.clone()).unwrap_or_default();
+            graph_body(console, fi, &modules, statuses)
+        },
+    )
+}
 
-    let layout = GraphLayout::compute(&f.modules);
-    let segments = edges(&f.modules, &layout);
+/// One laid-out graph: edges under, cards over, both scrollers.
+fn graph_body(
+    console: Console,
+    fi: usize,
+    modules: &[Rc<Module>],
+    statuses: Memo<Vec<Status>>,
+) -> Element {
+    let layout = GraphLayout::compute(modules);
+    let segments = edges(modules, &layout);
     let cards = layout.cards();
     // What the pointer is on: one dependency, by edge id, or one
     // module, by index. Read by every segment's style closure, so a
@@ -119,8 +160,8 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                             for seg in segments, key = seg.id {
                                 EdgeSegment(
                                     x = seg.x, y = seg.y, w = seg.w, h = seg.h,
-                                    tone = seg.tone, edge = seg.edge, from = seg.from, to = seg.to,
-                                    hovered = hovered,
+                                    edge = seg.edge, from = seg.from, to = seg.to,
+                                    hovered = hovered, statuses = statuses,
                                 )
                             }
                             for card in cards, key = card.module {
@@ -148,8 +189,6 @@ pub struct EdgeSegmentProps {
     pub w: f32,
     /// Height, px.
     pub h: f32,
-    /// Colour arm.
-    pub tone: EdgeLineTone,
     /// The dependency this piece belongs to.
     pub edge: usize,
     /// The prerequisite module of that dependency.
@@ -158,6 +197,9 @@ pub struct EdgeSegmentProps {
     pub to: usize,
     /// What the graph's pointer is on, shared by every segment and card.
     pub hovered: Signal<Option<Hover>>,
+    /// Every module's status, by index: what the piece's colour is
+    /// read from, live.
+    pub statuses: Memo<Vec<Status>>,
 }
 
 /// What the pointer is on in the graph. A segment is lit when the
@@ -177,11 +219,11 @@ impl Default for EdgeSegmentProps {
             y: 0.0,
             w: 0.0,
             h: 0.0,
-            tone: EdgeLineTone::default(),
             edge: 0,
             from: 0,
             to: 0,
             hovered: signal(None),
+            statuses: memo(Vec::new),
         }
     }
 }
@@ -198,10 +240,10 @@ pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
     let zone = abs_rules(props.x - HIT, props.y - HIT, props.w + HIT * 2.0, props.h + HIT * 2.0);
     let mut inner = abs_rules(HIT, HIT, props.w, props.h);
     inner.flex_direction = Some(FlexDirection::Column);
-    let tone = props.tone;
     let edge = props.edge;
     let (from, to) = (props.from, props.to);
     let hovered = props.hovered;
+    let statuses = props.statuses;
     let line = runtime_core::view(Vec::new())
         .with_style(move || {
             let lit = match hovered.get() {
@@ -210,8 +252,10 @@ pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
                 Some(Hover::Module(m)) if m == from || m == to => "on",
                 Some(_) => "off",
             };
+            let statuses = statuses.get();
+            let at = |i: usize| statuses.get(i).copied().unwrap_or_default();
             StyleApplication::new(edge_line_style())
-                .with("tone", tone.as_variant_str().to_string())
+                .with("tone", edge_tone(at(from), at(to)).as_variant_str().to_string())
                 .with("lit", lit.to_string())
         })
         .into_element();
@@ -363,6 +407,19 @@ pub struct GraphLayout {
     height: f32,
 }
 
+/// An edge's colour from its two ends: green when both are done,
+/// blue when the prerequisite is done and the dependent may proceed,
+/// red while the prerequisite itself is still open.
+pub fn edge_tone(prerequisite: Status, dependent: Status) -> EdgeLineTone {
+    if prerequisite != Status::Done {
+        EdgeLineTone::Blocked
+    } else if dependent == Status::Done {
+        EdgeLineTone::Done
+    } else {
+        EdgeLineTone::Open
+    }
+}
+
 /// Height of a pass-through row: room for a line and its margins.
 const PASS_H: f32 = 12.0;
 /// How many barycentre sweeps order the columns: down, up, down.
@@ -375,7 +432,7 @@ impl GraphLayout {
     /// then right, then left again) so chains run straight, fan-outs
     /// sit beside their source, and lines cross as little as a layered
     /// drawing lets them. Modules arrive topologically sorted.
-    pub fn compute(modules: &[Module]) -> Self {
+    pub fn compute(modules: &[Rc<Module>]) -> Self {
         let index: HashMap<&str, usize> = modules
             .iter()
             .enumerate()
@@ -401,13 +458,7 @@ impl GraphLayout {
                 }
                 let edge = tones.len();
                 ends.push((si, ti));
-                tones.push(if modules[si].status != Status::Done {
-                    EdgeLineTone::Blocked
-                } else if m.status == Status::Done {
-                    EdgeLineTone::Done
-                } else {
-                    EdgeLineTone::Open
-                });
+                tones.push(edge_tone(modules[si].status, m.status));
                 let mut from = si;
                 for col in sc + 1..tc {
                     let d = *buses.entry((si, col)).or_insert_with(|| {
@@ -585,7 +636,7 @@ fn lane_order(trunks: &mut Vec<Trunk>) {
 /// Tone follows the prerequisite: green once it is done (the gate is
 /// satisfied on this edge), amber while it is open; muted once the
 /// dependent itself is done.
-pub fn edges(_modules: &[Module], layout: &GraphLayout) -> Vec<Segment> {
+pub fn edges(_modules: &[Rc<Module>], layout: &GraphLayout) -> Vec<Segment> {
     let half = LINE / 2.0;
     let mut out: Vec<Segment> = Vec::new();
     let push = |x: f32, y: f32, w: f32, h: f32, edge: usize, out: &mut Vec<Segment>| {
@@ -725,8 +776,8 @@ mod tests {
     use super::*;
     use crate::model::{Module, Status};
 
-    fn module(id: &str, depth: usize, deps: &[&str], status: Status) -> Module {
-        Module {
+    fn module(id: &str, depth: usize, deps: &[&str], status: Status) -> Rc<Module> {
+        Rc::new(Module {
             id: id.into(),
             name: id.into(),
             description: String::new(),
@@ -741,9 +792,9 @@ mod tests {
             block: None,
             open_questions: Vec::new(),
             last_word: None,
-            quiet_secs: -1,
+            last_heard: None,
             tasks: Vec::new(),
-        }
+        })
     }
 
     // The worked scenario: a chain that fans out at the end. The two
@@ -876,7 +927,7 @@ mod tests {
         assert_eq!(segs.len(), 19);
     }
 
-    fn assert_no_segment_crosses_a_card(modules: &[Module], layout: &GraphLayout, segs: &[Segment]) {
+    fn assert_no_segment_crosses_a_card(modules: &[Rc<Module>], layout: &GraphLayout, segs: &[Segment]) {
         for card in layout.cards() {
             let (l, t, r, b) = (card.x, card.y, card.x + CARD_W, card.y + CARD_H);
             for s in segs {

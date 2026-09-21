@@ -58,13 +58,13 @@ pub fn KnowledgeView(props: &KnowledgeViewProps) -> Element {
     let page: Signal<api::KnowledgePage> = signal(api::KnowledgePage::default());
     let loaded = signal(false);
 
-    // One fetch per distinct query. Keyed on `rev` too, so an agent
-    // committing a memory refreshes the screen the same way it
-    // refreshes every other view.
+    // One fetch per distinct query. Keyed on `know_rev` too, so an
+    // agent committing a memory refreshes the screen — and nothing
+    // else that lands does.
     let loader = switch(
         move || {
             (
-                console.rev.get(),
+                console.know_rev.get(),
                 console.know_query.get(),
                 console.know_kinds.get(),
                 console.know_tags.get(),
@@ -232,7 +232,7 @@ pub fn Toolbar(props: &ToolbarProps) -> Element {
     );
 
     let tag_row = switch(
-        move || (console.rev.get(), console.know_tags.get()),
+        move || (console.know_rev.get(), console.know_tags.get()),
         move |state: &(u64, Vec<String>)| {
             let (_rev, active) = state.clone();
             let count = crate::model::tags().len();
@@ -848,7 +848,7 @@ pub fn KnowledgeDrawer(props: &KnowledgeDrawerProps) -> Element {
     let loaded = signal(false);
 
     let loader = switch(
-        move || (id.clone(), console.rev.get()),
+        move || (id.clone(), console.know_rev.get()),
         move |state: &(String, u64)| {
             let (id, _rev) = state.clone();
             spawn_then(api::knowledge_detail(id), move |result| {

@@ -340,9 +340,9 @@ pub struct TagRailProps {
 pub fn TagRail(props: &TagRailProps) -> Element {
     let console = props.console;
     switch(
-        move || console.rev.get(),
-        move |&_rev: &u64| {
-            let count = model::tags().len();
+        move || console.data.tags.get(),
+        move |tags: &std::rc::Rc<Vec<model::TagRow>>| {
+            let count = tags.len();
             if count == 0 {
                 return ui! { view {} };
             }

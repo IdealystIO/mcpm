@@ -3,12 +3,12 @@
 
 use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Typography};
 use runtime_core::{
-    component, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
+    component, memo, rx, stylesheet, ui, AlignItems, Element, FlexDirection, FontWeight,
     IdealystSchema, IntoElement, StyleApplication,
 };
 
 use crate::components::bits::{Mono, StatusBadge, StatusDot, Ticks, tappable};
-use crate::model::{features, Readiness, Status};
+use crate::model::{AgentTone, Readiness, Status};
 use crate::state::Console;
 use crate::styles::{MonoTextSize, MonoTextTone};
 
@@ -42,56 +42,60 @@ pub struct ModuleCardProps {
 /// prerequisites — green when every one is done, amber while it waits
 /// (with the names it waits on underneath), muted once it is done
 /// itself.
+///
+/// Built once per graph layout and never for a poll: every value on
+/// it is read live off the module's signal, so a task ticked on a
+/// box moves one tick here, and the ring keeps turning through it.
 #[component]
 pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let (fi, mi) = (props.feature, props.module);
-    let feats = features();
-    let f = &feats[fi];
-    let m = &f.modules[mi];
-
-    let name = m.name.clone();
-    let status = m.status;
-    let live = m.live();
+    let m = data.module(fi, mi);
+    let status = memo(move || m().map(|m| m.status).unwrap_or_default());
+    let live = memo(move || {
+        let now = data.clock.get();
+        m().is_some_and(|m| m.live_at(now))
+    });
+    let name = rx!(m().map(|m| m.name.clone()).unwrap_or_default());
     // The agent slot says who holds the card — and, once the holder
     // has gone quiet, for how long: that is the one fact that tells a
     // parked box from a working one, and the spinner's absence alone
     // would only whisper it.
-    let (agent, agent_tone) = match m.quiet_for() {
-        Some(quiet) => (format!("{} \u{b7} quiet {quiet}", m.agent), MonoTextTone::Warning),
-        None => (
-            m.agent.clone(),
-            match m.agent.as_str() {
-                "ready" => MonoTextTone::Success,
-                "waiting" => MonoTextTone::Warning,
-                _ => MonoTextTone::Muted,
-            },
-        ),
+    let agent_line = move || {
+        let now = data.clock.get();
+        m().map(|m| m.agent_line_at(now)).unwrap_or_default()
     };
-    let task_label = m.task_label();
-    let ticks: Vec<bool> = m.tasks.iter().map(|t| t.done).collect();
-    let readiness = m.readiness();
-    let waits = (readiness == Readiness::Waiting)
-        .then(|| clip(&format!("waits on {}", f.module_names(&m.waiting_on)), WAITS_CHARS));
+    let agent = rx!(agent_line().0);
+    let agent_tone = rx!(match agent_line().1 {
+        AgentTone::Quiet | AgentTone::Waiting => MonoTextTone::Warning,
+        AgentTone::Ready => MonoTextTone::Success,
+        AgentTone::Plain => MonoTextTone::Muted,
+    });
+    let task_label = rx!(m().map(|m| m.task_label()).unwrap_or_default());
+    let ticks = rx!(m().map(|m| m.tasks.iter().map(|t| t.done).collect::<Vec<bool>>()).unwrap_or_default());
     // The one line under the ticks is the "waits on" list while the
     // gate is shut and the worker's last word once it is open: a card
     // that is waiting has nobody speaking on it, and a card that is
     // moving has nothing to wait for.
-    let word = match (&waits, &m.last_word) {
-        (None, Some(w)) if status != Status::Done => {
-            Some(clip(&format!("\u{201c}{}\u{201d}", w.text), WAITS_CHARS))
+    let waits = move || {
+        let feats = data.features.get();
+        let f = feats.get(fi)?;
+        let m = f.modules.get(mi)?;
+        (m.readiness() == Readiness::Waiting)
+            .then(|| clip(&format!("waits on {}", f.module_names(&m.waiting_on)), WAITS_CHARS))
+    };
+    let word = move || {
+        let m = m()?;
+        match (waits(), &m.last_word) {
+            (None, Some(w)) if m.status != Status::Done => {
+                Some(clip(&format!("\u{201c}{}\u{201d}", w.text), WAITS_CHARS))
+            }
+            _ => None,
         }
-        _ => None,
     };
-    let ready_arm = match readiness {
-        Readiness::Open => "open",
-        Readiness::Waiting => "waiting",
-        Readiness::Done => "done",
-    };
-    let dim = matches!(status, Status::Blocked | Status::Queued);
     let selection = console.selected;
-    let id = m.id.clone();
-    let press_id = id.clone();
+    let id = move || m().map(|m| m.id.clone()).unwrap_or_default();
 
     let inner: Element = ui! {
         view(style = ModuleInner()) {
@@ -116,11 +120,17 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
                 Mono(content = task_label, size = MonoTextSize::Overline)
             }
             Ticks(ticks = ticks)
-            if let Some(line) = waits {
-                text(style = WaitsLine()) { line }
+            match waits() {
+                Some(line) => {
+                    text(style = WaitsLine()) { line.clone() }
+                }
+                None => {}
             }
-            if let Some(line) = word {
-                text(style = WordLine()) { line }
+            match word() {
+                Some(line) => {
+                    text(style = WordLine()) { line.clone() }
+                }
+                None => {}
             }
         }
     };
@@ -128,10 +138,14 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     // The style is a CLOSURE and not a value: selecting a module writes
     // `Console::selected`, and reading it here means the highlight
     // lands on this one node instead of rebuilding the graph around it
-    // — which is what lets the border transition play at all.
-    tappable(vec![inner], move || console.open_module(&press_id))
+    // — which is what lets the border transition play at all. The
+    // status and readiness arms are read the same way.
+    tappable(vec![inner], move || console.open_module(&id()))
         .with_style(move || {
-            let accent = if selection.get().as_deref() == Some(id.as_str()) {
+            let m = m();
+            let status = m.as_ref().map(|m| m.status).unwrap_or_default();
+            let readiness = m.as_ref().map(|m| m.readiness()).unwrap_or(Readiness::Open);
+            let accent = if m.as_ref().is_some_and(|m| selection.get().as_deref() == Some(m.id.as_str())) {
                 "selected"
             } else {
                 match status {
@@ -140,6 +154,12 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
                     _ => "plain",
                 }
             };
+            let ready_arm = match readiness {
+                Readiness::Open => "open",
+                Readiness::Waiting => "waiting",
+                Readiness::Done => "done",
+            };
+            let dim = matches!(status, Status::Blocked | Status::Queued);
             StyleApplication::new(module_box_style())
                 .with("accent", accent.to_string())
                 .with("ready", ready_arm.to_string())

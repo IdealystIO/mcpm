@@ -28,7 +28,7 @@ use runtime_core::{
 
 use crate::components::bits::{Pager, StatusDot, tappable};
 use crate::components::composer::Composer;
-use crate::model::{want_counts, want_total, wants, WantState};
+use crate::model::{wants, WantState};
 use crate::state::Console;
 use crate::styles::SectionLabel;
 
@@ -60,10 +60,10 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
     let console = props.console;
     let to_capture: Rc<dyn Fn()> = Rc::new(move || console.show_capture());
 
+    let data = console.data;
     let head = switch(
-        move || console.rev.get(),
-        move |_rev: &u64| {
-            let (loose, composed, declined) = want_counts();
+        move || data.want_counts.get(),
+        move |&(loose, composed, declined): &(usize, usize, usize)| {
             ui! {
                 view(style = StatRow()) {
                     PoolStat(value = format!("{loose}"), label = "loose")
@@ -74,14 +74,15 @@ pub fn WantsView(props: &WantsViewProps) -> Element {
         },
     );
 
+    // Keyed on the page's contents: remade when the server sends a
+    // different page, and not for anything else that lands.
     let table = switch(
-        move || (console.rev.get(), console.pool_page.get()),
-        move |state: &(u64, usize)| {
-            let (_rev, page) = *state;
+        move || (data.wants.get(), data.want_total.get(), console.pool_page.get()),
+        move |state: &(Rc<Vec<crate::model::Want>>, usize, usize)| {
+            let (_, total, page) = state.clone();
             // The page on screen is whatever the server sent for the
             // filters — paged there, against the text index, because
             // the pool grows without bound (see `api::search_wants`).
-            let total = want_total();
             let pages = total.div_ceil(PAGE_SIZE).max(1);
             // A filter change resets the page, but a tick can shrink
             // the result set under a page that is already showing.
@@ -311,9 +312,9 @@ pub fn FilterMenu(props: &FilterMenuProps) -> Element {
             let dismiss: Rc<dyn Fn()> = Rc::new(move || console.pool_filter_open.set(false));
             let on_tag_query: Rc<dyn Fn(String)> = Rc::new(move |t| console.pool_tag_query.set(t));
             let tag_rows = switch(
-                move || (console.pool_tag_query.get(), console.pool_tags.get(), console.rev.get()),
-                move |state: &(String, Vec<String>, u64)| {
-                    let (query, active, _rev) = state.clone();
+                move || (console.pool_tag_query.get(), console.pool_tags.get(), console.data.tags.get()),
+                move |state: &(String, Vec<String>, Rc<Vec<crate::model::TagRow>>)| {
+                    let (query, active, _tags) = state.clone();
                     let needle = query.trim().to_lowercase();
                     let tags = crate::model::tags();
                     let matched: Vec<usize> = tags

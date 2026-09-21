@@ -12,12 +12,12 @@ use std::rc::Rc;
 use idea_ui::{size, typography_kind, variant, Button, Field, IdeaThemeRef, Progress, ProgressCap,
     SegmentOption, SegmentedControl, Spacer, Table, TableCell, TableRow, Typography};
 use runtime_core::{
-    component, rx, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
+    component, memo, rx, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
     FontWeight, IdealystSchema, JustifyContent,
 };
 
 use crate::components::bits::{Mono, Pager, StatusBadge, StatusDot};
-use crate::model::{completed_count, features, filter_features, Status};
+use crate::model::{filter_features_of, Status};
 use crate::state::Console;
 use crate::styles::{status_tone, SectionLabel};
 
@@ -37,13 +37,18 @@ pub struct FeaturesViewProps {
 pub fn FeaturesView(props: &FeaturesViewProps) -> Element {
     let console = props.console;
 
+    let data = console.data;
+    // Three counts, remade when one of them moves.
     let head = switch(
-        move || console.rev.get(),
-        move |_rev: &u64| {
-            let all = features();
-            let total = all.len();
-            let done = completed_count();
-            let running = all.iter().filter(|f| f.status == Status::Running).count();
+        move || {
+            let all = data.features.get();
+            (
+                all.len(),
+                all.iter().filter(|f| f.status == Status::Running).count(),
+                all.iter().filter(|f| f.status == Status::Done).count(),
+            )
+        },
+        move |&(total, running, done): &(usize, usize, usize)| {
             ui! {
                 view(style = StatRow()) {
                     HeadStat(value = format!("{total}"), label = "features")
@@ -54,18 +59,18 @@ pub fn FeaturesView(props: &FeaturesViewProps) -> Element {
         },
     );
 
+    // Keyed on the rows the filters select, not on the data in them:
+    // a row reads its own feature live, so a poll that moves a count
+    // leaves the table standing.
     let table = switch(
         move || {
-            (
-                console.rev.get(),
-                console.feature_query.get(),
-                console.feature_status.get(),
-                console.feature_page.get(),
-            )
+            let query = console.feature_query.get();
+            let status = console.feature_status.get();
+            let matched = filter_features_of(&data.features.get(), &query, &status);
+            (matched, console.feature_page.get())
         },
-        move |state: &(u64, String, String, usize)| {
-            let (_rev, query, status, page) = state.clone();
-            let matched = filter_features(&query, &status);
+        move |state: &(Vec<usize>, usize)| {
+            let (matched, page) = state.clone();
             let total = matched.len();
             let pages = total.div_ceil(PAGE_SIZE).max(1);
             // A filter change resets the page, but a poll can shrink the
@@ -215,22 +220,32 @@ pub struct FeatureRowProps {
 #[component]
 pub fn FeatureRow(props: &FeatureRowProps) -> Element {
     let console = props.console;
+    let data = console.data;
     let index = props.feature;
-    let feats = features();
-    let f = &feats[index];
-    let name = f.name.clone();
-    let status = f.status;
-    let live = f.live();
-    let fraction = f.fraction();
-    let pct = f.pct_label();
-    let agent = f.agent.clone();
-    let (mods_done, mods_total) = f.module_count();
-    let modules = format!("{mods_done}/{mods_total} modules");
+    let f = data.feature(index);
+    let status = memo(move || f().map(|f| f.status).unwrap_or_default());
+    let live = memo(move || {
+        let now = data.clock.get();
+        f().is_some_and(|f| f.live_at(now))
+    });
+    let name = rx!(f().map(|f| f.name.clone()).unwrap_or_default());
+    let fraction = rx!(f().map(|f| f.fraction()).unwrap_or(0.0));
+    let tone = rx!(status_tone(status.get()));
+    let pct = rx!(f().map(|f| f.pct_label()).unwrap_or_default());
+    let agent = rx!(f().map(|f| f.agent.clone()).unwrap_or_default());
+    let modules = rx!(f()
+        .map(|f| {
+            let (done, total) = f.module_count();
+            format!("{done}/{total} modules")
+        })
+        .unwrap_or_default());
     let on_row_click: Rc<dyn Fn()> = Rc::new(move || console.select_feature(index));
 
     ui! {
         TableRow(on_row_click = Some(on_row_click)) {
-            TableCell(text = Some(name))
+            TableCell {
+                Typography(content = name, kind = typography_kind::BodySm)
+            }
             TableCell {
                 view(style = StatusCell()) {
                     StatusDot(status = status, live = live)
@@ -239,7 +254,7 @@ pub fn FeatureRow(props: &FeatureRowProps) -> Element {
             }
             TableCell {
                 view(style = ProgressCell()) {
-                    Progress(value = fraction, tone = status_tone(status), cap = ProgressCap::Rounded)
+                    Progress(value = fraction, tone = tone, cap = ProgressCap::Rounded)
                     view(style = ProgressLabels()) {
                         Mono(content = modules)
                         Spacer()
@@ -247,7 +262,9 @@ pub fn FeatureRow(props: &FeatureRowProps) -> Element {
                     }
                 }
             }
-            TableCell(text = Some(agent))
+            TableCell {
+                Typography(content = agent, kind = typography_kind::BodySm)
+            }
         }
     }
 }
