@@ -70,10 +70,10 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
     let layout = GraphLayout::compute(&f.modules);
     let segments = edges(&f.modules, &layout);
     let cards = layout.cards();
-    // The dependency under the pointer, by edge id. Read by every
-    // segment's style closure, so a hover restyles lines in place and
-    // rebuilds nothing (rule 25).
-    let hovered: Signal<Option<usize>> = signal(None);
+    // What the pointer is on: one dependency, by edge id, or one
+    // module, by index. Read by every segment's style closure, so a
+    // hover restyles lines in place and rebuilds nothing (rule 25).
+    let hovered: Signal<Option<Hover>> = signal(None);
     let mut canvas = StyleRules::default();
     canvas.position = Some(Position::Relative);
     canvas.width = Some(Tokenized::Literal(Length::Px(layout.width())));
@@ -103,7 +103,8 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                             Green edge: both ends done. Blue: the prerequisite is done, the \
                             dependent may proceed. Red: the prerequisite is still open.\n\
                             A card's left edge is green when it can be claimed, amber while it waits.\n\
-                            Hover a line to follow one dependency.",
+                            Hover a line to follow one dependency, or a card to see \
+                            everything in and out of it.",
                 )
             }
             // Two axes, two scrollers (rule 23). The horizontal one
@@ -118,11 +119,15 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                             for seg in segments, key = seg.id {
                                 EdgeSegment(
                                     x = seg.x, y = seg.y, w = seg.w, h = seg.h,
-                                    tone = seg.tone, edge = seg.edge, hovered = hovered,
+                                    tone = seg.tone, edge = seg.edge, from = seg.from, to = seg.to,
+                                    hovered = hovered,
                                 )
                             }
                             for card in cards, key = card.module {
-                                GraphCard(console = console, feature = fi, x = card.x, y = card.y, module = card.module)
+                                GraphCard(
+                                    console = console, feature = fi, x = card.x, y = card.y,
+                                    module = card.module, hovered = hovered,
+                                )
                             }
                         }
                     }
@@ -147,8 +152,22 @@ pub struct EdgeSegmentProps {
     pub tone: EdgeLineTone,
     /// The dependency this piece belongs to.
     pub edge: usize,
-    /// The graph's hovered dependency, shared by every segment.
-    pub hovered: Signal<Option<usize>>,
+    /// The prerequisite module of that dependency.
+    pub from: usize,
+    /// The dependent module of that dependency.
+    pub to: usize,
+    /// What the graph's pointer is on, shared by every segment and card.
+    pub hovered: Signal<Option<Hover>>,
+}
+
+/// What the pointer is on in the graph. A segment is lit when the
+/// named edge is its own, or the named module is at either end of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hover {
+    /// One dependency, by edge id.
+    Edge(usize),
+    /// One module, by index: every dependency in or out of it.
+    Module(usize),
 }
 
 impl Default for EdgeSegmentProps {
@@ -160,6 +179,8 @@ impl Default for EdgeSegmentProps {
             h: 0.0,
             tone: EdgeLineTone::default(),
             edge: 0,
+            from: 0,
+            to: 0,
             hovered: signal(None),
         }
     }
@@ -179,12 +200,14 @@ pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
     inner.flex_direction = Some(FlexDirection::Column);
     let tone = props.tone;
     let edge = props.edge;
+    let (from, to) = (props.from, props.to);
     let hovered = props.hovered;
     let line = runtime_core::view(Vec::new())
         .with_style(move || {
             let lit = match hovered.get() {
                 None => "plain",
-                Some(h) if h == edge => "on",
+                Some(Hover::Edge(h)) if h == edge => "on",
+                Some(Hover::Module(m)) if m == from || m == to => "on",
                 Some(_) => "off",
             };
             StyleApplication::new(edge_line_style())
@@ -204,8 +227,8 @@ pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
         .with_style(std::rc::Rc::new(runtime_core::StyleSheet::r#static(zone)))
         .on_hover(move |entering| {
             if entering {
-                hovered.set(Some(edge));
-            } else if hovered.get() == Some(edge) {
+                hovered.set(Some(Hover::Edge(edge)));
+            } else if hovered.get() == Some(Hover::Edge(edge)) {
                 hovered.set(None);
             }
         })
@@ -213,7 +236,7 @@ pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
 }
 
 /// Props for [`GraphCard`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct GraphCardProps {
     /// Console state handles.
     pub console: Console,
@@ -225,21 +248,51 @@ pub struct GraphCardProps {
     pub x: f32,
     /// Canvas-relative top edge, px.
     pub y: f32,
+    /// What the graph's pointer is on, shared by every segment and card.
+    pub hovered: Signal<Option<Hover>>,
 }
 
-/// A module card at its slot on the canvas.
+impl Default for GraphCardProps {
+    fn default() -> Self {
+        Self {
+            console: Console::default(),
+            feature: 0,
+            module: 0,
+            x: 0.0,
+            y: 0.0,
+            hovered: signal(None),
+        }
+    }
+}
+
+/// A module card at its slot on the canvas. Hovering it names the
+/// module, so every dependency in or out of it stays lit while the
+/// rest of the graph steps back.
 #[component]
 pub fn GraphCard(props: &GraphCardProps) -> Element {
     let console = props.console;
     let (fi, mi) = (props.feature, props.module);
+    let hovered = props.hovered;
     let mut rules = abs_rules(props.x, props.y, CARD_W, CARD_H);
     // A flex column, so the card inside stretches to the slot.
     rules.flex_direction = Some(FlexDirection::Column);
-    ui! {
-        view(style = rules) {
-            ModuleCard(console = console, feature = fi, module = mi)
-        }
-    }
+    let card = ui! {
+        ModuleCard(console = console, feature = fi, module = mi)
+    };
+    // LEFT HAND-BUILT: `on_hover` is a builder-only channel on `view`
+    // (the `ui!` tag form has no prop for it). Leaving clears the name
+    // only if it is still ours — the pointer may already be on a line.
+    // idealyst-lint-disable-next-line prefer-ui-macro
+    runtime_core::view(vec![card])
+        .with_style(std::rc::Rc::new(runtime_core::StyleSheet::r#static(rules)))
+        .on_hover(move |entering| {
+            if entering {
+                hovered.set(Some(Hover::Module(mi)));
+            } else if hovered.get() == Some(Hover::Module(mi)) {
+                hovered.set(None);
+            }
+        })
+        .into_element()
 }
 
 /// A module's slot on the canvas, in px.
@@ -305,6 +358,8 @@ pub struct GraphLayout {
     links: Vec<Link>,
     /// Tone per original edge, indexed by [`Link::edge`].
     tones: Vec<EdgeLineTone>,
+    /// (prerequisite, dependent) module per original edge, same index.
+    ends: Vec<(usize, usize)>,
     height: f32,
 }
 
@@ -334,6 +389,7 @@ impl GraphLayout {
             .collect();
         let mut links: Vec<Link> = Vec::new();
         let mut tones: Vec<EdgeLineTone> = Vec::new();
+        let mut ends: Vec<(usize, usize)> = Vec::new();
         // The bus rows: one pass-through per (source, column crossed).
         let mut buses: HashMap<(usize, usize), usize> = HashMap::new();
         for (ti, m) in modules.iter().enumerate() {
@@ -344,6 +400,7 @@ impl GraphLayout {
                     continue;
                 }
                 let edge = tones.len();
+                ends.push((si, ti));
                 tones.push(if modules[si].status != Status::Done {
                     EdgeLineTone::Blocked
                 } else if m.status == Status::Done {
@@ -418,7 +475,7 @@ impl GraphLayout {
             height = height.max(y - ROW_GAP + PAD);
         }
         let slots = (0..modules.len()).map(|i| Slot { col: nodes[i].col, row: nodes[i].row }).collect();
-        GraphLayout { slots, cols, nodes, links, tones, height }
+        GraphLayout { slots, cols, nodes, links, tones, ends, height }
     }
 
     /// Left edge of a column's cards.
@@ -462,6 +519,10 @@ pub struct Segment {
     /// The dependency this piece belongs to; every piece of one edge
     /// — stubs, trunk, bus runs — shares it, so a hover lights them all.
     pub edge: usize,
+    /// The prerequisite module, so a hovered card can claim the piece.
+    pub from: usize,
+    /// The dependent module, likewise.
+    pub to: usize,
 }
 
 /// A trunk: every link into one node of the next column, sharing the
@@ -529,7 +590,8 @@ pub fn edges(_modules: &[Module], layout: &GraphLayout) -> Vec<Segment> {
     let mut out: Vec<Segment> = Vec::new();
     let push = |x: f32, y: f32, w: f32, h: f32, edge: usize, out: &mut Vec<Segment>| {
         let id = out.len();
-        out.push(Segment { id, x, y, w, h, tone: layout.tones[edge], edge });
+        let (from, to) = layout.ends[edge];
+        out.push(Segment { id, x, y, w, h, tone: layout.tones[edge], edge, from, to });
     };
     for gap in 0..layout.cols.saturating_sub(1) {
         let x1 = layout.x(gap) + CARD_W;
@@ -710,8 +772,13 @@ mod tests {
         // api→app: api is still running — red.
         assert_eq!(segs[0].tone, EdgeLineTone::Open);
         assert_eq!(segs[3].tone, EdgeLineTone::Blocked);
-        // Every piece of one dependency carries its edge id.
-        assert!(segs[..3].iter().all(|s| s.edge == 0));
+        // Every piece of one dependency carries its edge id and its ends,
+        // so a hovered card can claim every line in or out of it: api
+        // sits on all three edges, app on one.
+        assert!(segs[..3].iter().all(|s| s.edge == 0 && s.from == 0 && s.to == 1));
+        let touching = |m: usize| segs.iter().filter(|s| s.from == m || s.to == m).count();
+        assert_eq!(touching(1), 9);
+        assert_eq!(touching(2), 3);
         // Nothing pokes outside the canvas.
         for seg in &segs {
             assert!(seg.x + seg.w <= layout.width() && seg.y + seg.h <= layout.height());
