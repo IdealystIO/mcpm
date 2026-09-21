@@ -47,6 +47,12 @@ stylesheet! {
         base(t) {
             width: 8,
             height: 8,
+            // A row squeezes an 8px child sideways before it wraps
+            // anything else (rule 18): pin both axes and refuse to
+            // shrink, or the dot becomes an oval and the ring a "C".
+            min_width: 8,
+            min_height: 8,
+            flex_shrink: 0.0,
             border_radius: t.radius.pill(),
         }
         transitions {
@@ -76,6 +82,9 @@ stylesheet! {
         base(t) {
             width: 8,
             height: 8,
+            min_width: 8,
+            min_height: 8,
+            flex_shrink: 0.0,
             border_radius: t.radius.pill(),
             border_top_width: 2.0,
             border_right_width: 2.0,
