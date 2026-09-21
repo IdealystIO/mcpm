@@ -198,6 +198,9 @@ pub struct FeatureRollupDto {
     pub modules_total: i64,
     /// todo + unclaimed + every prerequisite done.
     pub modules_ready: i64,
+    /// Modules an agent holds right now.
+    #[serde(default)]
+    pub modules_running: i64,
     pub tasks_done: i64,
     pub tasks_total: i64,
     /// Tasks the crew added beyond the plan.
@@ -205,9 +208,26 @@ pub struct FeatureRollupDto {
     /// "MMM D HH:MM" of the first and last ledger entry, or empty.
     pub started: String,
     pub last_activity: String,
+    /// Seconds since an agent HOLDING a module here last wrote to the
+    /// ledger, or -1 when nobody holds one or no holder has written.
+    /// Computed here so the console needs no clock of its own.
+    #[serde(default = "minus_one")]
+    pub quiet_secs: i64,
     /// The newest announcement anywhere in the feature.
     #[serde(default)]
     pub last_word: Option<AnnouncementDto>,
+}
+
+/// Serde default for the `quiet_secs` fields: "no reading".
+fn minus_one() -> i64 {
+    -1
+}
+
+/// Seconds between `t` and now, or -1 for `None`. Never negative: a
+/// clock skew between the database and this host reads as "just now".
+#[cfg(feature = "server")]
+fn quiet_since(t: Option<chrono::DateTime<chrono::Utc>>) -> i64 {
+    t.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)).unwrap_or(-1)
 }
 
 /// The latest thing an agent said it was doing, on a module, a
@@ -302,6 +322,13 @@ pub struct ModuleDto {
     pub block_body: String,
     /// "MMM D HH:MM" of its first claim, or empty.
     pub spawned: String,
+    /// Seconds since the agent holding this module last wrote to the
+    /// ledger (on anything), or -1 when nobody holds it or the holder
+    /// has never written. A running module with a small number here is
+    /// MOVING; one with a large number is held by a box that has gone
+    /// quiet, which is the failure this exists to make visible.
+    #[serde(default = "minus_one")]
+    pub quiet_secs: i64,
     /// Open questions on this module.
     #[serde(default)]
     pub open_questions: Vec<QuestionDto>,
@@ -613,6 +640,9 @@ pub struct AgentDto {
     /// "MMM D HH:MM" it last registered or announced.
     #[serde(default)]
     pub last_seen: String,
+    /// Seconds since its newest ledger write, or -1 if it never wrote.
+    #[serde(default = "minus_one")]
+    pub quiet_secs: i64,
     /// The newest thing it announced.
     #[serde(default)]
     pub last_word: Option<AnnouncementDto>,
@@ -876,11 +906,13 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
             modules_done: r.modules_done,
             modules_total: r.modules_total,
             modules_ready: r.modules_ready,
+            modules_running: r.modules_running,
             tasks_done: r.tasks_done,
             tasks_total: r.tasks_total,
             tasks_added: r.tasks_added,
             started: stamp(r.started),
             last_activity: stamp(r.last_activity),
+            quiet_secs: quiet_since(r.last_heard),
             last_word: r.last_word.as_ref().map(announcement_dto),
         })
         .collect();
@@ -918,6 +950,7 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
                 checked: stamp(h.checked_at),
             }),
             last_seen: stamp(Some(a.last_seen)),
+            quiet_secs: quiet_since(a.last_activity),
             last_word: a.last_word.as_ref().map(announcement_dto),
         })
         .collect();
@@ -1026,6 +1059,7 @@ pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerErr
                     .and_then(|x| x.first_claim)
                     .map(|t| t.format("%b %-d %H:%M").to_string())
                     .unwrap_or_default(),
+                quiet_secs: quiet_since(marks.and_then(|x| x.last_activity)),
                 rejected,
                 block_title,
                 block_body,

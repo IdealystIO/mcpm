@@ -403,7 +403,9 @@ impl Store {
                          WHERE m.claimed_by = a.name AND m.status IN ('in_progress','blocked'))
                             AS claim_names,
                         a.health_url, a.health_state, a.health_detail,
-                        a.health_checked_at, a.health_since
+                        a.health_checked_at, a.health_since,
+                        (SELECT e.ts FROM events e WHERE e.agent = a.name
+                         ORDER BY e.seq DESC LIMIT 1) AS last_activity
                  FROM agents a
              )
              SELECT * FROM load
@@ -425,6 +427,7 @@ impl Store {
                     active_claims: r.get("active_claims"),
                     claim_names: r.get("claim_names"),
                     last_seen: r.get("last_seen"),
+                    last_activity: r.get("last_activity"),
                     health: r.get::<Option<String>, _>("health_url").map(|url| AgentHealth {
                         url,
                         state: r
@@ -596,6 +599,8 @@ impl Store {
                     AND NOT EXISTS (SELECT 1 FROM module_deps d
                                     JOIN modules p ON p.id = d.depends_on
                                     WHERE d.module_id = m.id AND p.status <> 'done')) AS modules_ready,
+               (SELECT COUNT(*) FROM modules m
+                  WHERE m.feature_id = f.id AND m.status = 'in_progress') AS modules_running,
                (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
                   WHERE m.feature_id = f.id) AS tasks_total,
                (SELECT COUNT(*) FROM tasks t JOIN modules m ON m.id = t.module_id
@@ -606,7 +611,11 @@ impl Store {
                (SELECT e.ts FROM events e WHERE e.feature_id = f.id
                   ORDER BY e.seq ASC LIMIT 1) AS started,
                (SELECT e.ts FROM events e WHERE e.feature_id = f.id
-                  ORDER BY e.seq DESC LIMIT 1) AS last_activity
+                  ORDER BY e.seq DESC LIMIT 1) AS last_activity,
+               (SELECT MAX(h.ts) FROM modules m
+                  JOIN LATERAL (SELECT e.ts FROM events e WHERE e.agent = m.claimed_by
+                                ORDER BY e.seq DESC LIMIT 1) h ON true
+                  WHERE m.feature_id = f.id AND m.status = 'in_progress') AS last_heard
              FROM features f ORDER BY f.created_at",
         )
         .fetch_all(&self.pool)
@@ -622,12 +631,14 @@ impl Store {
                 modules_done: r.get("modules_done"),
                 modules_total: r.get("modules_total"),
                 modules_ready: r.get("modules_ready"),
+                modules_running: r.get("modules_running"),
                 tasks_done: r.get("tasks_done"),
                 tasks_total: r.get("tasks_total"),
                 tasks_added: r.get("tasks_added"),
                 created_by: r.get("created_by"),
                 started: r.get("started"),
                 last_activity: r.get("last_activity"),
+                last_heard: r.get("last_heard"),
             })
             .collect())
     }
@@ -4291,6 +4302,19 @@ impl Store {
         .bind(feature_id)
         .fetch_all(&self.pool)
         .await?;
+        // The holder's newest ledger write, whatever it was on — a task
+        // on this module, an announcement on the feature, a memory. One
+        // probe of `events_agent_idx` per held module.
+        let activity = sqlx::query(
+            "SELECT m.id AS module_id,
+                    (SELECT e.ts FROM events e WHERE e.agent = m.claimed_by
+                     ORDER BY e.seq DESC LIMIT 1) AS ts
+             FROM modules m
+             WHERE m.feature_id = $1 AND m.claimed_by IS NOT NULL",
+        )
+        .bind(feature_id)
+        .fetch_all(&self.pool)
+        .await?;
         fn slot(out: &mut Vec<ModuleMilestones>, module_id: String) -> &mut ModuleMilestones {
             let i = match out.iter().position(|m| m.module_id == module_id) {
                 Some(i) => i,
@@ -4300,6 +4324,7 @@ impl Store {
                         first_claim: None,
                         last_rejection: None,
                         last_blocker: None,
+                        last_activity: None,
                     });
                     out.len() - 1
                 }
@@ -4309,6 +4334,9 @@ impl Store {
         let mut out: Vec<ModuleMilestones> = Vec::new();
         for r in &claims {
             slot(&mut out, r.get("subject_id")).first_claim = Some(r.get("ts"));
+        }
+        for r in &activity {
+            slot(&mut out, r.get("module_id")).last_activity = r.get("ts");
         }
         for r in &latest {
             let e = map_event(r);

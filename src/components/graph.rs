@@ -448,6 +448,7 @@ mod tests {
             block: None,
             open_questions: Vec::new(),
             last_word: None,
+            quiet_secs: -1,
             tasks: Vec::new(),
         }
     }

@@ -169,6 +169,12 @@ pub fn RosterCard(props: &RosterCardProps) -> Element {
     // ledger can say: running while it holds a claim.
     let checked = a.health.is_some();
     let dot = a.health.as_ref().map(|h| h.tone).unwrap_or(state);
+    // Spinning while it holds a claim, wrote to the ledger inside the
+    // live window, and its box — if checked — is up. A quota-parked box
+    // holds its claim and says nothing: still dot.
+    let live = state == crate::model::Status::Running
+        && crate::model::within_live_window(a.quiet_secs)
+        && a.health.as_ref().is_none_or(|h| h.up);
     let health_label = a.health.as_ref().map(|h| h.label.clone()).unwrap_or_default();
     let health_tone = status_tone(a.health.as_ref().map(|h| h.tone).unwrap_or(state));
     let health_line = a.health.as_ref().map(|h| h.line.clone()).unwrap_or_default();
@@ -177,10 +183,14 @@ pub fn RosterCard(props: &RosterCardProps) -> Element {
     let word = a.last_word.as_ref().map(|w| format!("\u{201c}{}\u{201d}", w.text));
     let word_at = a.last_word.as_ref().map(|w| format!("{} on {}", w.at, w.subject)).unwrap_or_default();
     let seen = format!("seen {}", a.last_seen);
+    // Held-but-quiet says so in words here as on the card (rule 30).
+    let quiet = (state == crate::model::Status::Running
+        && a.quiet_secs >= crate::model::LIVE_WINDOW_SECS)
+        .then(|| format!("quiet {}", crate::model::quiet_label(a.quiet_secs)));
     ui! {
         view(style = RosterBox()) {
             Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
-                StatusDot(status = dot)
+                StatusDot(status = dot, live = live)
                 Mono(content = id)
                 Spacer()
                 if checked {
@@ -203,6 +213,9 @@ pub fn RosterCard(props: &RosterCardProps) -> Element {
             Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
                 Mono(content = level, size = MonoTextSize::Overline)
                 Spacer()
+                if let Some(quiet) = quiet {
+                    Mono(content = quiet, size = MonoTextSize::Overline, tone = crate::styles::MonoTextTone::Warning)
+                }
                 Mono(content = uptime, size = MonoTextSize::Overline)
                 Mono(content = seen, size = MonoTextSize::Overline)
             }

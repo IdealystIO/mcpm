@@ -523,3 +523,35 @@ content they serve off the bottom.
   ideas together should not need a fourth tab named for that pair.
   Default the set to what the screen is for (an inbox shows the
   unread).
+
+### 30. Liveness is motion, and it means recent activity, never a status
+
+A status says what a thing IS — running, queued, done. It does not say
+whether anything is happening to it right now, and on a board of
+agents that is the question a reader actually has: a module a box has
+held for three hours while quota-parked is `running` in every column,
+and so is one whose worker ticked a task ninety seconds ago.
+
+- **The status dot spins while something is live** (`StatusDot(live =
+  …)`), in the same ink it had still. Motion is the only thing that
+  changes, so the eye reads "alive" rather than "changed state". It is
+  a ring, not a spinner glyph, so it fits every slot the dot already
+  sits in — the rail, a row, a card, the roster.
+- **Live derives from the ledger's clock, not from a status.** A module
+  is live when it is held AND its holder wrote to the ledger inside
+  `model::LIVE_WINDOW_SECS`; a feature when a module is held and the
+  feature was heard from inside that window. The server sends
+  `quiet_secs` and the console compares, so the console needs no clock.
+- **Held-but-quiet says so in words.** Once the holder is past the
+  window the dot goes still AND the agent slot reads `box · quiet 34m`
+  in the warning tone. The spinner's absence alone is a whisper;
+  the number is what makes a parked box look parked.
+- **An edge goes green when its prerequisite is done**, amber while it
+  is open, muted once the dependent is done itself — the graph's own
+  liveness, already there. Do not add motion to edges: a line that
+  moves reads as data flowing, which is not what an edge means.
+- **Every forever animation is anchored to a scope.** The console
+  rebuilds its cards on every tick; a loop that outlives its node is
+  one more per rebuild for as long as the tab is open. Ask the render
+  server for the keyframe first, fall back to an `AnimatedValue`, and
+  cancel both in `on_scope_drop`.

@@ -251,6 +251,7 @@ pub fn RailFeature(props: &RailFeatureProps) -> Element {
     };
     let name = f.name.clone();
     let status = f.status;
+    let live = f.live();
     let fraction = f.fraction();
     let pct = f.pct_label();
     let arm = if props.selected { "on" } else { "off" };
@@ -258,7 +259,7 @@ pub fn RailFeature(props: &RailFeatureProps) -> Element {
     let inner: Element = ui! {
         view(style = RailInner()) {
             view(style = RailTitleRow()) {
-                StatusDot(status = status)
+                StatusDot(status = status, live = live)
                 view(style = RailNameSlot()) {
                     Typography(
                         content = name,

@@ -52,11 +52,21 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
 
     let name = m.name.clone();
     let status = m.status;
-    let agent = m.agent.clone();
-    let agent_tone = match agent.as_str() {
-        "ready" => MonoTextTone::Success,
-        "waiting" => MonoTextTone::Warning,
-        _ => MonoTextTone::Muted,
+    let live = m.live();
+    // The agent slot says who holds the card — and, once the holder
+    // has gone quiet, for how long: that is the one fact that tells a
+    // parked box from a working one, and the spinner's absence alone
+    // would only whisper it.
+    let (agent, agent_tone) = match m.quiet_for() {
+        Some(quiet) => (format!("{} \u{b7} quiet {quiet}", m.agent), MonoTextTone::Warning),
+        None => (
+            m.agent.clone(),
+            match m.agent.as_str() {
+                "ready" => MonoTextTone::Success,
+                "waiting" => MonoTextTone::Warning,
+                _ => MonoTextTone::Muted,
+            },
+        ),
     };
     let task_label = m.task_label();
     let ticks: Vec<bool> = m.tasks.iter().map(|t| t.done).collect();
@@ -87,7 +97,7 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
         view(style = ModuleInner()) {
             view(style = TitleRow()) {
                 view(style = DotSlot()) {
-                    StatusDot(status = status)
+                    StatusDot(status = status, live = live)
                 }
                 view(style = TitleSlot()) {
                     Typography(

@@ -279,6 +279,7 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
     let feature_id = f.id.clone();
     let name = f.name.clone();
     let status = f.status;
+    let live = f.live();
     let agent = f.agent.to_string();
     let (_tasks_done, _tasks_total, tasks_added) = f.task_count();
     let elapsed = f.elapsed.to_string();
@@ -320,6 +321,7 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
                     )
                 }
                 view(style = HeadFixed()) {
+                    StatusDot(status = status, live = live)
                     StatusBadge(status = status)
                 }
                 Spacer()

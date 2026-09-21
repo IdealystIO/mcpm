@@ -765,6 +765,8 @@ pub struct FeatureRollup {
     pub modules_total: i64,
     /// Modules whose prerequisites are all done and nobody holds.
     pub modules_ready: i64,
+    /// Modules an agent holds right now (`in_progress`).
+    pub modules_running: i64,
     pub tasks_done: i64,
     pub tasks_total: i64,
     /// Tasks the crew added while working, beyond the plan.
@@ -775,6 +777,11 @@ pub struct FeatureRollup {
     /// feature nothing has happened to.
     pub started: Option<DateTime<Utc>>,
     pub last_activity: Option<DateTime<Utc>>,
+    /// The newest ledger write by any agent currently HOLDING a module
+    /// here, on any subject. This — not `last_activity` — is whether
+    /// the feature is moving: a manager's plan revision is activity
+    /// on the feature, but only a holder's write says a box is alive.
+    pub last_heard: Option<DateTime<Utc>>,
     /// The newest announcement anywhere in the feature — on it or on
     /// one of its modules — so a board reads what the crew is doing
     /// without opening the ledger.
@@ -809,6 +816,11 @@ pub struct ModuleMilestones {
     pub first_claim: Option<DateTime<Utc>>,
     pub last_rejection: Option<Event>,
     pub last_blocker: Option<Event>,
+    /// The last time the agent holding this module wrote anything to
+    /// the ledger, on any subject. `None` when nobody holds it, or the
+    /// holder has never written. This is the liveness signal: a claim
+    /// says a module is held, this says whether it is moving.
+    pub last_activity: Option<DateTime<Utc>>,
 }
 
 /// The pool's shape: how many ideas sit in each state.
@@ -1106,6 +1118,8 @@ pub struct AgentOverview {
     pub claim_names: String,
     /// The last time it registered or announced anything.
     pub last_seen: DateTime<Utc>,
+    /// Its newest ledger write of any kind; `None` if it never wrote.
+    pub last_activity: Option<DateTime<Utc>>,
     /// The health check registered for it, if any, with its verdict.
     pub health: Option<AgentHealth>,
     /// The last thing it announced, if anything.

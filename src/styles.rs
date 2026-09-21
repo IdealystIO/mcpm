@@ -64,6 +64,31 @@ stylesheet! {
     }
 }
 
+// The live ring: the status dot's shape, drawn as an arc and spun.
+// One side transparent is what makes rotation visible at 8px; the
+// widths are spelled per side because the shorthand collides with
+// per-side colours (see ModuleBox). Colour is the same info ink as
+// the running dot, so a card that starts moving changes MOTION, not
+// palette — the eye reads "this one is alive", not "this one changed
+// state".
+stylesheet! {
+    pub LiveRing<IdeaThemeRef> {
+        base(t) {
+            width: 8,
+            height: 8,
+            border_radius: t.radius.pill(),
+            border_top_width: 2.0,
+            border_right_width: 2.0,
+            border_bottom_width: 2.0,
+            border_left_width: 2.0,
+            border_top_color: runtime_core::Color("#00000000".into()),
+            border_right_color: t.intent.info.fg(),
+            border_bottom_color: t.intent.info.fg(),
+            border_left_color: t.intent.info.fg(),
+        }
+    }
+}
+
 stylesheet! {
     pub MonoText<IdeaThemeRef> {
         base(t) {

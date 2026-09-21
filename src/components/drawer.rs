@@ -86,7 +86,11 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
     let path = format!("{}  \u{25b8}  Module", f.name);
     let name = m.name.clone();
     let status = m.status;
-    let agent = m.agent.to_string();
+    let live = m.live();
+    let agent = match m.quiet_for() {
+        Some(quiet) => format!("{} \u{b7} quiet {quiet}", m.agent),
+        None => m.agent.to_string(),
+    };
     let description = m.description.trim().to_string();
     let has_description = !description.is_empty();
     let done = m.tasks.iter().filter(|t| t.done).count();
@@ -166,6 +170,7 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                                     weight = Some(FontWeight::SemiBold),
                                 )
                                 Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
+                                    StatusDot(status = status, live = live)
                                     StatusBadge(status = status)
                                     Mono(content = agent, size = MonoTextSize::Overline)
                                 }

@@ -2,15 +2,23 @@
 //! metadata text, the per-task tick strip, and the `?` hint.
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use idea_ui::{typography_kind, Badge, Spacer, Tooltip, Typography};
-use runtime_core::{component, pressable, ui, Element, GluePressable, IdealystSchema,
-    IntoElement, StyleApplication};
+use runtime_core::animation::{AnimProp, AnimatedValue, LoopFactory, Repeat, SequenceFactory, TweenTo};
+use runtime_core::{after_animation_frame, component, on_scope_drop, pressable, ui, Element,
+    GluePressable, IdealystSchema, IntoElement, Ref, StyleApplication, ViewHandle};
 
 use crate::model::Status;
 use crate::styles::{
-    status_dot, status_tone, Dot, MonoText, MonoTextSize, MonoTextTone, Tick, TickState,
+    live_ring_style, status_dot, status_tone, Dot, MonoText, MonoTextSize, MonoTextTone, Tick,
+    TickState,
 };
+
+/// One turn of the live ring, in ms. Slow enough to read as steady
+/// work rather than a busy wait; a card full of them should hum, not
+/// flicker.
+const LIVE_TURN_MS: u64 = 1100;
 
 /// A tappable custom surface — a row, a chip, a close glyph — with no
 /// native chrome. Chain `.with_style(…)`, `.bind(…)`, then
@@ -33,15 +41,71 @@ pub fn tappable(children: Vec<Element>, on_press: impl Fn() + 'static) -> GluePr
 pub struct StatusDotProps {
     /// Status whose semantic color the dot takes.
     pub status: Status,
+    /// Something is happening here RIGHT NOW — an agent holds it and
+    /// has written to the ledger recently. The dot becomes a spinning
+    /// ring in the same ink. Liveness is recent activity, never a
+    /// status: a claimed module whose box has gone quiet is exactly
+    /// the case the still dot exists to show (UX_GUIDELINES rule 30).
+    pub live: bool,
 }
 
-/// A small round indicator colored by status.
+/// A small round indicator colored by status — spinning while live.
 #[component]
 pub fn StatusDot(props: &StatusDotProps) -> Element {
+    if props.live {
+        return live_ring();
+    }
     let style = Dot().tone(status_dot(props.status));
     ui! {
         view(style = style) {}
     }
+}
+
+/// The spinning arc that replaces the dot while something is live.
+///
+/// The turn is asked of the render server first (a CSS/CA keyframe
+/// costs no frames of ours); where the backend declines, an
+/// `AnimatedValue` loop drives `RotateZ` per frame. Either way it is
+/// anchored to the component's scope: the console rebuilds these on
+/// every tick, and a forever loop that outlived its node would be one
+/// more per rebuild for as long as the tab stayed open.
+fn live_ring() -> Element {
+    let ring_ref: Ref<ViewHandle> = Ref::new();
+    let turn: AnimatedValue<f32> = AnimatedValue::new(0.0);
+    turn.bind(ring_ref, AnimProp::RotateZ);
+    let turn_for_fallback = turn.clone();
+    let setup = after_animation_frame(move || {
+        let native = ring_ref
+            .with(|h| {
+                h.install_keyframe_animation(
+                    AnimProp::RotateZ,
+                    &[(0.0, 0.0), (1.0, 360.0)],
+                    LIVE_TURN_MS as u32,
+                    true,
+                    false,
+                )
+            })
+            .unwrap_or(false);
+        if !native {
+            turn_for_fallback.animate(LoopFactory::new(
+                SequenceFactory::new()
+                    .then(TweenTo::new(360.0, Duration::from_millis(LIVE_TURN_MS)).linear())
+                    .then(TweenTo::new(0.0, Duration::ZERO)),
+                Repeat::Forever,
+            ));
+        }
+    });
+    on_scope_drop(move || {
+        drop(setup);
+        turn.cancel();
+    });
+    // LEFT HAND-BUILT: the ring carries a `Ref`, and the `ui!` tag form
+    // drops the handle (the same reason `tappable` is built by hand).
+    // idealyst-lint-disable-next-line prefer-ui-macro
+    runtime_core::view(Vec::new())
+        .with_style(StyleApplication::new(live_ring_style()))
+        .bind(ring_ref)
+        .into_element()
 }
 
 /// Props for [`StatusBadge`].

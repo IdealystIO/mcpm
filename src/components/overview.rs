@@ -212,6 +212,7 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
     };
     let name = f.name.clone();
     let status = f.status;
+    let live = f.live();
     let fraction = f.fraction();
     let pct = f.pct_label();
     let (mods_done, mods_total) = f.module_count();
@@ -227,7 +228,7 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
         view(style = RowInner()) {
             view(style = FlexSlot()) {
                 view(style = TitleLine()) {
-                    StatusDot(status = status)
+                    StatusDot(status = status, live = live)
                     view(style = FlexSlot()) {
                         Typography(content = name, kind = typography_kind::BodySm)
                     }

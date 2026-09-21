@@ -16,7 +16,7 @@ use runtime_core::{
     FontWeight, IdealystSchema, JustifyContent,
 };
 
-use crate::components::bits::{Mono, Pager, StatusBadge};
+use crate::components::bits::{Mono, Pager, StatusBadge, StatusDot};
 use crate::model::{completed_count, features, filter_features, Status};
 use crate::state::Console;
 use crate::styles::{status_tone, SectionLabel};
@@ -220,6 +220,7 @@ pub fn FeatureRow(props: &FeatureRowProps) -> Element {
     let f = &feats[index];
     let name = f.name.clone();
     let status = f.status;
+    let live = f.live();
     let fraction = f.fraction();
     let pct = f.pct_label();
     let agent = f.agent.clone();
@@ -231,7 +232,10 @@ pub fn FeatureRow(props: &FeatureRowProps) -> Element {
         TableRow(on_row_click = Some(on_row_click)) {
             TableCell(text = Some(name))
             TableCell {
-                StatusBadge(status = status)
+                view(style = StatusCell()) {
+                    StatusDot(status = status, live = live)
+                    StatusBadge(status = status)
+                }
             }
             TableCell {
                 view(style = ProgressCell()) {
@@ -270,6 +274,16 @@ pub fn HeadStat(props: &HeadStatProps) -> Element {
                 weight = Some(FontWeight::SemiBold),
             )
             text(style = SectionLabel()) { label }
+        }
+    }
+}
+
+stylesheet! {
+    pub StatusCell<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            gap: t.spacing.sm(),
         }
     }
 }

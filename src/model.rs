@@ -202,7 +202,32 @@ pub struct Module {
     pub open_questions: Vec<Question>,
     /// The latest thing an agent announced on this module.
     pub last_word: Option<Word>,
+    /// Seconds since the holder last wrote to the ledger; -1 = no
+    /// reading (unclaimed, or a holder that has never written).
+    pub quiet_secs: i64,
     pub tasks: Vec<Task>,
+}
+
+/// How recently an agent must have written for a thing to be drawn as
+/// MOVING rather than merely held. Twenty minutes: a build or an e2e
+/// run fits inside it; a quota-parked box does not.
+pub const LIVE_WINDOW_SECS: i64 = 20 * 60;
+
+/// `true` when a reading exists and is inside [`LIVE_WINDOW_SECS`].
+pub fn within_live_window(quiet_secs: i64) -> bool {
+    (0..LIVE_WINDOW_SECS).contains(&quiet_secs)
+}
+
+/// "3m", "2h 10m", "1d 4h" — how long something has been quiet, for
+/// the card that is held but not moving.
+pub fn quiet_label(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60);
+    match (d, h, m) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, h, _) => format!("{d}d {h}h"),
+    }
 }
 
 /// What a module's drawer adds to its card. Read with [`module_detail`];
@@ -265,6 +290,8 @@ pub struct AgentRow {
     pub health: Option<AgentHealthRow>,
     /// When it last registered or announced, as a stamp.
     pub last_seen: String,
+    /// Seconds since its newest ledger write; -1 = never wrote.
+    pub quiet_secs: i64,
     /// The latest thing it announced.
     pub last_word: Option<Word>,
 }
@@ -372,6 +399,11 @@ pub struct Feature {
     pub open_questions: Rc<Vec<Question>>,
     /// The newest announcement anywhere in the feature.
     pub last_word: Option<Word>,
+    /// Modules an agent holds right now.
+    pub modules_running: usize,
+    /// Seconds since a HOLDER of one of its modules last wrote to the
+    /// ledger; -1 = nobody holds one, or no holder has written.
+    pub quiet_secs: i64,
 }
 
 // ---------------------------------------------------------------------
@@ -455,6 +487,27 @@ impl Module {
             self.tasks.iter().filter(|t| t.done).count(),
             self.tasks.len()
         )
+    }
+
+    /// Held AND moving: an agent has it and wrote to the ledger inside
+    /// the live window.
+    pub fn live(&self) -> bool {
+        self.status == Status::Running && within_live_window(self.quiet_secs)
+    }
+
+    /// Held but NOT moving: the holder has been silent past the
+    /// window. `None` while it is live, unclaimed, or unmeasured.
+    pub fn quiet_for(&self) -> Option<String> {
+        (self.status == Status::Running && self.quiet_secs >= LIVE_WINDOW_SECS)
+            .then(|| quiet_label(self.quiet_secs))
+    }
+}
+
+impl Feature {
+    /// Something in it is moving right now: a module is held and the
+    /// ledger heard from the feature inside the live window.
+    pub fn live(&self) -> bool {
+        self.modules_running > 0 && within_live_window(self.quiet_secs)
     }
 }
 
@@ -1017,6 +1070,8 @@ fn rebuild(cur: &mut Current) {
                 attachments: detail.map(|d| d.attachments.clone()).unwrap_or_default(),
                 open_questions: detail.map(|d| d.open_questions.clone()).unwrap_or_default(),
                 last_word: r.last_word.as_ref().map(map_word),
+                modules_running: r.modules_running.max(0) as usize,
+                quiet_secs: r.quiet_secs,
             }
         })
         .collect();
@@ -1193,6 +1248,7 @@ fn map_module(m: &api::ModuleDto) -> Module {
         block,
         open_questions: m.open_questions.iter().map(map_question).collect(),
         last_word: m.last_word.as_ref().map(map_word),
+        quiet_secs: m.quiet_secs,
         tasks: m
             .tasks
             .iter()
@@ -1294,6 +1350,7 @@ fn map_agent(a: &api::AgentDto) -> AgentRow {
         },
         health: a.health.as_ref().map(map_health),
         last_seen: a.last_seen.clone(),
+        quiet_secs: a.quiet_secs,
         last_word: a.last_word.as_ref().map(map_word),
     }
 }
