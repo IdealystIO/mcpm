@@ -206,6 +206,22 @@ fn tree_tools() -> Value {
             }
         },
         {
+            "name": "set_agent_health",
+            "description": "MANAGER. Register (or with an empty health_url, clear) the URL the \
+                server probes to see whether another agent's machine is up — for a box that \
+                already holds a key and so cannot be re-issued one with health_url, or whose \
+                URL changed. The box's own get_context can do the same for itself; this is \
+                the manager's way. Only hosts the server is configured to probe are accepted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_name": { "type": "string", "description": "The agent as the ledger names it — the box's branch slug, typically." },
+                    "health_url": { "type": "string", "description": "The URL of that box's dev server. Empty clears the check." }
+                },
+                "required": ["agent_name"]
+            }
+        },
+        {
             "name": "issue_worker_key",
             "description": "MANAGER. Issue a standing worker key so a box that is not your \
                 machine has an identity of its own. Use this when you dispatch to remote \

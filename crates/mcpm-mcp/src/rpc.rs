@@ -310,6 +310,15 @@ async fn call_tool(
             };
             to_value(store.mint_worker(&actor, key_id, req).await?)
         }
+        "set_agent_health" => {
+            let agent_name = str_arg(args, "agent_name")?;
+            let health_url = opt_str_arg(args, "health_url");
+            to_value(
+                store
+                    .set_health_url(&Actor::new(agent_name.trim()), health_url.as_deref())
+                    .await?,
+            )
+        }
         "issue_worker_key" => {
             let agent_name = str_arg(args, "agent_name")?;
             let label = opt_str_arg(args, "label");

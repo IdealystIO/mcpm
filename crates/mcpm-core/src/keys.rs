@@ -123,6 +123,10 @@ pub const MANAGER_ONLY: &[&str] = &[
     "complete_feature",
     "promote_wants",
     "issue_worker_key",
+    // Names ANOTHER agent's row. A worker may register only its own,
+    // through get_context; letting one point the prober at a sibling's
+    // URL would let it forge a sibling's liveness.
+    "set_agent_health",
 ];
 
 /// A verified key, resolved to who is calling. This is what the MCP

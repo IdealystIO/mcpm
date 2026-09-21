@@ -504,6 +504,9 @@ issue_worker_key(agent_name='box-a', health_url='https://box-a.dev.example.com/'
 The second form is for the manager that provisions the box: it knows
 the hostname before the box has ever spoken, and the box appears on the
 roster — registered, not yet probed — from the moment its key exists.
+For a box that already holds a key, the manager-only
+`set_agent_health(agent_name, health_url)` names its row directly; a
+worker may register only its own.
 The verdict is one of four, because they are four different things to
 do next:
 
