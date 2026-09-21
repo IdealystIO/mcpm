@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use idea_ui::{typography_kind, IdeaThemeRef, Spacer, Typography};
 use runtime_core::{
-    component, stylesheet, ui, AlignItems, Element, FlexDirection, IdealystSchema, Length,
-    Position, StyleRules, Tokenized,
+    component, signal, stylesheet, ui, AlignItems, Element, FlexDirection, IdealystSchema,
+    IntoElement, Length, Position, Signal, StyleApplication, StyleRules, Tokenized, VariantEnum,
 };
 
 use crate::components::bits::Hint;
@@ -70,6 +70,10 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
     let layout = GraphLayout::compute(&f.modules);
     let segments = edges(&f.modules, &layout);
     let cards = layout.cards();
+    // The dependency under the pointer, by edge id. Read by every
+    // segment's style closure, so a hover restyles lines in place and
+    // rebuilds nothing (rule 25).
+    let hovered: Signal<Option<usize>> = signal(None);
     let mut canvas = StyleRules::default();
     canvas.position = Some(Position::Relative);
     canvas.width = Some(Tokenized::Literal(Length::Px(layout.width())));
@@ -96,8 +100,10 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                 Spacer()
                 Hint(
                     text = "A module sits right of everything it depends on.\n\
-                            Green edge: that prerequisite is done. Amber edge: still open.\n\
-                            A card's left edge is green when it can be claimed, amber while it waits.",
+                            Green edge: both ends done. Blue: the prerequisite is done, the \
+                            dependent may proceed. Red: the prerequisite is still open.\n\
+                            A card's left edge is green when it can be claimed, amber while it waits.\n\
+                            Hover a line to follow one dependency.",
                 )
             }
             // Two axes, two scrollers (rule 23). The horizontal one
@@ -110,7 +116,10 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
                         // column passes under the cards in it.
                         view(style = canvas) {
                             for seg in segments, key = seg.id {
-                                EdgeSegment(x = seg.x, y = seg.y, w = seg.w, h = seg.h, tone = seg.tone)
+                                EdgeSegment(
+                                    x = seg.x, y = seg.y, w = seg.w, h = seg.h,
+                                    tone = seg.tone, edge = seg.edge, hovered = hovered,
+                                )
                             }
                             for card in cards, key = card.module {
                                 GraphCard(console = console, feature = fi, x = card.x, y = card.y, module = card.module)
@@ -124,7 +133,7 @@ pub fn GraphView(props: &GraphViewProps) -> Element {
 }
 
 /// Props for [`EdgeSegment`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct EdgeSegmentProps {
     /// Canvas-relative left edge, px.
     pub x: f32,
@@ -136,18 +145,71 @@ pub struct EdgeSegmentProps {
     pub h: f32,
     /// Colour arm.
     pub tone: EdgeLineTone,
+    /// The dependency this piece belongs to.
+    pub edge: usize,
+    /// The graph's hovered dependency, shared by every segment.
+    pub hovered: Signal<Option<usize>>,
 }
 
-/// One straight piece of an edge, absolutely positioned on the canvas.
-#[component]
-pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
-    let rules = abs_rules(props.x, props.y, props.w, props.h);
-    let tone = props.tone;
-    ui! {
-        view(style = rules) {
-            view(style = EdgeLine().tone(tone)) {}
+impl Default for EdgeSegmentProps {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            tone: EdgeLineTone::default(),
+            edge: 0,
+            hovered: signal(None),
         }
     }
+}
+
+/// How far from a line the pointer still counts as on it, px each
+/// side. A 2px line is not a target; the zone is.
+const HIT: f32 = 7.0;
+
+/// One straight piece of an edge, absolutely positioned on the canvas:
+/// a hit zone padded around the line, whose hover names the edge, and
+/// the line itself, restyled by whether the named edge is this one.
+#[component]
+pub fn EdgeSegment(props: &EdgeSegmentProps) -> Element {
+    let zone = abs_rules(props.x - HIT, props.y - HIT, props.w + HIT * 2.0, props.h + HIT * 2.0);
+    let mut inner = abs_rules(HIT, HIT, props.w, props.h);
+    inner.flex_direction = Some(FlexDirection::Column);
+    let tone = props.tone;
+    let edge = props.edge;
+    let hovered = props.hovered;
+    let line = runtime_core::view(Vec::new())
+        .with_style(move || {
+            let lit = match hovered.get() {
+                None => "plain",
+                Some(h) if h == edge => "on",
+                Some(_) => "off",
+            };
+            StyleApplication::new(edge_line_style())
+                .with("tone", tone.as_variant_str().to_string())
+                .with("lit", lit.to_string())
+        })
+        .into_element();
+    let line = ui! {
+        view(style = inner) { line }
+    };
+    // LEFT HAND-BUILT: `on_hover` is a builder-only channel on `view`
+    // (the `ui!` tag form has no prop for it), and the whole point of
+    // the zone is that channel. Leaving clears the name only if it is
+    // still ours — entering the next zone may already have renamed it.
+    // idealyst-lint-disable-next-line prefer-ui-macro
+    runtime_core::view(vec![line])
+        .with_style(std::rc::Rc::new(runtime_core::StyleSheet::r#static(zone)))
+        .on_hover(move |entering| {
+            if entering {
+                hovered.set(Some(edge));
+            } else if hovered.get() == Some(edge) {
+                hovered.set(None);
+            }
+        })
+        .into_element()
 }
 
 /// Props for [`GraphCard`].
@@ -282,12 +344,12 @@ impl GraphLayout {
                     continue;
                 }
                 let edge = tones.len();
-                tones.push(if m.status == Status::Done {
-                    EdgeLineTone::Muted
-                } else if modules[si].status == Status::Done {
-                    EdgeLineTone::Open
+                tones.push(if modules[si].status != Status::Done {
+                    EdgeLineTone::Blocked
+                } else if m.status == Status::Done {
+                    EdgeLineTone::Done
                 } else {
-                    EdgeLineTone::Blocking
+                    EdgeLineTone::Open
                 });
                 let mut from = si;
                 for col in sc + 1..tc {
@@ -397,6 +459,9 @@ pub struct Segment {
     pub w: f32,
     pub h: f32,
     pub tone: EdgeLineTone,
+    /// The dependency this piece belongs to; every piece of one edge
+    /// — stubs, trunk, bus runs — shares it, so a hover lights them all.
+    pub edge: usize,
 }
 
 /// A trunk: every link into one node of the next column, sharing the
@@ -462,9 +527,9 @@ fn lane_order(trunks: &mut Vec<Trunk>) {
 pub fn edges(_modules: &[Module], layout: &GraphLayout) -> Vec<Segment> {
     let half = LINE / 2.0;
     let mut out: Vec<Segment> = Vec::new();
-    let push = |x: f32, y: f32, w: f32, h: f32, tone: EdgeLineTone, out: &mut Vec<Segment>| {
+    let push = |x: f32, y: f32, w: f32, h: f32, edge: usize, out: &mut Vec<Segment>| {
         let id = out.len();
-        out.push(Segment { id, x, y, w, h, tone });
+        out.push(Segment { id, x, y, w, h, tone: layout.tones[edge], edge });
     };
     for gap in 0..layout.cols.saturating_sub(1) {
         let x1 = layout.x(gap) + CARD_W;
@@ -483,13 +548,12 @@ pub fn edges(_modules: &[Module], layout: &GraphLayout) -> Vec<Segment> {
         for (lane, t) in trunks.iter().enumerate() {
             let xm = x2 - COL_GAP + LANE_INSET + lane as f32 * step;
             for (ys, l) in &t.stubs {
-                let tone = layout.tones[l.edge];
-                push(x1, ys - half, xm - x1 + LINE, LINE, tone, &mut out);
-                push(xm, ys.min(t.yt) - half, LINE, (t.yt - ys).abs() + LINE, tone, &mut out);
-                push(xm, t.yt - half, x2 - xm, LINE, tone, &mut out);
+                push(x1, ys - half, xm - x1 + LINE, LINE, l.edge, &mut out);
+                push(xm, ys.min(t.yt) - half, LINE, (t.yt - ys).abs() + LINE, l.edge, &mut out);
+                push(xm, t.yt - half, x2 - xm, LINE, l.edge, &mut out);
                 // A pass-through keeps going across its column.
                 if layout.nodes[t.to].module.is_none() {
-                    push(x2, t.yt - half, CARD_W, LINE, tone, &mut out);
+                    push(x2, t.yt - half, CARD_W, LINE, l.edge, &mut out);
                 }
             }
         }
@@ -552,17 +616,30 @@ stylesheet! {
 }
 
 // Fills its absolutely-positioned segment; the colour is the theme's.
+// Tone is the edge's state: green when both ends are done, blue when
+// the prerequisite is done and the dependent may proceed, red while
+// the prerequisite itself is still open. `lit` is the hover: the edge
+// under the pointer stays full ink and every other edge steps back.
 stylesheet! {
     pub EdgeLine<IdeaThemeRef> {
         base(_t) {
             width: Length::Percent(100.0),
             height: Length::Percent(100.0),
         }
+        transitions {
+            opacity: 120ms EaseOut,
+        }
         variant tone {
             #[default]
-            muted(t) { background: t.color.border() }
-            open(t) { background: t.intent.success.fg() }
-            blocking(t) { background: t.intent.warning.fg() }
+            done(t) { background: t.intent.success.fg() }
+            open(t) { background: t.intent.info.fg() }
+            blocked(t) { background: t.intent.danger.fg() }
+        }
+        variant lit {
+            #[default]
+            plain(_t) { opacity: 1.0 }
+            on(_t) { opacity: 1.0 }
+            off(_t) { opacity: 0.25 }
         }
     }
 }
@@ -629,9 +706,12 @@ mod tests {
         for seg in &segs {
             assert!(seg.w > 0.0 && seg.h > 0.0, "{seg:?}");
         }
-        // The satisfied edge is green; the open ones are amber.
+        // schema→api: the prerequisite is done, api is not — blue.
+        // api→app: api is still running — red.
         assert_eq!(segs[0].tone, EdgeLineTone::Open);
-        assert_eq!(segs[3].tone, EdgeLineTone::Blocking);
+        assert_eq!(segs[3].tone, EdgeLineTone::Blocked);
+        // Every piece of one dependency carries its edge id.
+        assert!(segs[..3].iter().all(|s| s.edge == 0));
         // Nothing pokes outside the canvas.
         for seg in &segs {
             assert!(seg.x + seg.w <= layout.width() && seg.y + seg.h <= layout.height());
