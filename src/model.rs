@@ -163,6 +163,24 @@ impl Attachment {
     }
 }
 
+/// What an agent last said it was doing, as a card or a roster line
+/// shows it: the words, who, and when.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Word {
+    pub text: String,
+    pub by: String,
+    pub at: String,
+    /// The module or feature it was said on, by name.
+    pub subject: String,
+}
+
+impl Word {
+    /// `"text" · by · at`, the whole fact on one line.
+    pub fn line(&self) -> String {
+        format!("\u{201c}{}\u{201d} \u{b7} {} \u{b7} {}", self.text, self.by, self.at)
+    }
+}
+
 pub struct Module {
     pub id: String,
     pub name: String,
@@ -182,6 +200,8 @@ pub struct Module {
     pub block: Option<(String, String)>,
     /// Open questions on this module.
     pub open_questions: Vec<Question>,
+    /// The latest thing an agent announced on this module.
+    pub last_word: Option<Word>,
     pub tasks: Vec<Task>,
 }
 
@@ -243,6 +263,10 @@ pub struct AgentRow {
     pub scope: String,
     /// Whether the machine behind it is up, when a check is registered.
     pub health: Option<AgentHealthRow>,
+    /// When it last registered or announced, as a stamp.
+    pub last_seen: String,
+    /// The latest thing it announced.
+    pub last_word: Option<Word>,
 }
 
 /// The server's verdict on an agent's machine, ready to draw: the tone
@@ -346,6 +370,8 @@ pub struct Feature {
     pub attachments: Rc<Vec<Attachment>>,
     /// Open questions on the feature itself.
     pub open_questions: Rc<Vec<Question>>,
+    /// The newest announcement anywhere in the feature.
+    pub last_word: Option<Word>,
 }
 
 // ---------------------------------------------------------------------
@@ -990,6 +1016,7 @@ fn rebuild(cur: &mut Current) {
                 sources: detail.map(|d| d.sources.clone()).unwrap_or_default(),
                 attachments: detail.map(|d| d.attachments.clone()).unwrap_or_default(),
                 open_questions: detail.map(|d| d.open_questions.clone()).unwrap_or_default(),
+                last_word: r.last_word.as_ref().map(map_word),
             }
         })
         .collect();
@@ -1072,7 +1099,8 @@ fn event_display(kind: &str) -> (&'static str, Status) {
         "premature_claim" => ("gate", Status::Violation),
         "task_done" => ("task", Status::Done),
         "task_skipped" => ("task", Status::Queued),
-        "task_added" => ("task", Status::Planning),
+        "task_added" => ("ad hoc", Status::Planning),
+        "announcement" => ("says", Status::Running),
         "module_done" => ("module", Status::Done),
         // `stage_unlocked` is history: the ledger still carries rows
         // from before modules had prerequisites of their own.
@@ -1164,6 +1192,7 @@ fn map_module(m: &api::ModuleDto) -> Module {
         summary: m.summary.clone().filter(|s| !s.trim().is_empty()),
         block,
         open_questions: m.open_questions.iter().map(map_question).collect(),
+        last_word: m.last_word.as_ref().map(map_word),
         tasks: m
             .tasks
             .iter()
@@ -1264,6 +1293,17 @@ fn map_agent(a: &api::AgentDto) -> AgentRow {
             format!("Holds: {}", a.claim_names)
         },
         health: a.health.as_ref().map(map_health),
+        last_seen: a.last_seen.clone(),
+        last_word: a.last_word.as_ref().map(map_word),
+    }
+}
+
+fn map_word(w: &api::AnnouncementDto) -> Word {
+    Word {
+        text: w.text.clone(),
+        by: w.by.clone(),
+        at: w.at.clone(),
+        subject: w.subject.clone(),
     }
 }
 

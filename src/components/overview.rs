@@ -221,6 +221,7 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
         f.agent,
     );
     let first = if props.first { "yes" } else { "no" };
+    let word = f.last_word.as_ref().map(|w| w.line());
 
     let inner: Element = ui! {
         view(style = RowInner()) {
@@ -232,6 +233,9 @@ pub fn PlayRow(props: &PlayRowProps) -> Element {
                     }
                 }
                 Typography(content = meta, kind = typography_kind::Caption, muted = true)
+                if let Some(word) = word {
+                    Typography(content = word, kind = typography_kind::Caption)
+                }
             }
             view(style = ProgressSlot()) {
                 Mono(content = pct, size = MonoTextSize::Overline)

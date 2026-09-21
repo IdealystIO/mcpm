@@ -775,6 +775,11 @@ pub struct FeatureRollup {
     /// feature nothing has happened to.
     pub started: Option<DateTime<Utc>>,
     pub last_activity: Option<DateTime<Utc>>,
+    /// The newest announcement anywhere in the feature — on it or on
+    /// one of its modules — so a board reads what the crew is doing
+    /// without opening the ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_word: Option<Announcement>,
 }
 
 /// One thing across the project that has stopped and is waiting on a
@@ -896,7 +901,25 @@ pub struct ModuleView {
     /// Open questions on this module (the feature's are on the tree).
     #[serde(default)]
     pub open_questions: Vec<QuestionRef>,
+    /// The latest thing an agent announced on this module, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_word: Option<Announcement>,
     pub tasks: Vec<TaskView>,
+}
+
+/// What an agent last said it was doing, in its own words. Derived from
+/// the ledger (`type = 'announcement'`) at read time — the roster, a
+/// module and a feature each carry the newest one that names them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Announcement {
+    pub text: String,
+    /// Who said it.
+    pub by: String,
+    pub at: DateTime<Utc>,
+    /// What it was said on: a module or a feature id.
+    pub subject_id: String,
+    /// That subject's name, for display.
+    pub subject: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1068,7 +1091,12 @@ pub struct Event {
     pub payload: serde_json::Value,
 }
 
-/// One registered agent with its live claim load (dashboard roster).
+/// One agent on the roster with its live claim load.
+///
+/// The roster is the agents that are still part of the picture — a
+/// live claim, a registered box that has not answered 404, or a voice
+/// heard in the last day — not every name the ledger ever recorded;
+/// `Store::agents_overview` holds the rule.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentOverview {
     pub name: String,
@@ -1076,8 +1104,13 @@ pub struct AgentOverview {
     pub active_claims: i64,
     /// Comma-joined names of the modules it currently holds.
     pub claim_names: String,
+    /// The last time it registered or announced anything.
+    pub last_seen: DateTime<Utc>,
     /// The health check registered for it, if any, with its verdict.
     pub health: Option<AgentHealth>,
+    /// The last thing it announced, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_word: Option<Announcement>,
 }
 
 /// A registered health check and what the last probe made of it.

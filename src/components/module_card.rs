@@ -63,6 +63,16 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
     let readiness = m.readiness();
     let waits = (readiness == Readiness::Waiting)
         .then(|| clip(&format!("waits on {}", f.module_names(&m.waiting_on)), WAITS_CHARS));
+    // The one line under the ticks is the "waits on" list while the
+    // gate is shut and the worker's last word once it is open: a card
+    // that is waiting has nobody speaking on it, and a card that is
+    // moving has nothing to wait for.
+    let word = match (&waits, &m.last_word) {
+        (None, Some(w)) if status != Status::Done => {
+            Some(clip(&format!("\u{201c}{}\u{201d}", w.text), WAITS_CHARS))
+        }
+        _ => None,
+    };
     let ready_arm = match readiness {
         Readiness::Open => "open",
         Readiness::Waiting => "waiting",
@@ -98,6 +108,9 @@ pub fn ModuleCard(props: &ModuleCardProps) -> Element {
             Ticks(ticks = ticks)
             if let Some(line) = waits {
                 text(style = WaitsLine()) { line }
+            }
+            if let Some(line) = word {
+                text(style = WordLine()) { line }
             }
         }
     };
@@ -247,6 +260,16 @@ stylesheet! {
             align_items: AlignItems::Center,
             gap: t.spacing.sm(),
             min_width: 0,
+        }
+    }
+}
+
+stylesheet! {
+    pub WordLine<IdeaThemeRef> {
+        base(t) {
+            font_size: t.typography.overline_size(),
+            color: t.color.text_muted(),
+            overflow: runtime_core::Overflow::Hidden,
         }
     }
 }

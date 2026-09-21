@@ -35,5 +35,5 @@ pub use keys::{
     MintRequest, MintedWorker, MANAGER_ONLY,
 };
 pub use redact::redact_url;
-pub use store::{Store, ATTACHMENT_LINK_TTL_SECS, MAX_ATTACHMENT_BYTES};
+pub use store::{Store, ATTACHMENT_LINK_TTL_SECS, MAX_ANNOUNCEMENT_CHARS, MAX_ATTACHMENT_BYTES};
 pub use types::*;

@@ -375,6 +375,18 @@ the console; keep one tab, or use headless Chrome.
   verified FIRST, so nothing below it — the expiry, the key it is bound
   to — is observable without already holding the token, and a guesser
   only ever reaches `delegation_unknown`.
+- **An announcement is a ledger event and nothing else, and the
+  roster's membership is a rule in the store.** `Store::announce`
+  writes one `announcement` event; the "last word" on a module, a
+  feature and an agent is DERIVED from the ledger by
+  `latest_announcements` at read time (three partial indexes in
+  migration 0017 make each grouping a probe). Storing it on the row as
+  well would be a second copy that drifts from the feed. And
+  `agents_overview` is the roster, not the `agents` table: an agent is
+  listed while it holds a claim, has a health check not answering
+  `gone`, or was seen in the last day — the rule lives in that query
+  because the header's live count reads the same list, and a filter in
+  a view would leave the two disagreeing.
 - **A health URL is fetched by the server, so the allowlist is the
   gate and every registration path goes through it.** `agents.health_url`
   is agent-supplied and `run_prober` GETs it from inside the

@@ -114,7 +114,10 @@ dispatch instead of one per wave.\n\
 Never compute the gate yourself — next_work \
 already did. When workers return, poll \
 feature_status(feature_id, events_since=<cursor>) and read the new events: completions, \
-blockers, premature claims, discovered tasks, module_unlocked. Dispatch the next wave.\n\
+blockers, premature claims, discovered (ad hoc) tasks, announcements — what a worker said \
+it was doing in its own words — and module_unlocked. Dispatch the next wave. Announce \
+on the feature yourself (announce(feature_id, text)) for the work between modules: the \
+merge, the suite, the deploy.\n\
 4. On blocker_reported or premature_claim: fix the plan (revise_plan — add_dependency, \
 add_module, update_module, remove), re-dispatch, or escalate to the human. A \
 premature_claim event means YOUR dispatch was early.\n\
@@ -250,10 +253,16 @@ direction='up') for conventions and interfaces decided upstream — that walk en
 the project's standing knowledge, so it covers house rules as well as this feature's. \
 Ask in plain words; matching is fuzzy. Narrow with kinds=['convention','gotcha'] when \
 you want the rules rather than the history.\n\
-3. Work the checklist: complete_task each item as it lands. A task ticked when it is done \
-survives an interruption; one ticked at the end only survives if you get there. On a spot \
-instance the replacement sees your checklist, not your intentions. When reality reveals \
-work the plan missed, add_task it — it is recorded as discovered.\n\
+3. Work the checklist OUT LOUD. complete_task each item THE MOMENT it lands — never a \
+batch at the end: a task ticked when it is done survives an interruption, and until the \
+first tick a reader sees a module that is quiet, not one that is moving. When something \
+outside the plan takes your time — an e2e run goes red, the build breaks, a framework gap \
+needs routing around — add_task it BEFORE you fix it and tick it after: it lands as ad hoc \
+work, and that is how anyone later sees where the plan was thin without reading a \
+transcript. And announce('{module_id}', text) one line in your own words whenever the \
+checklist alone would not say why you are quiet: 'e2e failed on smoke:48, fixing', \
+'waiting on a nine-minute wasm build'. Announcing changes nothing and holds nothing — \
+it is the pulse a person reads on the console.\n\
 4. commit_memory anything the next agent will need, with the kind that fits \
 (decision, gotcha, reference). Module scope for what is true of your module; \
 scope={{level:'project'}} for something you learned that will bite anyone here, not \

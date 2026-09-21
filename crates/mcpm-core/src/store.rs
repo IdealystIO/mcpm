@@ -75,10 +75,18 @@ const MAX_LIVE_WORKER_KEYS: i64 = 64;
 /// reclaimable instances, where a mid-module reclaim loses the whole
 /// checklist and the resuming agent cannot tell "not started" from
 /// "done but unrecorded".
-const CLAIM_GUIDANCE: &str = "Tick each task as you finish it. A task ticked when it \
-     is done survives an interruption; one ticked at the end only survives if you \
-     get there. On a spot instance the replacement sees your checklist, not your \
-     intentions.";
+const CLAIM_GUIDANCE: &str = "Tick each task (complete_task) the moment it is done, not \
+     in a batch at the end: a task ticked when it is done survives an interruption, and \
+     on a spot instance the replacement sees your checklist, not your intentions. When \
+     something outside the plan takes your time — a red e2e run, a build that breaks, a \
+     framework gap — add_task it BEFORE you fix it, then tick it: it lands as ad hoc work \
+     and is how anyone later sees where the plan was thin. And say what you are doing in \
+     your own words with announce (\"e2e failed on smoke:48, fixing\"): one line, whenever \
+     the checklist alone would not tell a reader why you are quiet.";
+
+/// The most an announcement may say. It is a headline for a card and a
+/// roster line, not a report; the report is a comment.
+pub const MAX_ANNOUNCEMENT_CHARS: usize = 280;
 
 /// The most an attachment may weigh. Attachments are briefs — a design,
 /// a screenshot, a spec, a data sample — not a media library, and the
@@ -374,40 +382,85 @@ impl Store {
         self.feature_rollups().await
     }
 
-    /// Every registered agent with its live claim count (dashboard roster).
+    /// The roster: every agent still in the picture, with its live
+    /// claim load and the last thing it said.
+    ///
+    /// "In the picture" is one of three things — it holds a live claim,
+    /// it has a health check registered whose last verdict was not
+    /// `gone`, or it registered or announced within the last day. The
+    /// `agents` table is a ledger of every name that ever called
+    /// `get_context`, and a roster that listed all of it was a wall of
+    /// boxes torn down weeks ago; the header's "agents live" count reads
+    /// this same list, so the rule lives here and not in a view.
     pub async fn agents_overview(&self) -> Result<Vec<AgentOverview>> {
         let rows = sqlx::query(
-            "SELECT a.name, a.role,
-                    (SELECT COUNT(*) FROM modules m
-                     WHERE m.claimed_by = a.name AND m.status IN ('in_progress','blocked'))
-                        AS active_claims,
-                    (SELECT COALESCE(string_agg(m.name, ', '), '') FROM modules m
-                     WHERE m.claimed_by = a.name AND m.status IN ('in_progress','blocked'))
-                        AS claim_names,
-                    a.health_url, a.health_state, a.health_detail,
-                    a.health_checked_at, a.health_since
-             FROM agents a ORDER BY a.first_seen",
+            "WITH load AS (
+                 SELECT a.name, a.role, a.last_seen,
+                        (SELECT COUNT(*) FROM modules m
+                         WHERE m.claimed_by = a.name AND m.status IN ('in_progress','blocked'))
+                            AS active_claims,
+                        (SELECT COALESCE(string_agg(m.name, ', '), '') FROM modules m
+                         WHERE m.claimed_by = a.name AND m.status IN ('in_progress','blocked'))
+                            AS claim_names,
+                        a.health_url, a.health_state, a.health_detail,
+                        a.health_checked_at, a.health_since
+                 FROM agents a
+             )
+             SELECT * FROM load
+             WHERE active_claims > 0
+                OR (health_url IS NOT NULL AND COALESCE(health_state, '') <> 'gone')
+                OR last_seen > now() - interval '24 hours'
+             ORDER BY (active_claims > 0) DESC, last_seen DESC, name",
         )
+        .fetch_all(&self.pool)
+        .await?;
+        let words = self.latest_announcements("agent").await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let name: String = r.get("name");
+                AgentOverview {
+                    last_word: words.get(&name).cloned(),
+                    role: r.get("role"),
+                    active_claims: r.get("active_claims"),
+                    claim_names: r.get("claim_names"),
+                    last_seen: r.get("last_seen"),
+                    health: r.get::<Option<String>, _>("health_url").map(|url| AgentHealth {
+                        url,
+                        state: r
+                            .get::<Option<String>, _>("health_state")
+                            .as_deref()
+                            .and_then(HealthState::parse),
+                        detail: r.get("health_detail"),
+                        checked_at: r.get("health_checked_at"),
+                        since: r.get("health_since"),
+                    }),
+                    name,
+                }
+            })
+            .collect())
+    }
+
+    /// The newest announcement per `key` — `agent`, `feature_id` or
+    /// `subject_id` — as a map from that key. One query whichever way
+    /// it is grouped; the partial indexes of migration 0017 make each
+    /// grouping a probe rather than a scan of the ledger.
+    async fn latest_announcements(
+        &self,
+        key: &str,
+    ) -> Result<std::collections::HashMap<String, Announcement>> {
+        debug_assert!(matches!(key, "agent" | "feature_id" | "subject_id"));
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT ON ({key}) {key} AS key, agent, ts, subject_id, payload
+             FROM events
+             WHERE type = 'announcement' AND {key} IS NOT NULL
+             ORDER BY {key}, seq DESC"
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|r| AgentOverview {
-                name: r.get("name"),
-                role: r.get("role"),
-                active_claims: r.get("active_claims"),
-                claim_names: r.get("claim_names"),
-                health: r.get::<Option<String>, _>("health_url").map(|url| AgentHealth {
-                    url,
-                    state: r
-                        .get::<Option<String>, _>("health_state")
-                        .as_deref()
-                        .and_then(HealthState::parse),
-                    detail: r.get("health_detail"),
-                    checked_at: r.get("health_checked_at"),
-                    since: r.get("health_since"),
-                }),
-            })
+            .map(|r| (r.get::<String, _>("key"), announcement_of(&r)))
             .collect())
     }
 
@@ -558,9 +611,11 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await?;
+        let words = self.latest_announcements("feature_id").await?;
         Ok(rows
             .into_iter()
             .map(|r| FeatureRollup {
+                last_word: words.get(&r.get::<String, _>("id")).cloned(),
                 id: r.get("id"),
                 name: r.get("name"),
                 status: r.get("status"),
@@ -1431,6 +1486,79 @@ impl Store {
         Ok(Ack::with(
             format!("Task '{name}' added to the checklist as discovered work ({task_id})."),
             json!({ "task_id": task_id }),
+        ))
+    }
+
+    /// Say, in one line and in your own words, what you are doing on a
+    /// module or a feature. An announcement is a ledger event and nothing
+    /// else — no column, no status change, no hold — so that the roster,
+    /// the module card and the feature row all read the SAME latest word
+    /// straight from the ledger. Any agent may announce on any module or
+    /// feature (a delegated identity only on its own module); a want is
+    /// not something anyone works on, so it is refused.
+    pub async fn announce(
+        &self,
+        actor: impl Into<Actor>,
+        subject_id: &str,
+        text: &str,
+    ) -> Result<Ack> {
+        let actor = actor.into();
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                "An announcement needs some words.",
+                json!({ "subject_id": subject_id }),
+                "Say what you are doing in one line: 'e2e failed on smoke:48, fixing'.",
+            ));
+        }
+        if text.chars().count() > MAX_ANNOUNCEMENT_CHARS {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                format!(
+                    "An announcement is one line; this is {} characters and the limit is {}.",
+                    text.chars().count(),
+                    MAX_ANNOUNCEMENT_CHARS
+                ),
+                json!({ "subject_id": subject_id, "limit": MAX_ANNOUNCEMENT_CHARS }),
+                "Announce the headline; put the long form in add_comment.",
+            ));
+        }
+        let (level, subject_name, feature_id) = self.comment_subject(subject_id).await?;
+        if level == AttachmentLevel::Want {
+            return Err(McpmError::new(
+                ErrorCode::PlanInvalid,
+                "An announcement goes on a module or a feature — something being worked on.",
+                json!({ "subject_id": subject_id }),
+                "Announce on the module you hold, or on its feature; a remark about a want \
+                 is add_comment.",
+            ));
+        }
+        require_comment_scope(&actor, level, subject_id)?;
+        let mut tx = self.pool.begin().await?;
+        // Speaking counts as being seen: the roster keeps a voice that
+        // has spoken today even when nothing else about it is live.
+        sqlx::query("UPDATE agents SET last_seen = now() WHERE name = $1")
+            .bind(&actor.name)
+            .execute(&mut *tx)
+            .await?;
+        record_event(
+            &mut tx,
+            "announcement",
+            feature_id.as_deref(),
+            Some(subject_id),
+            Some(&actor.name),
+            json!({
+                "text": text,
+                "subject": subject_name,
+                "level": level.as_str(),
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Ack::with(
+            format!("Announced on {subject_name}: {text}"),
+            json!({ "subject_id": subject_id }),
         ))
     }
 
@@ -4235,6 +4363,9 @@ impl Store {
         // in one read: the gate's other half, derived here so
         // `dispatchable` cannot disagree with `claim_module`.
         let questions = self.open_questions_in(feature_id).await?;
+        // The newest announcement on each module of this feature, one
+        // read for the whole tree.
+        let words = self.latest_announcements("subject_id").await?;
         let feature_questions: Vec<QuestionRef> =
             questions.iter().filter(|q| q.level == "feature").cloned().collect();
         let feature_open = !feature_questions.is_empty();
@@ -4304,6 +4435,7 @@ impl Store {
                     && !feature_open
                     && open_questions.is_empty(),
                 open_questions,
+                last_word: words.get(&mid).cloned(),
                 id: mid.clone(),
                 name: m.get("name"),
                 description: m.get("description"),
@@ -5429,6 +5561,18 @@ async fn record_event(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// An [`Announcement`] from an `events` row of `type = 'announcement'`.
+fn announcement_of(r: &sqlx::postgres::PgRow) -> Announcement {
+    let payload: serde_json::Value = r.get("payload");
+    Announcement {
+        text: payload["text"].as_str().unwrap_or("").to_string(),
+        by: r.get::<Option<String>, _>("agent").unwrap_or_default(),
+        at: r.get("ts"),
+        subject_id: r.get::<Option<String>, _>("subject_id").unwrap_or_default(),
+        subject: payload["subject"].as_str().unwrap_or("").to_string(),
+    }
 }
 
 /// Delete every attachment row of one subject inside `tx`, returning

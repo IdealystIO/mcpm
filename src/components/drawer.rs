@@ -114,6 +114,7 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
         .collect();
     let summary = m.summary.clone().unwrap_or_default();
     let has_summary = !summary.is_empty();
+    let word = m.last_word.as_ref().map(|w| w.line());
     // The handoff and history are their own read, fetched when the
     // drawer opens; until it lands both sections say so rather than
     // claiming there is nothing.
@@ -178,11 +179,17 @@ pub fn ModulePanel(props: &ModulePanelProps) -> Element {
                             Typography(content = description, kind = typography_kind::BodySm, muted = true)
                         }
 
+                        if let Some(word) = word {
+                            view(style = WordBox()) {
+                                text(style = WordText()) { word }
+                            }
+                        }
+
                         Grid(columns = 2u32, gap = StackGap::Xs) {
                             StatCell(label = "depth", value = column)
                             StatCell(label = "spawned", value = spawned)
                             StatCell(label = "tasks done", value = format!("{done} / {total}"))
-                            StatCell(label = "agent-added", value = format!("{added}"))
+                            StatCell(label = "ad hoc", value = format!("{added}"))
                         }
 
                         if let Some((title, body)) = block {
@@ -598,7 +605,7 @@ pub struct TaskRowProps {
     pub label: String,
     /// Checked off?
     pub done: bool,
-    /// Worker-discovered (`origin: discovered`)?
+    /// Ad hoc — added by the worker outside the plan (`origin: discovered`)?
     pub added: bool,
 }
 
@@ -633,11 +640,30 @@ pub fn TaskRow(props: &TaskRowProps) -> Element {
                 text(style = text_style) { label }
             }
             if added {
-                Badge(label = "agent-added", tone = tone::Info)
+                Badge(label = "ad hoc", tone = tone::Info)
             }
             if let Some(control) = remove {
                 control
             }
+        }
+    }
+}
+
+stylesheet! {
+    pub WordBox<IdeaThemeRef> {
+        base(t) {
+            padding_left: t.spacing.sm(),
+            border_left_width: 2.0,
+            border_color: t.color.border(),
+        }
+    }
+}
+
+stylesheet! {
+    pub WordText<IdeaThemeRef> {
+        base(t) {
+            font_size: t.typography.caption_size(),
+            color: t.color.text(),
         }
     }
 }

@@ -284,9 +284,10 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
     let elapsed = f.elapsed.to_string();
     let mut meta = f.meta_line();
     if tasks_added > 0 {
-        meta.push_str(&format!(" \u{b7} {tasks_added} agent-added"));
+        meta.push_str(&format!(" \u{b7} {tasks_added} ad hoc"));
     }
     meta.push_str(&format!(" \u{b7} {elapsed}"));
+    let word = f.last_word.as_ref().map(|w| w.line());
 
     let file_count = f.attachments.len();
     let pending = f.open_questions.len()
@@ -332,6 +333,9 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
                 view(style = HeadFixed()) {
                     Mono(content = agent, size = MonoTextSize::Overline)
                 }
+            }
+            if let Some(word) = word {
+                Typography(content = word, kind = typography_kind::Caption)
             }
             Tabs(tabs = tabs, active = console.view, on_change = on_change)
         }

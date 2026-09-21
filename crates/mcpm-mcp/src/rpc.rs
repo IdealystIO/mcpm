@@ -37,7 +37,14 @@ pub const INSTRUCTIONS: &str = "mcpm (Model Context Project Management). Call ge
     to register your identity — every other tool requires it. Managers \
     plan features and dispatch what next_work returns; workers claim one \
     module, work its checklist, and exit through complete_module, \
-    report_blocker, or release_module. A feature is a GRAPH of modules: \
+    report_blocker, or release_module. Work the checklist OUT LOUD: \
+    complete_task the moment a task is done (never a batch at the end), \
+    add_task anything outside the plan that takes your time — a red e2e \
+    run, a broken build, a framework gap — before you fix it, so it is \
+    on the record as ad hoc work, and announce(subject_id, text) one \
+    line in your own words whenever the checklist would not tell a \
+    reader why you are quiet ('e2e failed on smoke:48, fixing'). A \
+    feature is a GRAPH of modules: \
     each names the modules it depends_on, and a module is claimable once \
     every one of them is done. next_work returns the ready frontier, and \
     everything in it can run at once. Workers are dispatched, not \
@@ -361,6 +368,11 @@ async fn call_tool(
                     .add_task(&actor, &module_id, &task_name, note.as_deref())
                     .await?,
             )
+        }
+        "announce" => {
+            let subject_id = str_arg(args, "subject_id")?;
+            let text = str_arg(args, "text")?;
+            to_value(store.announce(&actor, &subject_id, &text).await?)
         }
         "complete_module" => {
             let module_id = str_arg(args, "module_id")?;

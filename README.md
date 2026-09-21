@@ -237,6 +237,37 @@ because a presigned link signs the host it was minted for. Both the
 console host and the MCP server take the same variables; a server with
 none set serves the records and refuses only the bytes, saying why.
 
+## Announcements: the crew's own words
+
+An agent that is quiet between one checked-off task and the next is
+indistinguishable from one that is stuck, and the checklist cannot say
+why — "the e2e run went red and I am fixing it" is not a task. So any
+agent may `announce(subject_id, text)`: one line, in its own words, on
+the module it holds or on the feature (for the work between modules:
+the merge, the suite, a deploy). It is a ledger event and nothing else —
+no status changes, nothing is held — and the newest one that names a
+subject is derived from the ledger at read time, the way readiness is
+derived from the graph: the module card shows it under the ticks, the
+feature's header and its row on the home screen carry the newest word
+anywhere in the feature, the agent roster shows each agent's last word
+beside its claims, and the *Activity* feed lists them all with a `says`
+badge. Worker briefings ask for it whenever the checklist alone would
+not tell a reader why the box is quiet.
+
+Two neighbours of that on the checklist itself. `complete_task` is meant
+to be called the moment a task lands, never as a batch at the end — a
+batch reads as silence until the module closes, and a spot replacement
+sees the checklist, not the intentions. And `add_task` is for work the
+plan did not name, added *before* it is done: a red e2e run, a broken
+build, a framework gap. Such a task lands with `origin: discovered` and
+the console shows it as **ad hoc** (a badge on the row, a count on the
+module and the feature), so where a plan was thin is readable from the
+checklist without a transcript.
+
+The roster on the *Activity* tab lists agents still in the picture — a
+live claim, a registered health check that has not answered 404, or a
+voice heard in the last day — not every name that ever registered.
+
 ## Discussion, and questions that hold the work
 
 Every feature, want and module has a discussion — the *Discussion* tab
@@ -649,7 +680,8 @@ of the `server` SDK, so running only one hides breakage in the other.
 conversion). `-p control-center` checks Tab completion against a seeded
 registry. `-p mcpm-core` runs against a real Postgres, replaying the
 worked scenario end to end (premature claim, per-module unlocks, the
-plan validators, documents, discovered tasks, blockers, memory search
+plan validators, documents, discovered tasks, announcements and the
+roster's membership rule, blockers, memory search
 directions, every completion guard),
 exercising the want pool (capture, search, group composition, the
 frozen-once-promoted rule, declines and reopens, one want across two

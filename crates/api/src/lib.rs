@@ -205,6 +205,24 @@ pub struct FeatureRollupDto {
     /// "MMM D HH:MM" of the first and last ledger entry, or empty.
     pub started: String,
     pub last_activity: String,
+    /// The newest announcement anywhere in the feature.
+    #[serde(default)]
+    pub last_word: Option<AnnouncementDto>,
+}
+
+/// The latest thing an agent said it was doing, on a module, a
+/// feature, or from the roster's side. Empty text means nothing was
+/// ever announced there.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AnnouncementDto {
+    pub text: String,
+    /// Who said it.
+    pub by: String,
+    /// "MMM D HH:MM" of when.
+    pub at: String,
+    /// mod_… or feat_… it was said on, and that subject's name.
+    pub subject_id: String,
+    pub subject: String,
 }
 
 /// One stuck thing on the home screen's attention list.
@@ -287,6 +305,9 @@ pub struct ModuleDto {
     /// Open questions on this module.
     #[serde(default)]
     pub open_questions: Vec<QuestionDto>,
+    /// The newest announcement on this module.
+    #[serde(default)]
+    pub last_word: Option<AnnouncementDto>,
     pub tasks: Vec<TaskDto>,
 }
 
@@ -589,6 +610,12 @@ pub struct AgentDto {
     /// and down".
     #[serde(default)]
     pub health: Option<AgentHealthDto>,
+    /// "MMM D HH:MM" it last registered or announced.
+    #[serde(default)]
+    pub last_seen: String,
+    /// The newest thing it announced.
+    #[serde(default)]
+    pub last_word: Option<AnnouncementDto>,
 }
 
 /// What the server's last probe of an agent's machine concluded.
@@ -854,6 +881,7 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
             tasks_added: r.tasks_added,
             started: stamp(r.started),
             last_activity: stamp(r.last_activity),
+            last_word: r.last_word.as_ref().map(announcement_dto),
         })
         .collect();
     let attention = store
@@ -889,6 +917,8 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
                 since: stamp(h.since),
                 checked: stamp(h.checked_at),
             }),
+            last_seen: stamp(Some(a.last_seen)),
+            last_word: a.last_word.as_ref().map(announcement_dto),
         })
         .collect();
     let tags = store
@@ -1011,6 +1041,7 @@ pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerErr
                 depth: m.depth,
                 dispatchable: m.dispatchable,
                 open_questions: m.open_questions.iter().map(question_dto).collect(),
+                last_word: m.last_word.as_ref().map(announcement_dto),
                 tasks: m
                     .tasks
                     .into_iter()
@@ -1681,6 +1712,17 @@ fn document_dto(d: &mcpm_core::DocumentView) -> DocumentDto {
 }
 
 #[cfg(feature = "server")]
+fn announcement_dto(a: &mcpm_core::Announcement) -> AnnouncementDto {
+    AnnouncementDto {
+        text: a.text.clone(),
+        by: a.by.clone(),
+        at: a.at.format("%b %-d %H:%M").to_string(),
+        subject_id: a.subject_id.clone(),
+        subject: a.subject.clone(),
+    }
+}
+
+#[cfg(feature = "server")]
 fn question_dto(q: &mcpm_core::QuestionRef) -> QuestionDto {
     QuestionDto {
         id: q.id.clone(),
@@ -1808,9 +1850,12 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
         "task_done" => (format!("Task checked off: {}", s("task")), s("note")),
         "task_skipped" => (format!("Task skipped: {}", s("task")), s("note")),
         "task_added" => (
-            format!("Worker added a task: {}", s("task")),
-            String::new(),
+            format!("Ad hoc task added: {}", s("task")),
+            s("note"),
         ),
+        // The announcement IS the headline; where it was said goes
+        // under it.
+        "announcement" => (s("text"), format!("On {}.", s("subject"))),
         "module_done" => (format!("Module complete: {}", s("module")), String::new()),
         "module_unlocked" => (
             format!("Ready: {}", s("module")),

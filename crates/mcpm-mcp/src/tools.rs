@@ -1,4 +1,4 @@
-//! The 39 tool definitions (architecture doc §5). Descriptions are the
+//! The 41 tool definitions (architecture doc §5). Descriptions are the
 //! agent UX: they say what the tool does, who calls it, and what the
 //! caller should do with the answer.
 
@@ -263,9 +263,11 @@ fn tree_tools() -> Value {
         },
         {
             "name": "complete_task",
-            "description": "WORKER. Check off one checklist task as you finish it — not in a \
-                batch at the end. Skipping requires a reason in note; the reason becomes part \
-                of the record.",
+            "description": "WORKER. Check off one checklist task THE MOMENT it is done — never \
+                in a batch at the end. A batch at the end reads as silence until the module \
+                closes, and on a spot instance the replacement sees your checklist, not your \
+                intentions. Skipping requires a reason in note; the reason becomes part of \
+                the record.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -279,9 +281,13 @@ fn tree_tools() -> Value {
         },
         {
             "name": "add_task",
-            "description": "WORKER. Extend your own module's checklist when reality reveals \
-                work the plan missed. The task lands with origin 'discovered' so the manager \
-                can audit plan quality later.",
+            "description": "WORKER. Put work the plan did not name onto your own module's \
+                checklist — BEFORE you do it, then complete_task it when it is done. That is \
+                for anything outside the plan that takes real time: a red e2e run you have \
+                to fix, a build that broke under you, a framework gap you had to route \
+                around, a migration the plan forgot. The task lands with origin 'discovered' \
+                (the console shows it as ad hoc), so where the models struggle and where the \
+                plan was thin is readable from the checklist without a transcript.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -291,6 +297,28 @@ fn tree_tools() -> Value {
                     "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one. Identifies you as the minted worker rather than as the machine's key; the server records YOUR name and confines you to the module the token was minted for." }
                 },
                 "required": ["module_id", "name"]
+            }
+        },
+        {
+            "name": "announce",
+            "description": "ANY AGENT. Say in one line, in your own words, what you are doing \
+                on a module or a feature — 'e2e failed on smoke:48, fixing', 'wasm rebuild, \
+                nine minutes', 'merging development in before the last module'. It is the \
+                pulse a person reads on the console: the module card, the feature row and \
+                the agent roster each show the latest word, and the feed carries them all. \
+                Announce whenever the checklist alone would not tell a reader why you are \
+                quiet: a test run failed and you are on it, you are waiting on a long build, \
+                you hit something the plan did not mention. It changes no status and holds \
+                nothing — a decision you need is ask_question, a stop is report_blocker, and \
+                the long form is add_comment. A delegated subagent announces on its own module.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject_id": { "type": "string", "description": "mod_… (the module you hold) or feat_… (the feature, for work between modules: a merge, the suite, a deploy)." },
+                    "text": { "type": "string", "description": "One line, under 280 characters, present tense: what is happening and what you are doing about it." },
+                    "delegation_token": { "type": "string", "description": "Only if you are a subagent that was given one." }
+                },
+                "required": ["subject_id", "text"]
             }
         },
         {

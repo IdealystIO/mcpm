@@ -24,8 +24,10 @@ pub struct FeedViewProps {
     pub feature: usize,
 }
 
-/// The live-feed view for one feature (roster is the project-wide
-/// agent registry).
+/// The live-feed view for one feature (the roster beside it is
+/// project-wide: every agent still in the picture — holding a claim,
+/// on a box that answers, or heard from today — not every name ever
+/// registered).
 ///
 /// The ledger is paged: the newest page arrives when the tab opens
 /// and refreshes on a tick, and the control at the bottom reads the
@@ -67,7 +69,7 @@ pub fn FeedView(props: &FeedViewProps) -> Element {
                     }
                 }
                 view(style = RosterCol()) {
-                    text(style = SectionLabel()) { "Registered agents" }
+                    text(style = SectionLabel()) { "Agents" }
                     for i in 0..roster_count {
                         RosterCard(index = i)
                     }
@@ -170,6 +172,11 @@ pub fn RosterCard(props: &RosterCardProps) -> Element {
     let health_label = a.health.as_ref().map(|h| h.label.clone()).unwrap_or_default();
     let health_tone = status_tone(a.health.as_ref().map(|h| h.tone).unwrap_or(state));
     let health_line = a.health.as_ref().map(|h| h.line.clone()).unwrap_or_default();
+    // The last thing it said, in its own words — the pulse the roster
+    // exists for once a box is known to be up.
+    let word = a.last_word.as_ref().map(|w| format!("\u{201c}{}\u{201d}", w.text));
+    let word_at = a.last_word.as_ref().map(|w| format!("{} on {}", w.at, w.subject)).unwrap_or_default();
+    let seen = format!("seen {}", a.last_seen);
     ui! {
         view(style = RosterBox()) {
             Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
@@ -187,11 +194,39 @@ pub fn RosterCard(props: &RosterCardProps) -> Element {
             if checked {
                 Mono(content = health_line, size = MonoTextSize::Overline)
             }
-            Stack(axis = StackAxis::Row, align = StackAlign::Center) {
+            if let Some(word) = word {
+                view(style = WordBox()) {
+                    text(style = WordText()) { word }
+                    Mono(content = word_at, size = MonoTextSize::Overline)
+                }
+            }
+            Stack(axis = StackAxis::Row, gap = StackGap::Sm, align = StackAlign::Center) {
                 Mono(content = level, size = MonoTextSize::Overline)
                 Spacer()
                 Mono(content = uptime, size = MonoTextSize::Overline)
+                Mono(content = seen, size = MonoTextSize::Overline)
             }
+        }
+    }
+}
+
+stylesheet! {
+    pub WordBox<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Column,
+            gap: 2,
+            padding_left: t.spacing.sm(),
+            border_left_width: 2.0,
+            border_color: t.color.border(),
+        }
+    }
+}
+
+stylesheet! {
+    pub WordText<IdeaThemeRef> {
+        base(t) {
+            font_size: t.typography.caption_size(),
+            color: t.color.text(),
         }
     }
 }
