@@ -467,6 +467,9 @@ pub struct RoadItem {
     /// Optional long form, Markdown.
     pub vision: String,
     pub horizon: String,
+    /// The planner's own display order. What orders the HORIZON
+    /// groups, so adding an item never re-lays the screen.
+    pub position: i32,
     pub state: RoadState,
     /// "MMM D HH:MM" of when it shipped, or empty.
     pub shipped_at: String,
@@ -557,12 +560,17 @@ pub struct Roadmap {
 }
 
 impl Roadmap {
-    /// The horizons in the order their items first appear, with the
-    /// items under each. A horizon is a display label with no
-    /// semantics, so it is grouped, never sorted — sorting it would
-    /// make it look like an ordering, which is exactly what it is not.
+    /// The horizons, each with the items under it in the roadmap's own
+    /// (topological) order.
+    ///
+    /// The GROUPS are ordered by the lowest `position` in each, which
+    /// is the order the planner put the items in — not by where a
+    /// group's first item happens to land in the topological sort. An
+    /// item with no edges sorts to the front of that, so grouping by
+    /// first appearance let adding one unscheduled idea pull its whole
+    /// horizon above `now` and re-lay the screen.
     pub fn by_horizon(&self, shelved: bool) -> Vec<(String, Vec<usize>)> {
-        let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut out: Vec<(String, Vec<usize>, i32)> = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             if item.shelved != shelved {
                 continue;
@@ -572,12 +580,16 @@ impl Roadmap {
             } else {
                 item.horizon.clone()
             };
-            match out.iter_mut().find(|(h, _)| *h == key) {
-                Some((_, v)) => v.push(i),
-                None => out.push((key, vec![i])),
+            match out.iter_mut().find(|(h, _, _)| *h == key) {
+                Some((_, v, first)) => {
+                    v.push(i);
+                    *first = (*first).min(item.position);
+                }
+                None => out.push((key, vec![i], item.position)),
             }
         }
-        out
+        out.sort_by_key(|(_, _, first)| *first);
+        out.into_iter().map(|(h, v, _)| (h, v)).collect()
     }
 
     pub fn item(&self, id: &str) -> Option<&RoadItem> {
@@ -1296,6 +1308,7 @@ pub fn apply_roadmap(road: api::RoadmapDto) -> bool {
                     intent: i.intent.clone(),
                     vision: i.vision.clone(),
                     horizon: i.horizon.clone(),
+                    position: i.position,
                     state: RoadState::parse(&i.state),
                     shipped_at: i.shipped_at.clone(),
                     shipped_by: i.shipped_by.clone(),

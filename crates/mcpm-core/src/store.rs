@@ -1041,16 +1041,19 @@ impl Store {
         let next = match (&item_id, held.is_empty()) {
             (None, _) => " It was loose — bound to no roadmap item — so it is released.".to_string(),
             (Some(_), true) => format!(
-                " It is bound to the roadmap, so it is done but NOT released: call                  release_feature('{feature_id}', ...) when it goes out."
+                " It is bound to the roadmap, so it is done but NOT released: call \
+                 release_feature('{feature_id}', ...) when it goes out."
             ),
             (Some(_), false) => format!(
-                " It is bound to the roadmap and HELD: {} must ship before it can be released.                  Nothing here is wrong — leave it done-and-unreleased and tell your operator.",
+                " It is bound to the roadmap and HELD: {} must ship before it can be released. \
+                 Nothing here is wrong — leave it done-and-unreleased and tell your operator.",
                 held.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", ")
             ),
         };
         Ok(Ack::with(
             format!(
-                "Feature '{name}' is complete. The summary was committed as a feature-scope                  memory.{next}"
+                "Feature '{name}' is complete. The summary was committed as a feature-scope \
+                 memory.{next}"
             ),
             json!({
                 "feature_id": feature_id,
@@ -1309,12 +1312,15 @@ impl Store {
             return Err(McpmError::new(
                 ErrorCode::PrereqsOpen,
                 format!(
-                    "Module '{module_name}' ({module_id}) of '{feature_name}' is held by the                      roadmap: {} hard prerequisite(s) have not shipped: {}.",
+                    "Module '{module_name}' ({module_id}) of '{feature_name}' is held by the \
+                     roadmap: {} hard prerequisite(s) have not shipped: {}.",
                     names.len(),
                     names.join(", ")
                 ),
                 json!({ "blocking_roadmap": items }),
-                "Do not begin work on this module. A hard roadmap prerequisite means the thing                  it depends on does not exist yet, so there is nothing to build against. Report                  PREREQS_OPEN to your manager and end your turn.",
+                "Do not begin work on this module. A hard roadmap prerequisite means the thing \
+                 it depends on does not exist yet, so there is nothing to build against. Report \
+                 PREREQS_OPEN to your manager and end your turn.",
             ));
         }
 
@@ -5150,7 +5156,8 @@ impl Store {
                     return Err(McpmError::new(
                         ErrorCode::Forbidden,
                         format!(
-                            "A worker may only mint inside a feature it holds a claim in,                              and '{}' holds none in this one.",
+                            "A worker may only mint inside a feature it holds a claim in, and \
+                             '{}' holds none in this one.",
                             minter.name
                         ),
                         json!({
@@ -5158,7 +5165,9 @@ impl Store {
                             "module_id": module_id,
                             "feature_id": feature_id,
                         }),
-                        "Claim your own module in this feature first, then mint for the                          siblings you want to run beside it. If you were never dispatched                          to this feature, this is not your work to split — ask your                          manager.",
+                        "Claim your own module in this feature first, then mint for the siblings \
+                         you want to run beside it. If you were never dispatched to this \
+                         feature, this is not your work to split — ask your manager.",
                     ));
                 }
             }

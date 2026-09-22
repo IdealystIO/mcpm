@@ -20,12 +20,12 @@ use idea_ui::{tone, typography_kind, Badge, Button, IdeaThemeRef, Progress, Prog
     Tag, Typography};
 use runtime_core::{
     component, memo, rx, stylesheet, switch, ui, AlignItems, Cursor, Element, FlexDirection,
-    FlexWrap, FontWeight, IdealystSchema, IntoElement, JustifyContent, StyleApplication,
+    FlexWrap, FontWeight, IdealystSchema, IntoElement, Position, StyleApplication,
 };
 use std::rc::Rc;
 
 use crate::components::bits::{tappable, StatusDot};
-use crate::components::drawer::panel_motion;
+use crate::components::drawer::{close_box_style, panel_motion, CloseGlyph};
 use crate::components::edits::{ActionMenu, MenuEntry};
 use crate::model::{self, RoadFeature, RoadState};
 use crate::state::{Console, Edit};
@@ -58,9 +58,12 @@ pub fn RoadmapView(props: &RoadmapViewProps) -> Element {
             .count();
         let ready = road.ready_count();
         let loose = road.loose_features.len();
+        let items = road.items.iter().filter(|i| !i.shelved).count();
         format!(
-            "{} items \u{b7} {shipped} shipped \u{b7} {ready} ready to ship \u{b7} {loose} loose features",
-            road.items.iter().filter(|i| !i.shelved).count(),
+            "{items} item{} \u{b7} {shipped} shipped \u{b7} {ready} ready to ship \u{b7} \
+             {loose} loose feature{}",
+            if items == 1 { "" } else { "s" },
+            if loose == 1 { "" } else { "s" },
         )
     });
     let new_item: Rc<dyn Fn()> =
@@ -440,6 +443,19 @@ pub fn RoadFeatureRow(props: &RoadFeatureRowProps) -> Element {
         let row = row.clone();
         move || row().map(|f| f.released).unwrap_or(false)
     };
+    // Three states, and the badge only speaks for two of them: it is
+    // OUT, or the work is done and the ship door has not opened. A
+    // feature that is merely unfinished says so with its bar — calling
+    // that "held" would borrow the roadmap's word for a lock that does
+    // not exist yet.
+    let ship_state = {
+        let row = row.clone();
+        move || match row() {
+            Some(f) if f.released => "out",
+            Some(f) if f.status == "done" => "unreleased",
+            _ => "",
+        }
+    };
     let counts = {
         let row = row.clone();
         rx!(row()
@@ -451,13 +467,22 @@ pub fn RoadFeatureRow(props: &RoadFeatureRowProps) -> Element {
         let released = released.clone();
         rx!(if released() { tone::Success.into() } else { tone::Info.into() })
     };
-    let out_label = {
-        let released = released.clone();
-        rx!(if released() { "out".to_string() } else { "held".to_string() })
-    };
-    let out_tone = {
-        let released = released.clone();
-        rx!(if released() { tone::Success.into() } else { tone::Neutral.into() })
+    // The badge's own slot, keyed on the one word it says — so the
+    // pill appears and disappears without the row around it moving.
+    let badge = {
+        let ship_state = ship_state.clone();
+        switch(
+            move || ship_state().to_string(),
+            move |word: &String| {
+                let word = word.clone();
+                if word.is_empty() {
+                    return ui! { view {} };
+                }
+                let badge_tone: idea_ui::ToneRef =
+                    if word == "out" { tone::Success.into() } else { tone::Warning.into() };
+                ui! { Badge(label = word, tone = badge_tone) }
+            },
+        )
     };
     let go = {
         let id = id.clone();
@@ -473,7 +498,7 @@ pub fn RoadFeatureRow(props: &RoadFeatureRowProps) -> Element {
                 view(style = FeatureBar()) {
                     Progress(value = fraction, tone = bar_tone, cap = ProgressCap::Rounded)
                 }
-                Badge(label = out_label, tone = out_tone)
+                badge
             }
         }],
         go,
@@ -664,7 +689,15 @@ pub fn RoadmapPanel(props: &RoadmapPanelProps) -> Element {
     let intent_text = item.intent.clone();
     let item_name = item.name.clone();
     let entries = item_entries(&id);
-    let close: Rc<dyn Fn()> = Rc::new(move || console.close_drawer());
+    // The same × the other two drawers carry, in the same slot. A
+    // footer "Close" beside a corner affordance is UX_GUIDELINES rule
+    // 14's exact case, and the drawer already closes on the backdrop.
+    let close = tappable(
+        vec![ui! { text(style = CloseGlyph()) { "\u{d7}" } }],
+        move || console.close_drawer(),
+    )
+    .with_style(StyleApplication::new(close_box_style()))
+    .into_element();
 
     ui! {
         view(style = RoadPanelBox()) {
@@ -678,6 +711,7 @@ pub fn RoadmapPanel(props: &RoadmapPanelProps) -> Element {
                 }
                 Badge(label = state_label, tone = state_tone)
                 ActionMenu(console = console, id = format!("panel-{id}"), entries = entries)
+                close
             }
             scroll_view(style = PanelScroll()) {
                 view(style = PanelBody()) {
@@ -706,7 +740,6 @@ pub fn RoadmapPanel(props: &RoadmapPanelProps) -> Element {
                     for i in 0..un {
                         Typography(content = unlocks[i].clone(), kind = typography_kind::BodySm)
                     }
-                    Button(label = "Close", on_click = close)
                 }
             }
         }
@@ -934,10 +967,17 @@ stylesheet! {
 }
 
 stylesheet! {
+    // Absolute on all four sides, like the module and want drawers.
+    // A host that only lays out in flow sizes to its panel's content
+    // and pins the overlay to the bottom of the shell instead of
+    // covering it.
     pub RoadDrawerHost<IdeaThemeRef> {
         base(_t) {
-            flex_direction: FlexDirection::Row,
-            justify_content: JustifyContent::FlexEnd,
+            position: Position::Absolute,
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
         }
     }
 }
@@ -945,10 +985,13 @@ stylesheet! {
 stylesheet! {
     pub RoadPanelBox<IdeaThemeRef> {
         base(t) {
-            flex_direction: FlexDirection::Column,
+            position: Position::Absolute,
+            top: 0,
+            right: 0,
+            bottom: 0,
             width: 420,
-            min_height: 0,
-            flex_grow: 1.0,
+            max_width: runtime_core::Length::Percent(92.0),
+            flex_direction: FlexDirection::Column,
             background: t.color.surface(),
             border_left_width: 1.0,
             border_color: t.color.border(),
@@ -1100,9 +1143,13 @@ stylesheet! {
 
 stylesheet! {
     pub RoadBackdrop<IdeaThemeRef> {
-        base(_t) {
-            flex_grow: 1.0,
-            background: "rgba(0,0,0,0.32)",
+        base(t) {
+            position: Position::Absolute,
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: t.color.overlay(),
             cursor: Cursor::Pointer,
         }
     }
