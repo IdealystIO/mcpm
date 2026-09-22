@@ -1,33 +1,39 @@
-//! The roadmap screen: where the product is going, and the two ship
-//! doors that order it.
+//! The roadmap screen: where the product is going, drawn as a graph.
 //!
-//! Everything else in this console answers "how is the work going".
-//! This screen answers the question that shapes the work before it is
-//! planned, and it is read far more often than it is edited — by
-//! people here, and by every agent through `get_context`. So the card
-//! is a reading surface: the item's name, its state, and the paragraph
-//! of intent in full. Edges and the long form are properties and open
-//! in the drawer (rule 20).
+//! One column per depth — every item sits right of everything it waits
+//! on — using the same layered router the module graph does
+//! ([`crate::components::graph`]). That reuse is the point: the
+//! crossing-cost lane placement and the pass-through bus rows took
+//! real work to get right, and a second copy beside them would drift.
 //!
-//! One thing it deliberately does NOT do: draw the graph. A roadmap
-//! has tens of items and paragraphs of text on each, so a board of
-//! columns would be a wide surface whose cards are unreadable at the
-//! width that fits them (rule 23's corollary). Depth is expressed as
-//! "waits on" and "unlocks" chips, which is what a reader actually
-//! asks of a roadmap edge.
+//! The card is deliberately SMALL. An item's paragraph of intent, its
+//! long form, its edges and the features bound to it are properties,
+//! and properties open in the drawer (rule 20) — a card that had to be
+//! as wide as its intent would not be a card at all (rule 23's
+//! corollary), and a canvas of them could not be read at any zoom.
+//!
+//! Horizon is a chip on the card rather than an axis. Columns mean
+//! "waits on"; horizon means nothing of the sort, and laying it along
+//! the same axis would draw a claim the data does not make.
 
 use idea_ui::{tone, typography_kind, Badge, Button, IdeaThemeRef, Progress, ProgressCap, Spacer,
     Tag, Typography};
 use runtime_core::{
-    component, memo, rx, stylesheet, switch, ui, AlignItems, Cursor, Element, FlexDirection,
-    FlexWrap, FontWeight, IdealystSchema, IntoElement, Position, StyleApplication,
+    component, memo, rx, signal, stylesheet, switch, ui, AlignItems, Cursor, Element,
+    FlexDirection, FlexWrap, FontWeight, IdealystSchema, IntoElement, Length,
+    Overflow, Position, Signal,
+    StyleApplication, StyleRules, Tokenized,
 };
 use std::rc::Rc;
 
-use crate::components::bits::{tappable, StatusDot};
+use crate::components::bits::{tappable, Hint, StatusDot};
 use crate::components::drawer::{close_box_style, panel_motion, CloseGlyph};
+use crate::components::graph::{
+    edges, CanvasScroll, CardSize, EdgeSegment, GraphInput, GraphLayout, Hover, LegendRowBox,
+    StripScroll,
+};
 use crate::components::edits::{ActionMenu, MenuEntry};
-use crate::model::{self, RoadFeature, RoadState};
+use crate::model::{self, RoadFeature, RoadState, Status};
 use crate::state::{Console, Edit};
 use crate::styles::{status_tone, SectionLabel};
 
@@ -69,62 +75,35 @@ pub fn RoadmapView(props: &RoadmapViewProps) -> Element {
     let new_item: Rc<dyn Fn()> =
         Rc::new(move || console.open_edit(Edit::EditRoadmapItem { item: String::new() }));
 
+    // Keyed on the SHAPE of the graph — which items, their columns and
+    // their edges — never on their data. A feature completing four
+    // levels down moves a card's tag and an edge's tone without a node
+    // here being rebuilt.
     let body = switch(
         move || {
             let road = data.roadmap.get();
             let shelved = console.road_shelved.get();
-            // The shape: the horizons, and the ids under each. Not the
-            // items themselves — a poll that ships something moves the
-            // tag inside a card that stays mounted.
-            let groups: Vec<(String, Vec<String>)> = road
-                .by_horizon(false)
-                .into_iter()
-                .map(|(h, idx)| (h, idx.into_iter().map(|i| road.items[i].id.clone()).collect()))
+            let shape: Vec<(String, usize, Vec<String>)> = road
+                .items
+                .iter()
+                .filter(|i| shelved || !i.shelved)
+                .map(|i| {
+                    (
+                        i.id.clone(),
+                        i.depth.max(1) as usize,
+                        i.depends_on.iter().map(|e| e.item_id.clone()).collect(),
+                    )
+                })
                 .collect();
-            let shelf: Vec<String> = if shelved {
-                road.by_horizon(true).into_iter().flat_map(|(_, i)| i).map(|i| road.items[i].id.clone()).collect()
-            } else {
-                Vec::new()
-            };
-            let loose: Vec<String> = road.loose_features.iter().map(|f| f.id.clone()).collect();
-            (groups, shelf, loose, road.items.is_empty())
+            (shape, road.loose_features.len(), road.items.is_empty())
         },
-        move |state: &(Vec<(String, Vec<String>)>, Vec<String>, Vec<String>, bool)| {
-            let (groups, shelf, loose, empty) = state.clone();
-            let group_count = groups.len();
-            let shelf_count = shelf.len();
-            let loose_count = loose.len();
-            ui! {
-                view(style = RoadmapBody()) {
-                    if empty {
-                        BlankRoadmap(console = console)
-                    }
-                    for g in 0..group_count {
-                        HorizonGroup(
-                            console = console,
-                            label = groups[g].0.clone(),
-                            items = groups[g].1.clone(),
-                        )
-                    }
-                    if shelf_count > 0 {
-                        HorizonGroup(
-                            console = console,
-                            label = "Shelved".to_string(),
-                            items = shelf.clone(),
-                        )
-                    }
-                    if loose_count > 0 {
-                        view(style = HorizonBlock()) {
-                            text(style = SectionLabel()) { "Loose features" }
-                            view(style = SurfaceCard()) {
-                                for i in 0..loose_count {
-                                    LooseRow(console = console, feature = loose[i].clone())
-                                }
-                            }
-                        }
-                    }
-                }
+        move |(shape, loose, empty): &(Vec<(String, usize, Vec<String>)>, usize, bool)| {
+            if *empty {
+                return ui! {
+                    view(style = RoadmapBody()) { BlankRoadmap(console = console) }
+                };
             }
+            canvas_body(console, shape.clone(), *loose)
         },
     );
 
@@ -143,39 +122,159 @@ pub fn RoadmapView(props: &RoadmapViewProps) -> Element {
                 ShelfToggle(console = console)
                 Button(label = "New item", on_click = new_item)
             }
-            scroll_view(style = RoadmapScroll()) {
-                body
+            body
+        }
+    }
+}
+
+/// One laid-out roadmap: edges under, cards over, both scrollers.
+///
+/// The geometry, the router and the edge tones are the module graph's
+/// ([`crate::components::graph`]); only the card is this screen's.
+fn canvas_body(console: Console, shape: Vec<(String, usize, Vec<String>)>, loose: usize) -> Element {
+    let data = console.data;
+    let ids: Vec<String> = shape.iter().map(|(id, _, _)| id.clone()).collect();
+    // Statuses by node index, for the edge tones. Read live, so an item
+    // shipping recolours its edges without relaying the graph.
+    let tone_ids = ids.clone();
+    let statuses = memo(move || {
+        let road = data.roadmap.get();
+        tone_ids
+            .iter()
+            .map(|id| road.item(id).map(|i| i.state.status()).unwrap_or_default())
+            .collect::<Vec<Status>>()
+    });
+
+    let road = data.roadmap.get();
+    let inputs: Vec<GraphInput> = shape
+        .iter()
+        .map(|(id, depth, deps)| GraphInput {
+            id: id.clone(),
+            depth: *depth,
+            // An edge to an item that is not drawn is not in the graph
+            // either: the router would otherwise reserve a column for a
+            // node nothing renders. This is what shelving looks like
+            // from here.
+            depends_on: deps.iter().filter(|d| ids.contains(d)).cloned().collect(),
+            status: road.item(id).map(|i| i.state.status()).unwrap_or_default(),
+        })
+        .collect();
+
+    let layout = GraphLayout::compute(&inputs, ROAD_CARD);
+    let segments = edges(&layout);
+    let cards = layout.cards();
+    let hovered: Signal<Option<Hover>> = signal(None);
+
+    let mut canvas = StyleRules::default();
+    canvas.position = Some(Position::Relative);
+    canvas.width = Some(Tokenized::Literal(Length::Px(layout.width())));
+    canvas.height = Some(Tokenized::Literal(Length::Px(layout.height())));
+    canvas.flex_shrink = Some(Tokenized::Literal(0.0));
+    // The strip between the two scrollers — the pattern is graph.rs's,
+    // and the reason is UX_GUIDELINES rule 23.
+    let mut strip = StyleRules::default();
+    strip.width = Some(Tokenized::Literal(Length::Px(layout.width())));
+    strip.min_width = Some(Tokenized::Literal(Length::Percent(100.0)));
+    strip.height = Some(Tokenized::Literal(Length::Percent(100.0)));
+    strip.min_height = Some(Tokenized::Literal(Length::Px(0.0)));
+    strip.flex_shrink = Some(Tokenized::Literal(0.0));
+    strip.flex_direction = Some(FlexDirection::Column);
+
+    ui! {
+        view(style = CanvasHost()) {
+            view(style = LegendRowBox()) {
+                Spacer()
+                Hint(
+                    text = "An item sits right of everything it waits on.\n\
+                            Green edge: both ends shipped. Blue: the prerequisite has shipped \
+                            and this one may go. Red: it is still waiting.\n\
+                            A HARD edge also holds the WORK — the dependent's modules cannot \
+                            be claimed until the prerequisite ships.\n\
+                            Open a card for its intent, its edges and the features on it.",
+                )
+            }
+            scroll_view(horizontal = true, style = StripScroll()) {
+                view(style = strip) {
+                    scroll_view(style = CanvasScroll()) {
+                        view(style = canvas) {
+                            for seg in segments, key = seg.id {
+                                EdgeSegment(
+                                    x = seg.x, y = seg.y, w = seg.w, h = seg.h,
+                                    edge = seg.edge, from = seg.from, to = seg.to,
+                                    hovered = hovered, statuses = statuses,
+                                )
+                            }
+                            for card in cards, key = card.module {
+                                RoadmapCard(
+                                    console = console,
+                                    item = ids[card.module].clone(),
+                                    index = card.module,
+                                    x = card.x,
+                                    y = card.y,
+                                    hovered = hovered,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            if loose > 0 {
+                LooseStrip(console = console)
             }
         }
     }
 }
 
-/// Props for [`HorizonGroup`].
+/// The roadmap's card geometry.
+///
+/// This is the size the ROUTER lays out with, so it is the size the
+/// card must actually be. A card that paints past it covers the
+/// pass-through rows reserved for long edges in the columns beside it
+/// — which reads as an edge cutting straight through a card, and no
+/// test catches it because the arithmetic was right and the box lied.
+/// Sized for the three rows below at the longest item name we have.
+const ROAD_CARD: CardSize = CardSize { w: 248.0, h: 108.0 };
+
+/// Props for [`LooseStrip`].
 #[derive(Default, IdealystSchema)]
-pub struct HorizonGroupProps {
+pub struct LooseStripProps {
     /// Console state handles.
     pub console: Console,
-    /// The horizon's label — display only; it orders nothing.
-    pub label: String,
-    /// The item ids under it, in the roadmap's own order.
-    pub items: Vec<String>,
 }
 
-/// One horizon's worth of cards.
+/// The features the roadmap does not account for. A footer rather than
+/// a node: they sit on no item, so they are nowhere on the graph, and a
+/// reader still has to be able to see that they exist.
 #[component]
-pub fn HorizonGroup(props: &HorizonGroupProps) -> Element {
+pub fn LooseStrip(props: &LooseStripProps) -> Element {
     let console = props.console;
-    let label = props.label.clone();
-    let items = props.items.clone();
-    let n = items.len();
-    ui! {
-        view(style = HorizonBlock()) {
-            text(style = SectionLabel()) { label }
-            for i in 0..n {
-                RoadmapCard(console = console, item = items[i].clone())
+    let data = console.data;
+    switch(
+        move || {
+            data.roadmap
+                .get()
+                .loose_features
+                .iter()
+                .map(|f| f.id.clone())
+                .collect::<Vec<String>>()
+        },
+        move |ids: &Vec<String>| {
+            let ids = ids.clone();
+            let n = ids.len();
+            ui! {
+                view(style = LooseBar()) {
+                    text(style = SectionLabel()) {
+                        format!("{n} feature{} on no roadmap item", if n == 1 { "" } else { "s" })
+                    }
+                    view(style = ChipRow()) {
+                        for i in 0..n {
+                            LooseRow(console = console, feature = ids[i].clone())
+                        }
+                    }
+                }
             }
-        }
-    }
+        },
+    )
 }
 
 /// Props for [`ShelfToggle`].
@@ -185,7 +284,7 @@ pub struct ShelfToggleProps {
     pub console: Console,
 }
 
-/// Show shelved items too. A chip rather than a tab: shelved is a
+/// Draw shelved items too. A chip rather than a tab: shelved is a
 /// second set to include, not a different screen (rule 28).
 #[component]
 pub fn ShelfToggle(props: &ShelfToggleProps) -> Element {
@@ -201,185 +300,140 @@ pub fn ShelfToggle(props: &ShelfToggleProps) -> Element {
 }
 
 /// Props for [`RoadmapCard`].
-#[derive(Default, IdealystSchema)]
+#[derive(IdealystSchema)]
 pub struct RoadmapCardProps {
     /// Console state handles.
     pub console: Console,
-    /// The item's id. An id and not an index: the roadmap re-sorts
-    /// under a poll, and an index would slide onto another item.
+    /// The item's id. An id and not an index: the roadmap re-sorts as
+    /// items ship, and an index would slide onto another item.
     pub item: String,
+    /// Its node index, which is what the hover and the edges key on.
+    pub index: usize,
+    /// Canvas-relative left edge, px.
+    pub x: f32,
+    /// Canvas-relative top edge, px.
+    pub y: f32,
+    /// What the canvas's pointer is on, shared by every card and edge.
+    pub hovered: Signal<Option<Hover>>,
 }
 
-/// One item. Everything inside reads the item live off `Data::roadmap`,
-/// so a state change moves a tag and a bar in place.
+impl Default for RoadmapCardProps {
+    fn default() -> Self {
+        Self {
+            console: Console::default(),
+            item: String::new(),
+            index: 0,
+            x: 0.0,
+            y: 0.0,
+            hovered: signal(None),
+        }
+    }
+}
+
+/// One item at its slot. Everything inside reads the item live off
+/// `Data::roadmap`, so a state change moves a tag in place and the card
+/// is not rebuilt. Hovering it lights every edge in or out of it; a
+/// click opens the drawer, where its properties are.
 #[component]
 pub fn RoadmapCard(props: &RoadmapCardProps) -> Element {
     let console = props.console;
     let data = console.data;
     let id = props.item.clone();
+    let index = props.index;
+    let hovered = props.hovered;
 
-    let item = {
+    let read = {
         let id = id.clone();
         move || data.roadmap.get().item(&id).cloned()
     };
     let name = {
-        let item = item.clone();
-        rx!(item().map(|i| i.name.clone()).unwrap_or_default())
-    };
-    let intent = {
-        let item = item.clone();
-        rx!({
-            let text = item().map(|i| i.intent.clone()).unwrap_or_default();
-            if text.trim().is_empty() {
-                // Rule 19 keeps mechanism off the screen; this is the
-                // opposite — an instruction to the one person who can
-                // act on it, on the item that needs it.
-                "No intent written. An item without one teaches nobody anything.".to_string()
-            } else {
-                text
-            }
-        })
-    };
-    // Read the ROOT signal in each reading rather than chaining off a
-    // memo built in this same body — a memo's first compute is a
-    // staged write, so a dependent built beside it reads the empty
-    // value and the debug runtime warns `staged-read`.
-    let road_state = {
-        let id = id.clone();
-        move || {
-            data.roadmap
-                .get()
-                .item(&id)
-                .map(|i| i.state)
-                .unwrap_or(RoadState::Future)
-        }
+        let read = read.clone();
+        rx!(read().map(|i| i.name.clone()).unwrap_or_default())
     };
     let status = {
-        let road_state = road_state.clone();
-        memo(move || road_state().status())
+        let read = read.clone();
+        memo(move || read().map(|i| i.state.status()).unwrap_or_default())
     };
     let state_label = {
-        let road_state = road_state.clone();
-        rx!(road_state().label().to_string())
+        let read = read.clone();
+        rx!(read().map(|i| i.state.label().to_string()).unwrap_or_default())
     };
     let state_tone = {
-        let road_state = road_state.clone();
-        rx!(status_tone(road_state().status()))
+        let read = read.clone();
+        rx!(status_tone(read().map(|i| i.state).unwrap_or(RoadState::Future).status()))
     };
-    let feature_line = {
-        let item = item.clone();
-        rx!(item().map(|i| i.feature_line()).unwrap_or_default())
+    // Its own slot, keyed on the label, so a horizon appearing or being
+    // cleared does not rebuild the card around it.
+    let horizon = {
+        let read = read.clone();
+        switch(
+            move || read().map(|i| i.horizon.trim().to_string()).unwrap_or_default(),
+            move |label: &String| {
+                let label = label.clone();
+                if label.is_empty() {
+                    return ui! { view {} };
+                }
+                ui! { Tag(label = label, tone = tone::Neutral) }
+            },
+        )
     };
-
+    let features = {
+        let read = read.clone();
+        rx!(read().map(|i| i.feature_line()).unwrap_or_default())
+    };
     let open = {
         let id = id.clone();
         move || console.open_road(&id)
     };
-    let head_id = id.clone();
-    let head = tappable(
-        vec![ui! {
+    let inner = ui! {
+        view(style = CardBody()) {
             view(style = CardHead()) {
                 StatusDot(status = status)
                 view(style = CardTitle()) {
                     Typography(
                         content = name,
-                        kind = typography_kind::Body,
+                        kind = typography_kind::BodySm,
                         weight = Some(FontWeight::SemiBold),
                     )
                 }
+            }
+            view(style = ChipRow()) {
                 Badge(label = state_label, tone = state_tone)
+                horizon
             }
-        }],
-        open.clone(),
-    )
-    .with_style(StyleApplication::new(card_head_box_style()))
-    .into_element();
-
-    // The edges: what holds this item, and what it holds. Keyed on the
-    // edges themselves, so shipping a prerequisite two cards up
-    // rebuilds only this strip.
-    let edges = {
-        let id = id.clone();
-        switch(
-            move || {
-                let road = data.roadmap.get();
-                road.item(&id)
-                    .map(|i| {
-                        (
-                            i.blocking().into_iter().map(|e| (e.name.clone(), e.hard)).collect::<Vec<_>>(),
-                            i.unlocks.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
-                        )
-                    })
-                    .unwrap_or_default()
-            },
-            move |(waiting, unlocks): &(Vec<(String, bool)>, Vec<String>)| {
-                let (waiting, unlocks) = (waiting.clone(), unlocks.clone());
-                let (wn, un) = (waiting.len(), unlocks.len());
-                ui! {
-                    view(style = ChipRow()) {
-                        for i in 0..wn {
-                            Tag(
-                                label = if waiting[i].1 {
-                                    format!("waits on {} \u{b7} hard", waiting[i].0)
-                                } else {
-                                    format!("waits on {}", waiting[i].0)
-                                },
-                                tone = tone::Danger,
-                            )
-                        }
-                        for i in 0..un {
-                            Tag(label = format!("unlocks {}", unlocks[i]), tone = tone::Neutral)
-                        }
-                    }
-                }
-            },
-        )
-    };
-
-    // The features bound to it. Keyed on which they are, not on their
-    // progress — a module completing moves a bar inside a mounted row.
-    let features = {
-        let id = id.clone();
-        switch(
-            move || {
-                data.roadmap
-                    .get()
-                    .item(&id)
-                    .map(|i| i.features.iter().map(|f| f.id.clone()).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            },
-            move |ids: &Vec<String>| {
-                let ids = ids.clone();
-                let n = ids.len();
-                ui! {
-                    view(style = FeatureList()) {
-                        for i in 0..n {
-                            RoadFeatureRow(console = console, feature = ids[i].clone())
-                        }
-                    }
-                }
-            },
-        )
-    };
-
-    let entries = item_entries(&id);
-
-    ui! {
-        view(style = SurfaceCard()) {
-            head
-            Typography(content = intent, kind = typography_kind::BodySm, muted = true)
-            edges
-            features
-            view(style = CardFoot()) {
-                Typography(content = feature_line, kind = typography_kind::Caption, muted = true)
-                Spacer()
-                ActionMenu(console = console, id = head_id, entries = entries)
-            }
+            Typography(content = features, kind = typography_kind::Caption, muted = true)
         }
-    }
+    };
+    let pressable = tappable(vec![inner], open)
+        .with_style(StyleApplication::new(card_box_style()))
+        .into_element();
+
+    let mut rules = StyleRules::default();
+    rules.position = Some(Position::Absolute);
+    rules.left = Some(Tokenized::Literal(Length::Px(props.x)));
+    rules.top = Some(Tokenized::Literal(Length::Px(props.y)));
+    rules.width = Some(Tokenized::Literal(Length::Px(ROAD_CARD.w)));
+    rules.height = Some(Tokenized::Literal(Length::Px(ROAD_CARD.h)));
+    rules.flex_direction = Some(FlexDirection::Column);
+
+    // LEFT HAND-BUILT for the same reason graph.rs's card is: `on_hover`
+    // is a builder-only channel on `view` and the `ui!` tag form has no
+    // prop for it. Leaving clears the name only if it is still ours —
+    // the pointer may already be on a line.
+    // idealyst-lint-disable-next-line prefer-ui-macro
+    runtime_core::view(vec![pressable])
+        .with_style(std::rc::Rc::new(runtime_core::StyleSheet::r#static(rules)))
+        .on_hover(move |entering| {
+            if entering {
+                hovered.set(Some(Hover::Module(index)));
+            } else if hovered.get() == Some(Hover::Module(index)) {
+                hovered.set(None);
+            }
+        })
+        .into_element()
 }
 
-/// The verbs an item offers. `Ship` is offered whenever the item is not
+/// The verbs an item offers./// The verbs an item offers. `Ship` is offered whenever the item is not
 /// already shipped — the store says no, in its own words, when the
 /// features below it are not out; a menu that hid the verb would leave
 /// the reader guessing why (rule 16's disabled-state corollary).
@@ -683,6 +737,12 @@ pub fn RoadmapPanel(props: &RoadmapPanelProps) -> Element {
         .collect();
     let has_shipped = !shipped.is_empty();
     let unlocks: Vec<String> = item.unlocks.iter().map(|e| e.name.clone()).collect();
+    // The features moved off the card and in here: they are properties
+    // of the item, and a canvas card that listed them could not be a
+    // card (rule 20, and rule 23's corollary about width).
+    let feature_ids: Vec<String> = item.features.iter().map(|f| f.id.clone()).collect();
+    let fn_count = feature_ids.len();
+    let released_line = item.feature_line();
     let (wn, un) = (waits.len(), unlocks.len());
     let vision = item.vision.clone();
     let has_vision = !vision.trim().is_empty();
@@ -739,6 +799,20 @@ pub fn RoadmapPanel(props: &RoadmapPanelProps) -> Element {
                     }
                     for i in 0..un {
                         Typography(content = unlocks[i].clone(), kind = typography_kind::BodySm)
+                    }
+                    text(style = SectionLabel()) { "Features" }
+                    if fn_count == 0 {
+                        Typography(
+                            content = "No features bound. Bind one from its own board, or from the strip under the canvas.",
+                            kind = typography_kind::Caption,
+                            muted = true,
+                        )
+                    }
+                    for i in 0..fn_count {
+                        RoadFeatureRow(console = console, feature = feature_ids[i].clone())
+                    }
+                    if fn_count > 0 {
+                        Typography(content = released_line.clone(), kind = typography_kind::Caption, muted = true)
                     }
                 }
             }
@@ -1151,6 +1225,69 @@ stylesheet! {
             bottom: 0,
             background: t.color.overlay(),
             cursor: Cursor::Pointer,
+        }
+    }
+}
+
+
+stylesheet! {
+    // The canvas's host: chrome that never gives, and a scroller that
+    // takes the rest (rule 27).
+    pub CanvasHost<IdeaThemeRef> {
+        base(_t) {
+            flex_direction: FlexDirection::Column,
+            flex_grow: 1.0,
+            min_height: 0,
+        }
+    }
+}
+
+stylesheet! {
+    // The card's own surface, inside the absolutely-positioned slot.
+    pub CardBox<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Column,
+            flex_grow: 1.0,
+            cursor: Cursor::Pointer,
+            padding: t.spacing.sm(),
+            border_width: 1.0,
+            border_color: t.color.border(),
+            border_radius: t.radius.md(),
+            background: t.color.surface(),
+        }
+        state hovered(t) { border_color: t.color.text_muted() }
+        transitions { border_color: 160ms EaseOut }
+    }
+}
+
+stylesheet! {
+    pub CardBody<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Column,
+            flex_grow: 1.0,
+            gap: t.spacing.xs(),
+            // The card is a fixed box on a canvas: anything that would
+            // not fit is clipped rather than allowed to paint over the
+            // lanes its neighbours' edges run in.
+            overflow: Overflow::Hidden,
+        }
+    }
+}
+
+stylesheet! {
+    // The loose-feature footer. Pinned, so it can never be the thing
+    // that gives when the canvas is tall (rule 27).
+    pub LooseBar<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Column,
+            gap: t.spacing.xs(),
+            flex_shrink: 0.0,
+            padding_left: t.spacing.lg(),
+            padding_right: t.spacing.lg(),
+            padding_top: t.spacing.sm(),
+            padding_bottom: t.spacing.sm(),
+            border_top_width: 1.0,
+            border_color: t.color.border(),
         }
     }
 }

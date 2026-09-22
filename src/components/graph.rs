@@ -2,8 +2,8 @@
 //! module sits right of everything it depends on — and an edge from
 //! each prerequisite to what depends on it.
 //!
-//! The layout is computed here from known card geometry
-//! ([`CARD_W`]/[`CARD_H`]) and the edges are absolutely-positioned
+//! The layout is computed here from the card geometry its caller
+//! passes ([`CardSize`]) and the edges are absolutely-positioned
 //! views inside one relatively-positioned canvas. A dependency that
 //! skips a column is routed THROUGH it on a thin pass-through row of
 //! its own, between the cards, rather than drawn under one; columns
@@ -108,8 +108,17 @@ fn graph_body(
     modules: &[Rc<Module>],
     statuses: Memo<Vec<Status>>,
 ) -> Element {
-    let layout = GraphLayout::compute(modules);
-    let segments = edges(modules, &layout);
+    let inputs: Vec<GraphInput> = modules
+        .iter()
+        .map(|m| GraphInput {
+            id: m.id.clone(),
+            depth: m.depth,
+            depends_on: m.depends_on.clone(),
+            status: m.status,
+        })
+        .collect();
+    let layout = GraphLayout::compute(&inputs, CardSize { w: CARD_W, h: CARD_H });
+    let segments = edges(&layout);
     let cards = layout.cards();
     // What the pointer is on: one dependency, by edge id, or one
     // module, by index. Read by every segment's style closure, so a
@@ -339,6 +348,35 @@ pub fn GraphCard(props: &GraphCardProps) -> Element {
         .into_element()
 }
 
+/// What the layout needs of one node, from whichever graph is using it.
+///
+/// The engine below knows nothing about modules: it orders columns by
+/// depth, routes long edges, and colours them from two statuses. That
+/// is equally true of the roadmap's items, so the input is a plain row
+/// and each caller builds one — rather than a second copy of the
+/// router growing beside this one and drifting from it.
+#[derive(Clone, PartialEq)]
+pub struct GraphInput {
+    pub id: String,
+    /// Longest path from a root, 1-based. The column, minus one.
+    pub depth: usize,
+    /// The ids this node waits on.
+    pub depends_on: Vec<String>,
+    /// Drives the tone of every edge into and out of it.
+    pub status: Status,
+}
+
+/// The card geometry a graph draws with. On the layout rather than a
+/// constant because the two graphs' cards are not the same size: a
+/// module card carries its task ticks, a roadmap card a name and a
+/// state, and the router's arithmetic has to use the one it is laying
+/// out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardSize {
+    pub w: f32,
+    pub h: f32,
+}
+
 /// A module's slot on the canvas, in px.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CardSlot {
@@ -370,14 +408,16 @@ struct Node {
     y: f32,
     /// `Some` for a module, `None` for a pass-through.
     module: Option<usize>,
+    /// Its height: a card's, or the sliver a pass-through takes.
+    h: f32,
 }
 
 impl Node {
     fn h(&self) -> f32 {
-        if self.module.is_some() { CARD_H } else { PASS_H }
+        self.h
     }
     fn mid(&self) -> f32 {
-        self.y + self.h() / 2.0
+        self.y + self.h / 2.0
     }
 }
 
@@ -405,6 +445,7 @@ pub struct GraphLayout {
     /// (prerequisite, dependent) module per original edge, same index.
     ends: Vec<(usize, usize)>,
     height: f32,
+    card: CardSize,
 }
 
 /// An edge's colour from its two ends: green when both are done,
@@ -432,7 +473,7 @@ impl GraphLayout {
     /// then right, then left again) so chains run straight, fan-outs
     /// sit beside their source, and lines cross as little as a layered
     /// drawing lets them. Modules arrive topologically sorted.
-    pub fn compute(modules: &[Rc<Module>]) -> Self {
+    pub fn compute(modules: &[GraphInput], card: CardSize) -> Self {
         let index: HashMap<&str, usize> = modules
             .iter()
             .enumerate()
@@ -442,7 +483,7 @@ impl GraphLayout {
         let mut nodes: Vec<Node> = modules
             .iter()
             .enumerate()
-            .map(|(i, m)| Node { col: m.depth - 1, row: 0, y: 0.0, module: Some(i) })
+            .map(|(i, m)| Node { col: m.depth - 1, row: 0, y: 0.0, module: Some(i), h: card.h })
             .collect();
         let mut links: Vec<Link> = Vec::new();
         let mut tones: Vec<EdgeLineTone> = Vec::new();
@@ -462,7 +503,7 @@ impl GraphLayout {
                 let mut from = si;
                 for col in sc + 1..tc {
                     let d = *buses.entry((si, col)).or_insert_with(|| {
-                        nodes.push(Node { col, row: 0, y: 0.0, module: None });
+                        nodes.push(Node { col, row: 0, y: 0.0, module: None, h: PASS_H });
                         nodes.len() - 1
                     });
                     // The hop onto a shared bus is drawn once, in the
@@ -526,12 +567,12 @@ impl GraphLayout {
             height = height.max(y - ROW_GAP + PAD);
         }
         let slots = (0..modules.len()).map(|i| Slot { col: nodes[i].col, row: nodes[i].row }).collect();
-        GraphLayout { slots, cols, nodes, links, tones, ends, height }
+        GraphLayout { slots, cols, nodes, links, tones, ends, height, card }
     }
 
     /// Left edge of a column's cards.
     pub fn x(&self, col: usize) -> f32 {
-        PAD + col as f32 * (CARD_W + COL_GAP)
+        PAD + col as f32 * (self.card.w + COL_GAP)
     }
 
     /// Top edge of a module's card.
@@ -548,7 +589,7 @@ impl GraphLayout {
 
     /// Canvas width, padding included.
     pub fn width(&self) -> f32 {
-        PAD * 2.0 + self.cols as f32 * CARD_W + (self.cols - 1) as f32 * COL_GAP
+        PAD * 2.0 + self.cols as f32 * self.card.w + (self.cols - 1) as f32 * COL_GAP
     }
 
     /// Canvas height, padding included.
@@ -636,7 +677,7 @@ fn lane_order(trunks: &mut Vec<Trunk>) {
 /// Tone follows the prerequisite: green once it is done (the gate is
 /// satisfied on this edge), amber while it is open; muted once the
 /// dependent itself is done.
-pub fn edges(_modules: &[Rc<Module>], layout: &GraphLayout) -> Vec<Segment> {
+pub fn edges(layout: &GraphLayout) -> Vec<Segment> {
     let half = LINE / 2.0;
     let mut out: Vec<Segment> = Vec::new();
     let push = |x: f32, y: f32, w: f32, h: f32, edge: usize, out: &mut Vec<Segment>| {
@@ -645,7 +686,7 @@ pub fn edges(_modules: &[Rc<Module>], layout: &GraphLayout) -> Vec<Segment> {
         out.push(Segment { id, x, y, w, h, tone: layout.tones[edge], edge, from, to });
     };
     for gap in 0..layout.cols.saturating_sub(1) {
-        let x1 = layout.x(gap) + CARD_W;
+        let x1 = layout.x(gap) + layout.card.w;
         let x2 = layout.x(gap + 1);
         let mut trunks: Vec<Trunk> = Vec::new();
         for l in layout.links.iter().filter(|l| layout.nodes[l.from].col == gap) {
@@ -666,7 +707,7 @@ pub fn edges(_modules: &[Rc<Module>], layout: &GraphLayout) -> Vec<Segment> {
                 push(xm, t.yt - half, x2 - xm, LINE, l.edge, &mut out);
                 // A pass-through keeps going across its column.
                 if layout.nodes[t.to].module.is_none() {
-                    push(x2, t.yt - half, CARD_W, LINE, l.edge, &mut out);
+                    push(x2, t.yt - half, layout.card.w, LINE, l.edge, &mut out);
                 }
             }
         }
@@ -774,28 +815,23 @@ stylesheet! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Module, Status};
+    use crate::model::Status;
 
-    fn module(id: &str, depth: usize, deps: &[&str], status: Status) -> Rc<Module> {
-        Rc::new(Module {
+    /// The engine's own input, not a Module: these tests are about the
+    /// router, and building a whole domain record to exercise four
+    /// fields of it only ties them to a type they do not test.
+    fn module(id: &str, depth: usize, deps: &[&str], status: Status) -> GraphInput {
+        GraphInput {
             id: id.into(),
-            name: id.into(),
-            description: String::new(),
-            status,
-            agent: String::new(),
-            spawned: String::new(),
-            depends_on: deps.iter().map(|d| d.to_string()).collect(),
-            waiting_on: Vec::new(),
-            owns: Vec::new(),
             depth,
-            summary: None,
-            block: None,
-            open_questions: Vec::new(),
-            last_word: None,
-            last_heard: None,
-            tasks: Vec::new(),
-        })
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            status,
+        }
     }
+
+    /// The module graph's own geometry, so the assertions below keep
+    /// measuring the layout the console actually draws.
+    const CARD: CardSize = CardSize { w: CARD_W, h: CARD_H };
 
     // The worked scenario: a chain that fans out at the end. The two
     // leaves share a column, sit under their common prerequisite, and
@@ -808,13 +844,13 @@ mod tests {
             module("app", 3, &["api"], Status::Queued),
             module("mcp", 3, &["api"], Status::Queued),
         ];
-        let layout = GraphLayout::compute(&modules);
+        let layout = GraphLayout::compute(&modules, CARD);
         assert_eq!(layout.cols, 3);
         assert_eq!(layout.slots[0], Slot { col: 0, row: 0 });
         assert_eq!(layout.slots[1], Slot { col: 1, row: 0 });
         assert_eq!(layout.slots[2], Slot { col: 2, row: 0 });
         assert_eq!(layout.slots[3], Slot { col: 2, row: 1 });
-        let segs = edges(&modules, &layout);
+        let segs = edges(&layout);
         assert_eq!(segs.len(), 9, "three segments per edge");
         for seg in &segs {
             assert!(seg.w > 0.0 && seg.h > 0.0, "{seg:?}");
@@ -846,11 +882,11 @@ mod tests {
             module("b", 2, &["a"], Status::Done),
             module("c", 3, &["a", "b"], Status::Queued),
         ];
-        let layout = GraphLayout::compute(&modules);
+        let layout = GraphLayout::compute(&modules, CARD);
         // Column 1 holds b and the pass-through of a→c, so the canvas is
         // taller than one card.
         assert!(layout.height() > PAD * 2.0 + CARD_H + ROW_GAP);
-        let segs = edges(&modules, &layout);
+        let segs = edges(&layout);
         // a→b: 3; a→c: 3 into the pass-through, 1 across, 3 into c; b→c: 3.
         assert_eq!(segs.len(), 13);
         assert_no_segment_crosses_a_card(&modules, &layout, &segs);
@@ -876,9 +912,9 @@ mod tests {
             module("permission-group-ui", 5, &["crew-screens", "permission-scope"], Status::Queued),
             module("gate-and-suite", 6, &["crew-screens", "projects-division", "permission-group-ui", "mcp-tools", "settings-screens", "noun-by-division"], Status::Queued),
         ];
-        let layout = GraphLayout::compute(&modules);
+        let layout = GraphLayout::compute(&modules, CARD);
         assert_eq!(layout.cols, 6);
-        let segs = edges(&modules, &layout);
+        let segs = edges(&layout);
         assert_no_segment_crosses_a_card(&modules, &layout, &segs);
         // Within one gap, distinct targets sit on distinct lanes.
         for gap in 0..layout.cols - 1 {
@@ -918,22 +954,22 @@ mod tests {
             module("c", 3, &["a", "b"], Status::Queued),
             module("d", 3, &["a", "b"], Status::Queued),
         ];
-        let layout = GraphLayout::compute(&modules);
+        let layout = GraphLayout::compute(&modules, CARD);
         // Column 1: b and ONE bus for a's two far edges.
         assert_eq!(layout.nodes.iter().filter(|n| n.col == 1).count(), 2);
-        let segs = edges(&modules, &layout);
+        let segs = edges(&layout);
         assert_no_segment_crosses_a_card(&modules, &layout, &segs);
         // a→b 3; a→bus 3 + 1 across; bus→c 3; bus→d 3; b→c 3; b→d 3.
         assert_eq!(segs.len(), 19);
     }
 
-    fn assert_no_segment_crosses_a_card(modules: &[Rc<Module>], layout: &GraphLayout, segs: &[Segment]) {
+    fn assert_no_segment_crosses_a_card(modules: &[GraphInput], layout: &GraphLayout, segs: &[Segment]) {
         for card in layout.cards() {
             let (l, t, r, b) = (card.x, card.y, card.x + CARD_W, card.y + CARD_H);
             for s in segs {
                 let (sl, st, sr, sb) = (s.x, s.y, s.x + s.w, s.y + s.h);
                 let overlaps = sl < r - 0.5 && sr > l + 0.5 && st < b - 0.5 && sb > t + 0.5;
-                assert!(!overlaps, "segment {s:?} crosses card '{}'", modules[card.module].name);
+                assert!(!overlaps, "segment {s:?} crosses card '{}'", modules[card.module].id);
             }
         }
     }
@@ -948,8 +984,8 @@ mod tests {
             module("c", 2, &["b"], Status::Queued),
             module("d", 2, &["a"], Status::Queued),
         ];
-        let layout = GraphLayout::compute(&modules);
-        let segs = edges(&modules, &layout);
+        let layout = GraphLayout::compute(&modules, CARD);
+        let segs = edges(&layout);
         let verticals: Vec<f32> = segs.iter().filter(|s| s.w == LINE).map(|s| s.x).collect();
         assert_eq!(verticals.len(), 2);
         assert_ne!(verticals[0], verticals[1]);
