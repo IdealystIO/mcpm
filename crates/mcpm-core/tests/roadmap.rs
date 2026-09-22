@@ -370,6 +370,54 @@ async fn re_stating_the_roadmap_updates_in_place() {
 }
 
 #[tokio::test]
+async fn a_second_plan_appends_rather_than_restarting_positions() {
+    // `position` is what orders the horizon GROUPS on the board, so a
+    // second plan that restarted at 0 would interleave its items with
+    // the first plan's and silently re-lay a screen somebody had got
+    // used to. The plan's own index is not a position.
+    with_scratch("road_position", |store| async move {
+        store
+            .plan_roadmap(
+                "mgr",
+                PlanRoadmap {
+                    items: vec![
+                        PlanRoadmapItem { name: "a".into(), ..Default::default() },
+                        PlanRoadmapItem { name: "b".into(), ..Default::default() },
+                    ],
+                },
+            )
+            .await
+            .expect("first plan");
+        store
+            .plan_roadmap(
+                "mgr",
+                PlanRoadmap {
+                    items: vec![
+                        // An UPDATE: it must keep the position it has
+                        // and must not consume a new one.
+                        PlanRoadmapItem { name: "a".into(), intent: "reworded".into(), ..Default::default() },
+                        PlanRoadmapItem { name: "c".into(), ..Default::default() },
+                    ],
+                },
+            )
+            .await
+            .expect("second plan");
+
+        let road = store.roadmap().await.expect("roadmap");
+        let at = |n: &str| road.items.iter().find(|i| i.name == n).expect("item").position;
+        assert_eq!(at("a"), 0, "an existing item keeps its position");
+        assert_eq!(at("b"), 1);
+        assert_eq!(at("c"), 2, "a new item lands after everything, not back at 0");
+
+        let mut seen: Vec<i32> = road.items.iter().map(|i| i.position).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "positions are distinct");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn shelving_releases_what_an_item_was_holding() {
     with_scratch("road_shelve", |store| async move {
         let (first, _later) = two_items(&store, false).await;

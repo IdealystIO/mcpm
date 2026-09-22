@@ -479,10 +479,30 @@ impl Store {
             )));
         }
 
+        // A NEW item goes on the end of the board. The plan's own index
+        // is not a position: a second plan would restart at 0 and
+        // interleave its items with the first plan's, which silently
+        // re-orders the horizon groups a reader is used to. An item
+        // that already exists keeps the position it has — the upsert
+        // below does not touch the column, so what is bound for it is
+        // discarded.
+        let existing_names: BTreeSet<String> = existing
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        let mut next_position: i32 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(position), -1) + 1 FROM roadmap_items")
+                .fetch_one(&mut *tx)
+                .await?;
+
         let mut written: Vec<String> = Vec::new();
-        for (n, i) in plan.items.iter().enumerate() {
+        for i in &plan.items {
             let name = i.name.trim();
             let id = &id_of_name[name];
+            let position = next_position;
+            if !existing_names.contains(name) {
+                next_position += 1;
+            }
             sqlx::query(
                 "INSERT INTO roadmap_items (id, name, intent, vision, horizon, position, created_by)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -496,7 +516,7 @@ impl Store {
             .bind(i.intent.trim())
             .bind(i.vision.trim())
             .bind(i.horizon.trim())
-            .bind(n as i32)
+            .bind(position)
             .bind(agent)
             .execute(&mut *tx)
             .await?;
