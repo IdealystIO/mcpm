@@ -22,8 +22,9 @@
 
 use mcpm_core::{
     Actor, Delegation, DocumentKind, EdgeKind, ErrorCode, KeyIdentity, KeyRole, McpmError,
-    MemoryKind, MemoryQuery, MemoryScope, MintRequest, PlanFeature, PlanOp, PromoteWants,
-    SearchDirection, Store, Supersede, TaskOutcome, WantDraft, WantEdit, WantFilter, WantState,
+    MemoryKind, MemoryQuery, MemoryScope, MintRequest, PlanFeature, PlanOp, PlanRoadmap,
+    PromoteWants, RoadmapOp, SearchDirection, Store, Supersede, TaskOutcome, WantDraft, WantEdit,
+    WantFilter, WantState,
 };
 use serde_json::{json, Value};
 
@@ -303,6 +304,25 @@ async fn call_tool(
             let feature_id = str_arg(args, "feature_id")?;
             let summary = str_arg(args, "summary")?;
             to_value(store.complete_feature(&agent, &feature_id, &summary).await?)
+        }
+        "read_roadmap" => to_value(store.roadmap().await?),
+        "plan_roadmap" => {
+            let plan: PlanRoadmap = parse_args(args)?;
+            to_value(store.plan_roadmap(&agent, plan).await?)
+        }
+        "revise_roadmap" => {
+            let ops: Vec<RoadmapOp> = parse_field(args, "ops")?;
+            to_value(store.revise_roadmap(&agent, ops).await?)
+        }
+        "release_feature" => {
+            let feature_id = str_arg(args, "feature_id")?;
+            let note = opt_str_arg(args, "note").unwrap_or_default();
+            to_value(store.release_feature(&agent, &feature_id, &note).await?)
+        }
+        "ship_roadmap_item" => {
+            let item_id = str_arg(args, "item_id")?;
+            let note = opt_str_arg(args, "note").unwrap_or_default();
+            to_value(store.ship_roadmap_item(&agent, &item_id, &note).await?)
         }
         "mint_worker" => {
             let module_id = str_arg(args, "module_id")?;
@@ -706,6 +726,13 @@ pub async fn list_resources(store: &Store) -> Result<Value, McpmError> {
             "mimeType": "application/json"
         }),
         json!({
+            "uri": "project://roadmap",
+            "name": "Roadmap",
+            "description": "Where the product is going: every item with its intent, its \
+                state, what it waits on and what waits on it.",
+            "mimeType": "application/json"
+        }),
+        json!({
             "uri": "project://wants",
             "name": "Want pool",
             "description": "Every loose idea captured for this project, with the features \
@@ -745,6 +772,8 @@ pub async fn read_resource(store: &Store, params: &Value) -> Result<Value, McpmE
         .ok_or_else(|| bad_args("missing uri"))?;
     let body = if uri == "project://status" {
         store.snapshot().await?
+    } else if uri == "project://roadmap" {
+        serde_json::to_value(store.roadmap().await?).unwrap_or_default()
     } else if uri == "project://wants" {
         serde_json::to_value(store.list_wants("", mcpm_core::WantFilter::All, &[], 500).await?)
             .map_err(McpmError::internal)?

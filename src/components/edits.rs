@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use idea_ui::{push_toast, size, tone, typography_kind, variant, Button, Chip, Field, IdeaThemeRef,
-    Menu, MenuItem, MenuSeparator, Modal, Spacer, Textarea, Typography};
+    Menu, MenuItem, MenuSeparator, Modal, Spacer, Switch, Textarea, Typography};
 use runtime_core::primitives::portal::{AnchorTarget, ElementAlign, ElementSide};
 use runtime_core::{
     component, rx, spawn_then, stylesheet, switch, ui, AlignItems, Cursor, Element,
@@ -188,6 +188,36 @@ pub fn choose(console: Console, edit: Edit) {
             .unwrap_or_default();
             console.seed_form("", &description, "", &owns, "");
         }
+        // Editing an item opens on what it says now; creating opens
+        // blank. `form_tags` carries the horizon and `form_owns` the
+        // long form — the generic buffers, as every other form here
+        // uses them.
+        Edit::EditRoadmapItem { item } => {
+            let seed = crate::model::roadmap()
+                .item(item)
+                .map(|i| (i.name.clone(), i.intent.clone(), i.vision.clone(), i.horizon.clone()));
+            match seed {
+                Some((name, intent, vision, horizon)) => {
+                    console.seed_form(&name, &intent, "", &vision, &horizon)
+                }
+                None => console.seed_form("", "", "", "", ""),
+            }
+            console.form_hard.set(false);
+        }
+        Edit::AddRoadmapDependency { .. } => {
+            console.seed_form("", "", "", "", "");
+            console.form_hard.set(false);
+        }
+        // The bind form opens on the binding the feature already has,
+        // so "no change" is the shape it starts in.
+        Edit::BindFeature { feature } => {
+            console.seed_form("", "", "", "", "");
+            let current = with_feature(feature, |f| {
+                f.roadmap_item.as_ref().map(|e| e.item_id.clone())
+            })
+            .flatten();
+            console.form_pick.set(current.into_iter().collect());
+        }
         Edit::EditWant { want } => {
             let (body, tags) = want_by_id(want)
                 .map(|w| {
@@ -295,6 +325,56 @@ fn form_body(console: Console) -> Element {
                 )
             }
             Edit::AddModule { feature } => add_module_form(console, feature),
+            Edit::EditRoadmapItem { item } => roadmap_item_form(console, item),
+            Edit::RemoveRoadmapItem { item } => confirm_form(
+                console,
+                "Remove roadmap item",
+                format!(
+                    "'{}' comes off the roadmap, with its edges. Anything waiting on it stops \
+                     waiting.",
+                    road_name(&item)
+                ),
+                "Remove",
+                true,
+                Edit::RemoveRoadmapItem { item },
+            ),
+            Edit::ShelveRoadmapItem { item, shelve } => {
+                let name = road_name(&item);
+                confirm_form(
+                    console,
+                    if shelve { "Shelve roadmap item" } else { "Unshelve roadmap item" },
+                    if shelve {
+                        // Rule 19: this is a domain rule the reader
+                        // cannot infer from the control, not the app
+                        // narrating its own mechanism.
+                        format!(
+                            "'{name}' leaves the roadmap and stops holding anything: features \
+                             waiting on it can be released."
+                        )
+                    } else {
+                        format!("'{name}' goes back on the roadmap and holds again.")
+                    },
+                    if shelve { "Shelve" } else { "Unshelve" },
+                    false,
+                    Edit::ShelveRoadmapItem { item, shelve },
+                )
+            }
+            Edit::AddRoadmapDependency { item } => add_roadmap_dependency_form(console, item),
+            Edit::RemoveRoadmapDependency { item, depends_on } => confirm_form(
+                console,
+                "Remove prerequisite",
+                format!(
+                    "'{}' will no longer wait on '{}'.",
+                    road_name(&item),
+                    road_name(&depends_on)
+                ),
+                "Remove",
+                false,
+                Edit::RemoveRoadmapDependency { item, depends_on },
+            ),
+            Edit::BindFeature { feature } => bind_feature_form(console, feature),
+            Edit::ReleaseFeature { feature } => release_feature_form(console, feature),
+            Edit::ShipRoadmapItem { item } => ship_item_form(console, item),
             Edit::RenameModule { feature, module } => name_form(
                 console,
                 "Rename module",
@@ -839,6 +919,42 @@ fn request(console: Console, edit: &Edit) -> Result<Pending, String> {
         Edit::RemoveDependency { feature, module, depends_on } => {
             revise(&feature, Op::RemoveDependency { module_id: module, depends_on })
         }
+        Edit::EditRoadmapItem { item } => Box::pin(api::save_roadmap_item(api::RoadmapDraft {
+            item_id: item,
+            name,
+            intent: text,
+            vision: console.form_owns.get().trim().to_string(),
+            horizon: console.form_tags.get().trim().to_string(),
+        })),
+        Edit::RemoveRoadmapItem { item } => {
+            Box::pin(api::revise_roadmap(vec![api::RoadmapOpDto::RemoveItem { item_id: item }]))
+        }
+        Edit::ShelveRoadmapItem { item, shelve } => Box::pin(api::revise_roadmap(vec![
+            api::RoadmapOpDto::ShelveItem { item_id: item, shelved: shelve },
+        ])),
+        Edit::AddRoadmapDependency { item } => {
+            let Some(depends_on) = pick.first().cloned() else {
+                return Err("Pick the item to wait on.".into());
+            };
+            Box::pin(api::revise_roadmap(vec![api::RoadmapOpDto::AddDependency {
+                item_id: item,
+                depends_on,
+                hard: console.form_hard.get(),
+            }]))
+        }
+        Edit::RemoveRoadmapDependency { item, depends_on } => Box::pin(api::revise_roadmap(vec![
+            api::RoadmapOpDto::RemoveDependency { item_id: item, depends_on },
+        ])),
+        // An empty pick LOOSENS the feature, which is a legal and
+        // ordinary thing to want — so this one does not refuse on it.
+        Edit::BindFeature { feature } => Box::pin(api::revise_roadmap(vec![
+            api::RoadmapOpDto::BindFeature {
+                feature_id: feature,
+                item_id: pick.first().cloned().unwrap_or_default(),
+            },
+        ])),
+        Edit::ReleaseFeature { feature } => Box::pin(api::release_feature(feature, text)),
+        Edit::ShipRoadmapItem { item } => Box::pin(api::ship_roadmap_item(item, text)),
         Edit::EditWant { want } => {
             Box::pin(api::edit_want(want, text, tags_of(&console.form_tags.get())))
         }
@@ -946,6 +1062,7 @@ fn plan_draft(console: Console) -> Result<api::PlanDraft, String> {
         });
     }
     Ok(api::PlanDraft {
+        roadmap_item: console.plan_item.get(),
         name,
         description: console.plan_description.get().trim().to_string(),
         whitepaper: console.plan_whitepaper.get().trim().to_string(),
@@ -1058,12 +1175,21 @@ fn feature_name(feature: &str) -> String {
 /// when work has happened, in its own words.
 pub fn feature_entries(feature: &str) -> Vec<MenuEntry> {
     let (status, shelved) = with_feature(feature, |f| (f.status, f.shelved)).unwrap_or_default();
+    let released = with_feature(feature, |f| !f.released.is_empty()).unwrap_or(false);
     let id = feature.to_string();
     let mut entries = vec![
         MenuEntry::new("Rename", Edit::RenameFeature { feature: id.clone() }),
         MenuEntry::new("Edit description", Edit::DescribeFeature { feature: id.clone() }),
         MenuEntry::new("Add module", Edit::AddModule { feature: id.clone() }),
+        MenuEntry::new("Bind to the roadmap", Edit::BindFeature { feature: id.clone() }),
     ];
+    // The second door, offered exactly while it means something: the
+    // work has landed and it has not gone out. The store decides
+    // whether the roadmap lets it, and says why in its own words — a
+    // menu that hid the verb would leave the reader guessing.
+    if status == Status::Done && !released {
+        entries.push(MenuEntry::new("Release\u{2026}", Edit::ReleaseFeature { feature: id.clone() }));
+    }
     if status != Status::Done {
         entries.push(MenuEntry::new(
             if shelved { "Unshelve" } else { "Shelve" },
@@ -1221,4 +1347,188 @@ stylesheet! {
             gap: t.spacing.xs(),
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The roadmap's forms
+// ---------------------------------------------------------------------
+
+/// One item's name, intent, horizon and long form. Creating and editing
+/// are the same form — the only difference is whether `item` is empty,
+/// which is also what tells the server which op to send.
+fn roadmap_item_form(console: Console, item: String) -> Element {
+    let creating = item.trim().is_empty();
+    let on_name: Rc<dyn Fn(String)> = Rc::new(move |v| console.form_name.set(v));
+    let on_text: Rc<dyn Fn(String)> = Rc::new(move |v| console.form_text.set(v));
+    let on_horizon: Rc<dyn Fn(String)> = Rc::new(move |v| console.form_tags.set(v));
+    let on_vision: Rc<dyn Fn(String)> = Rc::new(move |v| console.form_owns.set(v));
+    let body: Element = ui! {
+        view(style = FieldsCol()) {
+            Field(value = console.form_name, on_change = on_name, label = Some("Name".to_string()))
+            Textarea(
+                value = console.form_text,
+                on_change = on_text,
+                label = Some("Intent".to_string()),
+                // The placeholder carries the one instruction that
+                // decides whether this text is worth anything: it is
+                // read by every agent on the project, so it has to be
+                // about the product rather than about the work.
+                placeholder = Some(
+                    "One paragraph, in product terms: what changes for a user when this lands."
+                        .to_string(),
+                ),
+                rows = 3u32,
+                max_rows = 10u32,
+            )
+            Field(
+                value = console.form_tags,
+                on_change = on_horizon,
+                label = Some("Horizon".to_string()),
+                placeholder = Some("now / next / later".to_string()),
+            )
+            Textarea(
+                value = console.form_owns,
+                on_change = on_vision,
+                label = Some("Detail".to_string()),
+                placeholder = Some("Markdown. Read when an agent needs more than the intent.".to_string()),
+                rows = 3u32,
+                max_rows = 14u32,
+            )
+        }
+    };
+    frame(
+        console,
+        if creating { "New roadmap item" } else { "Edit roadmap item" },
+        body,
+        if creating { "Create" } else { "Save" },
+        false,
+        Edit::EditRoadmapItem { item },
+        move || !console.form_name.get().trim().is_empty(),
+    )
+}
+
+/// Pick the item a roadmap item waits on, and whether the edge is hard.
+fn add_roadmap_dependency_form(console: Console, item: String) -> Element {
+    let road = model::roadmap();
+    let already: Vec<String> = road
+        .item(&item)
+        .map(|i| i.depends_on.iter().map(|e| e.item_id.clone()).collect())
+        .unwrap_or_default();
+    let candidates: Vec<(String, String)> = road
+        .items
+        .iter()
+        .filter(|i| i.id != item && !i.shelved && !already.contains(&i.id))
+        .map(|i| (i.id.clone(), i.name.clone()))
+        .collect();
+    let pick = pick_row(console, "Waits on", candidates, false);
+    let on_hard: Rc<dyn Fn(bool)> = Rc::new(move |v| console.form_hard.set(v));
+    let body: Element = ui! {
+        view(style = FieldsCol()) {
+            pick
+            Switch(
+                value = console.form_hard,
+                on_change = on_hard,
+                label = Some("Hard \u{2014} also holds the work".to_string()),
+            )
+            Typography(
+                content = "A soft prerequisite holds only the ship door, so the work can be \
+                           planned and built ahead of it. A hard one means there is nothing to \
+                           build against yet, and refuses the claim.",
+                kind = typography_kind::Caption,
+                muted = true,
+            )
+        }
+    };
+    frame(
+        console,
+        "Add prerequisite",
+        body,
+        "Add",
+        false,
+        Edit::AddRoadmapDependency { item },
+        move || !console.form_pick.get().is_empty(),
+    )
+}
+
+/// Bind a feature to an item, or loosen it. An empty pick is the
+/// loosen, which is why this form never refuses an empty one.
+fn bind_feature_form(console: Console, feature: String) -> Element {
+    let road = model::roadmap();
+    let candidates: Vec<(String, String)> = road
+        .items
+        .iter()
+        .filter(|i| !i.shelved && i.state != model::RoadState::Shipped)
+        .map(|i| (i.id.clone(), i.name.clone()))
+        .collect();
+    let pick = pick_row(console, "Roadmap item", candidates, false);
+    let body: Element = ui! {
+        view(style = FieldsCol()) {
+            pick
+            Typography(
+                content = "Leave it unpicked to loosen this feature from the roadmap.",
+                kind = typography_kind::Caption,
+                muted = true,
+            )
+        }
+    };
+    frame(console, "Bind to the roadmap", body, "Save", false, Edit::BindFeature { feature }, || true)
+}
+
+/// The feature's second door. The form says what the verb MEANS,
+/// because "release" is the one word here a reader can take two ways.
+fn release_feature_form(console: Console, feature: String) -> Element {
+    let name = feature_name(&feature);
+    let on_text: Rc<dyn Fn(String)> = Rc::new(move |v| console.form_text.set(v));
+    let body: Element = ui! {
+        view(style = FieldsCol()) {
+            Typography(
+                content = format!("'{name}' has gone out."),
+                kind = typography_kind::Body,
+            )
+            Field(
+                value = console.form_text,
+                on_change = on_text,
+                label = Some("Where it went".to_string()),
+                placeholder = Some("deployed to prod, merged to main, in the 1.7 build\u{2026}".to_string()),
+            )
+        }
+    };
+    frame(console, "Release feature", body, "Release", false, Edit::ReleaseFeature { feature }, || true)
+}
+
+/// The item's door.
+fn ship_item_form(console: Console, item: String) -> Element {
+    let name = road_name(&item);
+    let external = model::roadmap().item(&item).is_some_and(|i| i.features.is_empty());
+    let on_text: Rc<dyn Fn(String)> = Rc::new(move |v| console.form_text.set(v));
+    let body: Element = ui! {
+        view(style = FieldsCol()) {
+            Typography(
+                content = format!("'{name}' is live \u{2014} the capability exists for users."),
+                kind = typography_kind::Body,
+            )
+            Field(
+                value = console.form_text,
+                on_change = on_text,
+                label = Some("What made it true".to_string()),
+                placeholder = Some("the release, the migration, the vendor\u{2026}".to_string()),
+            )
+            // Only where the reader cannot infer it: an item with no
+            // features is being shipped on something outside the work
+            // tree, and that is worth naming once (rule 16).
+            if external {
+                Typography(
+                    content = "No features are bound to this item, so nothing here proves it. \
+                               Say what does.",
+                    kind = typography_kind::Caption,
+                    muted = true,
+                )
+            }
+        }
+    };
+    frame(console, "Ship roadmap item", body, "Ship", false, Edit::ShipRoadmapItem { item }, || true)
+}
+
+fn road_name(item: &str) -> String {
+    model::roadmap().item(item).map(|i| i.name.clone()).unwrap_or_default()
 }

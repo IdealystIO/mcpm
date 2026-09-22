@@ -15,6 +15,7 @@ use crate::components::gate::KeyGate;
 use crate::components::header::Header;
 use crate::components::knowledge::KnowledgeDrawer;
 use crate::components::main_pane::MainPane;
+use crate::components::roadmap::RoadmapDrawer;
 use crate::components::sidebar::Sidebar;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -217,6 +218,27 @@ pub fn app() -> Element {
         }
     };
 
+    // The roadmap drawer, in the same overlay slot. Keyed on the item
+    // id: the roadmap re-sorts as items ship, so an index would slide
+    // onto a different item under a poll.
+    let roadmap_host: Element = ui! {
+        presence(
+            present = move || console.road_open.get().is_some(),
+            enter = PresenceAnim::fade(BACKDROP_IN_MS, Easing::EaseOut),
+            exit = PresenceAnim::fade(BACKDROP_OUT_MS, Easing::EaseIn),
+        ) {
+            {
+                switch(
+                    move || console.last_road.get(),
+                    move |id: &Option<String>| match id {
+                        Some(id) => ui! { RoadmapDrawer(console = console, item = id.clone()) },
+                        None => ui! { view {} },
+                    },
+                )
+            }
+        }
+    };
+
     ui! {
         view(style = PageFrame()) {
             Header(console = console)
@@ -224,6 +246,7 @@ pub fn app() -> Element {
             drawer_host
             want_host
             knowledge_host
+            roadmap_host
             // Manual edits: the one modal every form renders in, the
             // hole their requests run in, and where their outcomes
             // are announced.
@@ -257,6 +280,9 @@ struct Wanted {
     /// The discussions on screen — a want's, a module's, a feature's —
     /// most specific first.
     threads: Vec<String>,
+    /// Whether the roadmap is needed: its own screen, or a feature's
+    /// header, which badges the items holding its release.
+    roadmap: bool,
 }
 
 /// Whether one of the threads on screen is `subject`.
@@ -332,6 +358,7 @@ fn start_sync(console: Console, key: String) {
     let mut stale_pool = true;
     let mut stale_want = true;
     let mut stale_threads = true;
+    let mut stale_roadmap = true;
     let in_flight: InFlight = Rc::new(RefCell::new(HashMap::new()));
 
     raf_loop_scoped(move || {
@@ -378,6 +405,11 @@ fn start_sync(console: Console, key: String) {
                 page: console.pool_page.get(),
             }),
             want: console.want.get(),
+            // The roadmap is read for its own screen, and for a
+            // feature's header — the held badge is a current condition
+            // (rule 21) and has to be right the moment the board says
+            // the feature is bound.
+            roadmap: pane == "roadmap" || on_feature,
         };
 
         // --- What has changed under us ----------------------------
@@ -388,6 +420,11 @@ fn start_sync(console: Console, key: String) {
             if tick.seq > seen_seq {
                 seen_seq = tick.seq;
                 stale_board = true;
+                // An item's state is derived from its features, so a
+                // module completing four levels down can move a card
+                // here. Cheap to re-read (tens of rows) and wrong if
+                // missed, so it follows the board.
+                stale_roadmap = true;
                 // No kind means an old trigger: assume the worst.
                 let untyped = tick.kind.is_empty();
                 if untyped || tick.feature_id == feature_id {
@@ -432,6 +469,7 @@ fn start_sync(console: Console, key: String) {
             stale_pool = true;
             stale_want = true;
             stale_threads = true;
+            stale_roadmap = true;
         }
         // The fallback poll refreshes everything, as a tick naming all
         // of it would.
@@ -442,6 +480,7 @@ fn start_sync(console: Console, key: String) {
             stale_pool = true;
             stale_want = true;
             stale_threads = true;
+            stale_roadmap = true;
             console.know_rev.update(|r| r + 1);
         }
         // The clock every liveness reading is taken against: written
@@ -466,6 +505,9 @@ fn start_sync(console: Console, key: String) {
         }
         if wanted.threads != last_wanted.threads {
             stale_threads = true;
+        }
+        if wanted.roadmap && !last_wanted.roadmap {
+            stale_roadmap = true;
         }
         // The feed's "load older" is a one-shot request, not a state.
         let older = console.feed_older.get();
@@ -590,6 +632,18 @@ fn start_sync(console: Console, key: String) {
                     fetch_thread(console, &in_flight, now, subject);
                 }
             }
+        }
+
+        if wanted.roadmap && stale_roadmap && started("roadmap") {
+            stale_roadmap = false;
+            let release = done("roadmap".into());
+            spawn_then(api::load_roadmap(), move |result| {
+                release();
+                match result {
+                    Ok(road) => bump(model::apply_roadmap(road)),
+                    Err(err) => runtime_core::log_warn!("roadmap fetch failed: {err:?}"),
+                }
+            });
         }
 
         if let Some(key) = wanted.pool.clone() {

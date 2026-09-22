@@ -69,6 +69,7 @@ fn plan() -> PlanFeature {
         ],
         stages: vec![],
         whitepaper: Some("# Field reports\n\nReports are filed per shift and read by the office.".into()),
+        roadmap_item: None,
     }
 }
 

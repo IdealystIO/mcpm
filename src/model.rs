@@ -443,6 +443,169 @@ pub struct Feature {
     /// as Unix seconds; `None` = nobody holds one, or no holder has
     /// written.
     pub last_heard: Option<i64>,
+    /// The roadmap item it delivers part of. `None` is LOOSE, which is
+    /// normal and gets no badge — only a binding is worth showing.
+    pub roadmap_item: Option<RoadEdge>,
+    /// "MMM D HH:MM" of when it shipped, or empty. A feature can be
+    /// done with this empty: the work landed, the roadmap has not let
+    /// it out.
+    pub released: String,
+    /// Unshipped roadmap items holding its release. Non-empty is the
+    /// HELD badge, and it clears itself when they ship (rule 21).
+    pub held_by: Vec<RoadEdge>,
+}
+
+/// Where the product is going: one item's worth, as the screen draws
+/// it. `state` is the SERVER's derivation — the console never
+/// recomputes it, for the same reason readiness is not recomputed here.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RoadItem {
+    pub id: String,
+    pub name: String,
+    /// One paragraph, product terms. The card's body.
+    pub intent: String,
+    /// Optional long form, Markdown.
+    pub vision: String,
+    pub horizon: String,
+    pub state: RoadState,
+    /// "MMM D HH:MM" of when it shipped, or empty.
+    pub shipped_at: String,
+    pub shipped_by: String,
+    pub shelved: bool,
+    pub depth: i32,
+    pub depends_on: Vec<RoadEdge>,
+    /// What waits on this one.
+    pub unlocks: Vec<RoadEdge>,
+    pub features: Vec<RoadFeature>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RoadEdge {
+    pub item_id: String,
+    pub name: String,
+    /// A hard edge holds the WORK as well as the ship door.
+    pub hard: bool,
+    pub shipped: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RoadFeature {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub released: bool,
+    pub modules_done: usize,
+    pub modules_total: usize,
+}
+
+/// A roadmap item's derived state. Ordered by how much it asks of the
+/// reader: `Ready` is the one with a verb attached.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoadState {
+    Future,
+    Held,
+    Active,
+    Ready,
+    Shipped,
+    Shelved,
+}
+
+impl RoadState {
+    pub fn parse(s: &str) -> RoadState {
+        match s {
+            "held" => RoadState::Held,
+            "active" => RoadState::Active,
+            "ready" => RoadState::Ready,
+            "shipped" => RoadState::Shipped,
+            "shelved" => RoadState::Shelved,
+            _ => RoadState::Future,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RoadState::Future => "Future",
+            RoadState::Held => "Held",
+            RoadState::Active => "Building",
+            RoadState::Ready => "Ready to ship",
+            RoadState::Shipped => "Shipped",
+            RoadState::Shelved => "Shelved",
+        }
+    }
+
+    /// The status this state reads as, so the roadmap borrows the
+    /// board's tones rather than inventing a second palette for the
+    /// same six ideas.
+    pub fn status(self) -> Status {
+        match self {
+            RoadState::Future | RoadState::Shelved => Status::Queued,
+            RoadState::Held => Status::Violation,
+            RoadState::Active => Status::Running,
+            RoadState::Ready => Status::Planning,
+            RoadState::Shipped => Status::Done,
+        }
+    }
+}
+
+/// The roadmap as the screen holds it.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Roadmap {
+    /// Topological order, as the server returned it.
+    pub items: Vec<RoadItem>,
+    /// Features bound to no item. Normal — a sprint, a bugfix.
+    pub loose_features: Vec<RoadFeature>,
+}
+
+impl Roadmap {
+    /// The horizons in the order their items first appear, with the
+    /// items under each. A horizon is a display label with no
+    /// semantics, so it is grouped, never sorted — sorting it would
+    /// make it look like an ordering, which is exactly what it is not.
+    pub fn by_horizon(&self, shelved: bool) -> Vec<(String, Vec<usize>)> {
+        let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+        for (i, item) in self.items.iter().enumerate() {
+            if item.shelved != shelved {
+                continue;
+            }
+            let key = if item.horizon.trim().is_empty() {
+                "Unscheduled".to_string()
+            } else {
+                item.horizon.clone()
+            };
+            match out.iter_mut().find(|(h, _)| *h == key) {
+                Some((_, v)) => v.push(i),
+                None => out.push((key, vec![i])),
+            }
+        }
+        out
+    }
+
+    pub fn item(&self, id: &str) -> Option<&RoadItem> {
+        self.items.iter().find(|i| i.id == id)
+    }
+
+    /// How many items are waiting on something that has not shipped —
+    /// the count the nav badge carries, because a held item is the one
+    /// state on this screen a person may need to act on.
+    pub fn ready_count(&self) -> usize {
+        self.items.iter().filter(|i| i.state == RoadState::Ready).count()
+    }
+}
+
+impl RoadItem {
+    /// `2/3 features released`, or the blank state.
+    pub fn feature_line(&self) -> String {
+        if self.features.is_empty() {
+            return "No features bound".to_string();
+        }
+        let out = self.features.iter().filter(|f| f.released).count();
+        format!("{out}/{} features released", self.features.len())
+    }
+
+    /// The unshipped prerequisites, which is what "held" means.
+    pub fn blocking(&self) -> Vec<&RoadEdge> {
+        self.depends_on.iter().filter(|e| !e.shipped).collect()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -681,6 +844,10 @@ struct Current {
     questions: Rc<Vec<Question>>,
     /// The name this console's writes are recorded under.
     you: String,
+    /// The roadmap, as far as it has been read. Its own fetch, not the
+    /// board's: the board is read on every tick and must stay scalars.
+    roadmap_raw: Option<api::RoadmapDto>,
+    roadmap: Rc<Roadmap>,
     loaded: bool,
 }
 
@@ -705,6 +872,8 @@ thread_local! {
         threads: HashMap::new(),
         questions: Rc::new(Vec::new()),
         you: String::new(),
+        roadmap_raw: None,
+        roadmap: Rc::new(Roadmap { items: Vec::new(), loose_features: Vec::new() }),
         loaded: false,
     });
 }
@@ -915,6 +1084,10 @@ pub struct Data {
     /// the window — without a fetch, and without rebuilding anything
     /// but the ring.
     pub clock: Signal<i64>,
+    /// Where the product is going. Fetched when the roadmap screen is
+    /// on or a feature's header needs its binding, refetched on a
+    /// roadmap or feature tick.
+    pub roadmap: Signal<Rc<Roadmap>>,
 }
 
 /// How often [`Data::clock`] moves. Coarse on purpose: a reading only
@@ -940,6 +1113,7 @@ impl Data {
             want_total: signal(0),
             open_want: signal(None),
             clock: signal(0),
+            roadmap: signal(Rc::new(Roadmap::default())),
         }
     }
 
@@ -1025,6 +1199,7 @@ pub fn publish(data: Data) {
     data.wants.set(wants);
     data.want_total.set(want_total);
     data.open_want.set(open_want);
+    data.roadmap.set(CURRENT.with(|c| c.borrow().roadmap.clone()));
     data.tick_clock();
 }
 
@@ -1101,6 +1276,66 @@ pub fn apply_feature(detail: api::FeatureDetail) -> bool {
         rebuild(&mut cur);
         true
     })
+}
+
+/// Store the roadmap. Returns true when it changed — an idle poll
+/// returns an identical DTO and nothing on screen is rebuilt for it.
+pub fn apply_roadmap(road: api::RoadmapDto) -> bool {
+    CURRENT.with(|c| {
+        let mut cur = c.borrow_mut();
+        if cur.roadmap_raw.as_ref() == Some(&road) {
+            return false;
+        }
+        cur.roadmap = Rc::new(Roadmap {
+            items: road
+                .items
+                .iter()
+                .map(|i| RoadItem {
+                    id: i.id.clone(),
+                    name: i.name.clone(),
+                    intent: i.intent.clone(),
+                    vision: i.vision.clone(),
+                    horizon: i.horizon.clone(),
+                    state: RoadState::parse(&i.state),
+                    shipped_at: i.shipped_at.clone(),
+                    shipped_by: i.shipped_by.clone(),
+                    shelved: i.shelved,
+                    depth: i.depth,
+                    depends_on: i.depends_on.iter().map(map_edge).collect(),
+                    unlocks: i.unlocks.iter().map(map_edge).collect(),
+                    features: i.features.iter().map(map_road_feature).collect(),
+                })
+                .collect(),
+            loose_features: road.loose_features.iter().map(map_road_feature).collect(),
+        });
+        cur.roadmap_raw = Some(road);
+        true
+    })
+}
+
+/// The roadmap as last read.
+pub fn roadmap() -> Rc<Roadmap> {
+    CURRENT.with(|c| c.borrow().roadmap.clone())
+}
+
+fn map_edge(e: &api::RoadmapEdgeDto) -> RoadEdge {
+    RoadEdge {
+        item_id: e.item_id.clone(),
+        name: e.name.clone(),
+        hard: e.hard,
+        shipped: e.shipped,
+    }
+}
+
+fn map_road_feature(f: &api::RoadmapFeatureDto) -> RoadFeature {
+    RoadFeature {
+        id: f.id.clone(),
+        name: f.name.clone(),
+        status: f.status.clone(),
+        released: f.released,
+        modules_done: f.modules_done.max(0) as usize,
+        modules_total: f.modules_total.max(0) as usize,
+    }
 }
 
 /// Store one module's drawer contents. Returns true when they changed.
@@ -1265,6 +1500,9 @@ fn rebuild(cur: &mut Current) {
                 last_word: r.last_word.as_ref().map(map_word),
                 modules_running: r.modules_running.max(0) as usize,
                 last_heard: r.last_heard,
+                roadmap_item: r.roadmap_item.as_ref().map(map_edge),
+                released: r.released.clone(),
+                held_by: r.held_by.iter().map(map_edge).collect(),
             }
         })
         .map(Rc::new)

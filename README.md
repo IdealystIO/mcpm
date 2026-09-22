@@ -4,6 +4,9 @@ The console for **mcpm** (Model Context Project Management): MCP-first
 project management for agent crews. One deployed instance is tied to one
 project, and the entire agent-facing surface is an MCP server.
 
+    Roadmap item ──depends_on──► Roadmap item   ← long-horizon INTENT
+          ▲                                        gates the ship door
+          │ bound (0..n; unbound is normal)
     Want ─┐
     Want ─┼─► Feature → Module ──depends_on──► Module → Task
     Want ─┘             ↑                        ↑
@@ -128,7 +131,7 @@ tool attributes its writes to that identity and will refuse until it is
 made. Errors carry a `code`, a `message`, and a `hint` saying what to do
 next, so recovery does not require reading this file.
 
-Beyond the 28 tools there are:
+Beyond the 33 tools there are:
 
 - **Prompts**, which brief a fresh agent for a role:
   `manager_briefing`, `worker_briefing`, `compose_wants`.
@@ -176,6 +179,87 @@ The old `stages` shape is still accepted and lowered to edges — each
 module depends on every module of the preceding stage — which is also
 how migration 0012 backfilled every feature that existed before the
 graph. The gate it produces is identical to the old one.
+
+## The roadmap
+
+A feature says what is being built. A **roadmap item** says what the
+product is becoming — one paragraph of intent in product terms, and
+nothing about how. It exists so an agent planning today's module can
+account for work nobody has planned yet without reading a single other
+feature's plan.
+
+    Roadmap item ──depends_on──► Roadmap item      (a DAG, like modules)
+          ▲
+          └── bound (0..n)   Feature ─► Module ─► Task
+                             (unbound = LOOSE: a sprint, a bugfix)
+
+**Loose is normal.** A feature bound to no item carries no ceremony and
+no lock; most bugfixes and sprints are loose, and inventing an item to
+hang one on is worse than no roadmap at all.
+
+### Two doors, each gated on the level below
+
+`complete_feature` says the work landed. **`release_feature` says it
+shipped**, and that is the one the roadmap gates: it is refused with
+`ROADMAP_LOCKED` while any item the feature's own item waits on is
+unshipped. Nothing before that door is ever held, which is what makes
+planning and building ahead of the frontier possible — the reason to
+plan against a roadmap at all.
+
+A loose feature releases the moment it completes: nothing holds it, and
+a second call per sprint is a habit that gets forgotten and leaves the
+board reading as though nothing ever shipped.
+
+`ship_roadmap_item` is the item's door, refused until every feature
+bound to it is released and every item it waits on has shipped. So the
+ladder is: modules prove the feature, features prove the item, items
+gate each other. It is an ACT rather than something derived, because an
+item can be satisfied by something the work tree never saw — a
+migration, a contract, a vendor's release — and an item with no features
+would otherwise hold its dependents shut for good.
+
+Everything else about an item is derived at read time, the way
+readiness is: `future` (nothing built), `held` (a prerequisite is out),
+`active` (a bound feature is moving), `ready` (everything under it is
+released — somebody owes it a ship), `shipped`, `shelved`.
+
+### Soft edges hold the ship; hard edges hold the work
+
+The default edge is **soft**: plan it, dispatch it, build it, complete
+every module — only shipping waits. A **hard** edge is the exception,
+for a prerequisite that must physically exist before anything
+downstream can be written at all, and it makes `claim_module` refuse
+with the same `PREREQS_OPEN` an unmet module edge gives, so a worker
+needs no new reaction for it.
+
+### How the direction reaches an agent
+
+- **`get_context`** carries a digest: one line per unshelved item, with
+  the intent paragraph in full for anything unshipped. A roadmap
+  summarized down to titles tells a model the order of things and
+  nothing about what they are.
+- **The claim briefing** carries the feature's item, its unshipped
+  prerequisites, and — the half worth reading — **the items that wait
+  on it**. A worker already knows what it is building; what it does not
+  know is which decisions somebody downstream will have to live with.
+  The guidance says so explicitly, including the part that matters
+  most: *you are not building those*.
+- **`read_roadmap`** and `project://roadmap` for the whole thing.
+  Reading it is open to every agent; `plan_roadmap`, `revise_roadmap`,
+  `release_feature` and `ship_roadmap_item` are manager-only. Context
+  withheld from the agent writing the code is the one place it is worth
+  nothing.
+
+### From the console
+
+The **Roadmap** screen lists items by horizon — a display label with no
+semantics; edges are what ordering means — each card carrying its
+intent, what holds it, what it unlocks, and the features bound to it
+with how far they have got. A card opens a drawer with the long form
+and both edge lists whole. The screen also lists the features bound to
+nothing, so what the roadmap does not account for is visible rather
+than merely absent. A feature's own header says which item it belongs
+to and, while it is done and held, what it is waiting for.
 
 ## Documents
 

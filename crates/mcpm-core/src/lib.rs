@@ -17,6 +17,7 @@ mod health;
 mod ids;
 mod keys;
 mod redact;
+mod roadmap;
 mod store;
 mod types;
 
@@ -27,7 +28,8 @@ pub use health::{
     DEFAULT_INTERVAL_SECS, HEALTH_HOSTS_ENV, HEALTH_INTERVAL_ENV, PROBE_TIMEOUT,
 };
 pub use ids::{
-    id_level, new_attachment_id, new_comment_id, new_document_id, new_id, new_want_id, normalize_tag, Level,
+    id_level, new_attachment_id, new_comment_id, new_document_id, new_id, new_roadmap_id, new_want_id,
+    normalize_tag, Level,
     PROJECT_SUBJECT,
 };
 pub use keys::{

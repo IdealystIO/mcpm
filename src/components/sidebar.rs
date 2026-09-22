@@ -62,10 +62,20 @@ pub fn Sidebar(props: &SidebarProps) -> Element {
     // by the reactive width below so the collapse can animate, and
     // never on a poll that changed neither.
     let nav = switch(
-        move || (console.pane.get(), data.features.get().len(), data.want_counts.get().0),
-        move |(pane, total, loose): &(String, usize, usize)| {
+        move || {
+            (
+                console.pane.get(),
+                data.features.get().len(),
+                data.want_counts.get().0,
+                // The badge counts items waiting on a person to say
+                // they shipped — the one state here with a verb
+                // attached, and the reason to look at the screen.
+                data.roadmap.get().ready_count(),
+            )
+        },
+        move |(pane, total, loose, ready): &(String, usize, usize, usize)| {
             let pane = pane.clone();
-            let (total, loose) = (*total, *loose);
+            let (total, loose, ready) = (*total, *loose, *ready);
             let on_feature = pane == "feature" || pane == "features";
             ui! {
                 view(style = NavGroup()) {
@@ -83,6 +93,15 @@ pub fn Sidebar(props: &SidebarProps) -> Element {
                         label = "Features",
                         count = total,
                         selected = on_feature,
+                    )
+                    NavItem(
+                        console = console,
+                        id = "roadmap",
+                        glyph = "\u{25b3}",
+                        label = "Roadmap",
+                        count = ready,
+                        urgent = true,
+                        selected = pane == "roadmap",
                     )
                     NavItem(
                         console = console,
@@ -226,6 +245,7 @@ pub fn NavItem(props: &NavItemProps) -> Element {
         match id {
             "overview" => console.show_overview(),
             "features" => console.show_features(),
+            "roadmap" => console.show_roadmap(),
             "wants" => console.show_wants(),
             "capture" => console.show_capture(),
             _ => console.show_knowledge(),

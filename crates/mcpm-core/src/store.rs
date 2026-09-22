@@ -35,6 +35,7 @@ use crate::ids::{
     id_level, new_attachment_id, new_comment_id, new_document_id, new_id, new_memory_id,
     new_want_id, normalize_tag, Level,
 };
+use crate::roadmap::{held_edges, resolve_roadmap_item, roadmap_edge};
 use crate::keys::{
     Actor, ApiKeyInfo, Delegation, IssuedKey, KeyIdentity, KeyRole, MintRequest, MintedWorker,
 };
@@ -98,11 +99,11 @@ pub const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 pub const ATTACHMENT_LINK_TTL_SECS: u32 = 3600;
 
 type Result<T> = std::result::Result<T, McpmError>;
-type Tx<'a> = Transaction<'a, Postgres>;
+pub(crate) type Tx<'a> = Transaction<'a, Postgres>;
 
 #[derive(Clone)]
 pub struct Store {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
     /// Kept so the event listener can open its OWN connection. It must
     /// not come from `pool`: a listener holds its connection for the
     /// life of the subscription, so borrowing one would permanently
@@ -297,6 +298,7 @@ impl Store {
             });
 
         let features = self.feature_rollups().await?;
+        let roadmap = self.roadmap_digest().await?;
         let your_claims = self.claims_of(agent).await?;
         let awaiting_you = self.questions_awaiting(agent).await?;
         let open_wants: i64 = sqlx::query_scalar(
@@ -355,6 +357,7 @@ impl Store {
             your_claims,
             open_wants,
             awaiting_you,
+            roadmap,
             suggested_next,
         })
     }
@@ -615,7 +618,26 @@ impl Store {
                (SELECT MAX(h.ts) FROM modules m
                   JOIN LATERAL (SELECT e.ts FROM events e WHERE e.agent = m.claimed_by
                                 ORDER BY e.seq DESC LIMIT 1) h ON true
-                  WHERE m.feature_id = f.id AND m.status = 'in_progress') AS last_heard
+                  WHERE m.feature_id = f.id AND m.status = 'in_progress') AS last_heard,
+               f.released_at, f.roadmap_item_id,
+               (SELECT i.name FROM roadmap_items i WHERE i.id = f.roadmap_item_id) AS item_name,
+               (SELECT i.shipped_at IS NOT NULL FROM roadmap_items i
+                  WHERE i.id = f.roadmap_item_id) AS item_shipped,
+               -- What stands between this feature and its release: the
+               -- unshipped items ITS item waits on. Empty is the normal
+               -- case, and the console badges a row on it being non-empty.
+               COALESCE((SELECT array_agg(p.id ORDER BY p.name)
+                         FROM roadmap_deps d JOIN roadmap_items p ON p.id = d.depends_on
+                         WHERE d.item_id = f.roadmap_item_id
+                           AND p.shipped_at IS NULL AND NOT p.shelved), '{}') AS held_ids,
+               COALESCE((SELECT array_agg(p.name ORDER BY p.name)
+                         FROM roadmap_deps d JOIN roadmap_items p ON p.id = d.depends_on
+                         WHERE d.item_id = f.roadmap_item_id
+                           AND p.shipped_at IS NULL AND NOT p.shelved), '{}') AS held_names,
+               COALESCE((SELECT array_agg(d.hard ORDER BY p.name)
+                         FROM roadmap_deps d JOIN roadmap_items p ON p.id = d.depends_on
+                         WHERE d.item_id = f.roadmap_item_id
+                           AND p.shipped_at IS NULL AND NOT p.shelved), '{}') AS held_hard
              FROM features f ORDER BY f.created_at",
         )
         .fetch_all(&self.pool)
@@ -625,6 +647,9 @@ impl Store {
             .into_iter()
             .map(|r| FeatureRollup {
                 last_word: words.get(&r.get::<String, _>("id")).cloned(),
+                roadmap_item: roadmap_edge(&r),
+                released_at: r.get("released_at"),
+                held_by: held_edges(&r),
                 id: r.get("id"),
                 name: r.get("name"),
                 status: r.get("status"),
@@ -959,11 +984,33 @@ impl Store {
                  complete them before closing the feature.",
             ));
         }
-        sqlx::query("UPDATE features SET status = 'done', summary = $2 WHERE id = $1")
-            .bind(feature_id)
-            .bind(summary)
-            .execute(&mut *tx)
+        // A loose feature — no roadmap item — has nothing holding it,
+        // so completing it IS releasing it. Demanding a second call for
+        // every sprint and bugfix would be a habit that gets forgotten,
+        // and a board that then reads as though nothing ever shipped.
+        let item_id: Option<String> = sqlx::query_scalar(
+            "UPDATE features SET status = 'done', summary = $2,
+                    released_at = CASE WHEN roadmap_item_id IS NULL THEN now() ELSE released_at END,
+                    released_by = CASE WHEN roadmap_item_id IS NULL THEN $3 ELSE released_by END
+             WHERE id = $1
+             RETURNING roadmap_item_id",
+        )
+        .bind(feature_id)
+        .bind(summary)
+        .bind(agent)
+        .fetch_one(&mut *tx)
+        .await?;
+        if item_id.is_none() {
+            record_event(
+                &mut tx,
+                "feature_released",
+                Some(feature_id),
+                Some(feature_id),
+                Some(agent),
+                json!({ "feature": name, "note": "loose feature: nothing held it" }),
+            )
             .await?;
+        }
         insert_memory(
             &mut tx,
             Level::Feature,
@@ -983,10 +1030,35 @@ impl Store {
             json!({ "name": name }),
         )
         .await?;
+        // The gate is read BEFORE the commit closes the transaction, so
+        // the ack tells the manager what the roadmap will do next
+        // instead of leaving it to discover the hold on release.
+        let held = match &item_id {
+            Some(id) => crate::roadmap::unshipped_prereqs(&mut tx, id).await?,
+            None => Vec::new(),
+        };
         tx.commit().await?;
-        Ok(Ack::new(format!(
-            "Feature '{name}' is complete. The summary was committed as a feature-scope memory."
-        )))
+        let next = match (&item_id, held.is_empty()) {
+            (None, _) => " It was loose — bound to no roadmap item — so it is released.".to_string(),
+            (Some(_), true) => format!(
+                " It is bound to the roadmap, so it is done but NOT released: call                  release_feature('{feature_id}', ...) when it goes out."
+            ),
+            (Some(_), false) => format!(
+                " It is bound to the roadmap and HELD: {} must ship before it can be released.                  Nothing here is wrong — leave it done-and-unreleased and tell your operator.",
+                held.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        };
+        Ok(Ack::with(
+            format!(
+                "Feature '{name}' is complete. The summary was committed as a feature-scope                  memory.{next}"
+            ),
+            json!({
+                "feature_id": feature_id,
+                "released": item_id.is_none(),
+                "roadmap_item": item_id,
+                "held_by": held.iter().map(|(i, n)| json!({ "id": i, "name": n })).collect::<Vec<_>>(),
+            }),
+        ))
     }
 
     // -----------------------------------------------------------------
@@ -1210,6 +1282,42 @@ impl Store {
             ));
         }
 
+        // The roadmap's only hold on WORK. A hard edge says the
+        // prerequisite must physically exist before anything downstream
+        // can be written; a soft one (the default) holds only the ship
+        // door, which is what lets a feature be built ahead of the
+        // frontier. Deliberately the same refusal as an unmet module
+        // edge — a worker needs no new reaction for it, and the manager
+        // sees the same premature_claim event.
+        let road_block = crate::roadmap::hard_block(&mut tx, &feature_id).await?;
+        if !road_block.is_empty() {
+            let items: Vec<serde_json::Value> = road_block
+                .iter()
+                .map(|(id, name)| json!({ "id": id, "name": name, "kind": "roadmap_item" }))
+                .collect();
+            let names: Vec<&str> = road_block.iter().map(|(_, n)| n.as_str()).collect();
+            record_event(
+                &mut tx,
+                "premature_claim",
+                Some(&feature_id),
+                Some(module_id),
+                Some(agent),
+                json!({ "module": module_name, "blocking_roadmap": items }),
+            )
+            .await?;
+            tx.commit().await?;
+            return Err(McpmError::new(
+                ErrorCode::PrereqsOpen,
+                format!(
+                    "Module '{module_name}' ({module_id}) of '{feature_name}' is held by the                      roadmap: {} hard prerequisite(s) have not shipped: {}.",
+                    names.len(),
+                    names.join(", ")
+                ),
+                json!({ "blocking_roadmap": items }),
+                "Do not begin work on this module. A hard roadmap prerequisite means the thing                  it depends on does not exist yet, so there is nothing to build against. Report                  PREREQS_OPEN to your manager and end your turn.",
+            ));
+        }
+
         // The gate's other half: an open question on this module or on
         // its feature. A person or an agent owes an answer, and until
         // it lands the work is not to start — that is what asking was
@@ -1353,7 +1461,9 @@ impl Store {
             .await?;
         let attachments = self.feature_attachments(&feature_id).await?;
         let discussion = self.briefing_discussion(&feature_id, module_id).await?;
+        let roadmap = self.roadmap_context(&feature_id).await?;
         Ok(Briefing {
+            roadmap,
             module,
             feature_id,
             feature_name,
@@ -4357,7 +4467,26 @@ impl Store {
     /// The full graph with every derived fact: what each module waits
     /// on, its depth, and whether it is dispatchable right now.
     pub async fn feature_tree(&self, feature_id: &str) -> Result<FeatureTree> {
-        let feature = sqlx::query("SELECT id, name, description, status, summary FROM features WHERE id = $1")
+        let feature = sqlx::query(
+            "SELECT f.id, f.name, f.description, f.status, f.summary,
+                    f.released_at, f.roadmap_item_id,
+                    (SELECT i.name FROM roadmap_items i WHERE i.id = f.roadmap_item_id) AS item_name,
+                    (SELECT i.shipped_at IS NOT NULL FROM roadmap_items i
+                       WHERE i.id = f.roadmap_item_id) AS item_shipped,
+                    COALESCE((SELECT array_agg(p.id ORDER BY p.name)
+                              FROM roadmap_deps d JOIN roadmap_items p ON p.id = d.depends_on
+                              WHERE d.item_id = f.roadmap_item_id
+                                AND p.shipped_at IS NULL AND NOT p.shelved), '{}') AS held_ids,
+                    COALESCE((SELECT array_agg(p.name ORDER BY p.name)
+                              FROM roadmap_deps d JOIN roadmap_items p ON p.id = d.depends_on
+                              WHERE d.item_id = f.roadmap_item_id
+                                AND p.shipped_at IS NULL AND NOT p.shelved), '{}') AS held_names,
+                    COALESCE((SELECT array_agg(d.hard ORDER BY p.name)
+                              FROM roadmap_deps d JOIN roadmap_items p ON p.id = d.depends_on
+                              WHERE d.item_id = f.roadmap_item_id
+                                AND p.shipped_at IS NULL AND NOT p.shelved), '{}') AS held_hard
+             FROM features f WHERE f.id = $1",
+        )
             .bind(feature_id)
             .fetch_optional(&self.pool)
             .await?
@@ -4502,6 +4631,9 @@ impl Store {
             whitepaper,
             attachments,
             open_questions: feature_questions,
+            roadmap_item: roadmap_edge(&feature),
+            released_at: feature.get("released_at"),
+            held_by: held_edges(&feature),
         })
     }
 
@@ -5263,10 +5395,10 @@ impl SubjectSets {
 /// modules at one depth list in a stable, human order rather than by
 /// the random half of their ids.
 #[derive(Clone, Debug)]
-struct GraphNode {
-    id: String,
-    key: String,
-    deps: Vec<String>,
+pub(crate) struct GraphNode {
+    pub(crate) id: String,
+    pub(crate) key: String,
+    pub(crate) deps: Vec<String>,
 }
 
 /// Topological order with depths: every node after all of its
@@ -5275,7 +5407,7 @@ struct GraphNode {
 ///
 /// Kahn's algorithm over a set small enough (a feature holds tens of
 /// modules) that the quadratic lookups below cost nothing measurable.
-fn topo_order(nodes: &[GraphNode]) -> std::result::Result<Vec<(String, i32)>, Vec<String>> {
+pub(crate) fn topo_order(nodes: &[GraphNode]) -> std::result::Result<Vec<(String, i32)>, Vec<String>> {
     use std::collections::{BTreeMap, BTreeSet};
     let known: BTreeSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     let mut indegree: BTreeMap<&str, usize> = BTreeMap::new();
@@ -5569,7 +5701,7 @@ mod graph_tests {
 // Free helpers
 // ---------------------------------------------------------------------
 
-async fn record_event(
+pub(crate) async fn record_event(
     tx: &mut Tx<'_>,
     kind: &str,
     feature_id: Option<&str>,
@@ -5819,7 +5951,7 @@ async fn open_questions_tx(
 }
 
 /// The first line or so of a body, for a ledger row or a hint.
-fn excerpt(body: &str, max: usize) -> String {
+pub(crate) fn excerpt(body: &str, max: usize) -> String {
     let first = body.trim().lines().next().unwrap_or("").trim();
     let mut out: String = first.chars().take(max).collect();
     if first.chars().count() > max || body.trim().lines().count() > 1 {
@@ -6139,7 +6271,7 @@ fn require_scope(actor: &Actor, module_id: &str) -> std::result::Result<(), Mcpm
     }
 }
 
-fn plan_invalid(message: impl Into<String>) -> McpmError {
+pub(crate) fn plan_invalid(message: impl Into<String>) -> McpmError {
     McpmError::new(
         ErrorCode::PlanInvalid,
         message,
@@ -6148,7 +6280,7 @@ fn plan_invalid(message: impl Into<String>) -> McpmError {
     )
 }
 
-fn plan_conflict(message: impl Into<String>) -> McpmError {
+pub(crate) fn plan_conflict(message: impl Into<String>) -> McpmError {
     McpmError::new(
         ErrorCode::PlanConflict,
         message,
@@ -6654,14 +6786,23 @@ async fn insert_plan(
     modules: &[PlanModule],
 ) -> Result<String> {
     let feature_id = new_id(Level::Feature);
+    // A feature may be born bound. Accepting the item by NAME as well
+    // as by id is deliberate: a planner composing a feature is reading
+    // the roadmap digest, which names items, and making it look an id
+    // up first is a round trip that buys nothing.
+    let item_id = match plan.roadmap_item.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(key) => Some(resolve_roadmap_item(tx, key).await?),
+    };
     sqlx::query(
-        "INSERT INTO features (id, name, description, status, created_by)
-         VALUES ($1, $2, $3, 'planning', $4)",
+        "INSERT INTO features (id, name, description, status, created_by, roadmap_item_id)
+         VALUES ($1, $2, $3, 'planning', $4, $5)",
     )
     .bind(&feature_id)
     .bind(&plan.name)
     .bind(&plan.description)
     .bind(agent)
+    .bind(&item_id)
     .execute(&mut **tx)
     .await
     .map_err(unique_to_plan_invalid("a feature with that name already exists"))?;

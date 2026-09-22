@@ -14,10 +14,11 @@ use std::rc::Rc;
 use idea_ui::{size, tone, typography_kind, variant, Button, Chip, Field, IdeaThemeRef, Spacer,
     Textarea, Typography};
 use runtime_core::{
-    component, rx, stylesheet, switch, ui, AlignItems, Element, FlexDirection, FlexWrap,
-    FontWeight, IdealystSchema, JustifyContent,
+    component, rx, stylesheet, switch, ui, AlignItems, Cursor, Element, FlexDirection, FlexWrap,
+    FontWeight, IdealystSchema, IntoElement, JustifyContent, StyleApplication,
 };
 
+use crate::components::bits::tappable;
 use crate::state::{Console, Edit, PLAN_SLOTS};
 use crate::styles::SectionLabel;
 
@@ -40,6 +41,52 @@ pub fn PlanEditor(props: &PlanEditorProps) -> Element {
         console.show_features();
     });
     let create: Rc<dyn Fn()> = Rc::new(move || console.submit(Edit::CreatePlan));
+
+    // Which roadmap item this feature delivers part of. Rebuilt when
+    // the roadmap's membership changes or the pick moves — never on a
+    // poll that only shipped something.
+    let data = console.data;
+    let roadmap_pick = switch(
+        move || {
+            let items: Vec<(String, String)> = data
+                .roadmap
+                .get()
+                .items
+                .iter()
+                .filter(|i| !i.shelved && i.state != crate::model::RoadState::Shipped)
+                .map(|i| (i.id.clone(), i.name.clone()))
+                .collect();
+            (items, console.plan_item.get())
+        },
+        move |(items, picked): &(Vec<(String, String)>, String)| {
+            let (items, picked) = (items.clone(), picked.clone());
+            let n = items.len();
+            if n == 0 {
+                return ui! { view {} };
+            }
+            ui! {
+                view(style = PickCol()) {
+                    text(style = SectionLabel()) { "Roadmap item" }
+                    view(style = PickRow()) {
+                        for i in 0..n {
+                            PlanItemChip(
+                                console = console,
+                                id = items[i].0.clone(),
+                                label = items[i].1.clone(),
+                                selected = picked == items[i].0,
+                            )
+                        }
+                    }
+                    Typography(
+                        content = "Leave it unpicked for a loose feature \u{2014} a sprint, a fix, \
+                                   anything the roadmap does not speak to.",
+                        kind = typography_kind::Caption,
+                        muted = true,
+                    )
+                }
+            }
+        },
+    );
     let add: Rc<dyn Fn()> = Rc::new(move || console.add_plan_module());
 
     // The module cards, rebuilt when a slot is added or removed. Their
@@ -107,6 +154,7 @@ pub fn PlanEditor(props: &PlanEditorProps) -> Element {
                             rows = 6u32,
                             max_rows = 30u32,
                         )
+                        roadmap_pick
                     }
                     view(style = SectionHead()) {
                         text(style = SectionLabel()) { "Modules" }
@@ -399,6 +447,89 @@ stylesheet! {
         base(t) {
             font_size: t.typography.body_sm_size(),
             color: t.intent.danger.fg(),
+        }
+    }
+}
+
+/// Props for [`PlanItemChip`].
+#[derive(Default, IdealystSchema)]
+pub struct PlanItemChipProps {
+    /// Console state handles.
+    pub console: Console,
+    /// The roadmap item's id.
+    pub id: String,
+    /// Its name.
+    pub label: String,
+    /// Whether it is the current pick.
+    pub selected: bool,
+}
+
+/// One roadmap item as a chip. Pressing the current pick clears it,
+/// because "loose" has to be reachable without a second control.
+#[component]
+pub fn PlanItemChip(props: &PlanItemChipProps) -> Element {
+    let console = props.console;
+    let id = props.id.clone();
+    let selected = props.selected;
+    let on_press = move || {
+        console
+            .plan_item
+            .set(if selected { String::new() } else { id.clone() });
+    };
+    tappable(
+        vec![ui! { text(style = ChipLabel()) { props.label.clone() } }],
+        on_press,
+    )
+    .with_style(StyleApplication::new(item_chip_style()).with("selected", if selected { "on" } else { "off" }.to_string()))
+    .into_element()
+}
+
+stylesheet! {
+    pub PickCol<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Column,
+            gap: t.spacing.xs(),
+        }
+    }
+}
+
+stylesheet! {
+    pub PickRow<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            gap: t.spacing.xs(),
+        }
+    }
+}
+
+stylesheet! {
+    pub ItemChip<IdeaThemeRef> {
+        base(t) {
+            flex_direction: FlexDirection::Row,
+            cursor: Cursor::Pointer,
+            padding_left: t.spacing.sm(),
+            padding_right: t.spacing.sm(),
+            padding_top: t.spacing.xs(),
+            padding_bottom: t.spacing.xs(),
+            border_width: 1.0,
+            border_color: t.color.border(),
+            border_radius: t.radius.pill(),
+        }
+        variant selected {
+            #[default]
+            off(_t) { background: runtime_core::Color("#00000000".into()) }
+            on(t) { background: t.intent.primary.soft_bg() }
+        }
+        transitions { background: 160ms EaseOut }
+    }
+}
+
+stylesheet! {
+    pub ChipLabel<IdeaThemeRef> {
+        base(t) {
+            color: t.color.text(),
+            font_size: 12,
         }
     }
 }

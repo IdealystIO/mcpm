@@ -18,5 +18,6 @@ pub mod main_pane;
 pub mod module_card;
 pub mod overview;
 pub mod plan_editor;
+pub mod roadmap;
 pub mod sidebar;
 pub mod wants;

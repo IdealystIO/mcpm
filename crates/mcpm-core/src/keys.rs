@@ -123,6 +123,16 @@ pub const MANAGER_ONLY: &[&str] = &[
     "complete_feature",
     "promote_wants",
     "issue_worker_key",
+    // The roadmap is the project's direction and its two ship doors.
+    // A worker owns one module; stating where the product is going, and
+    // declaring that something has gone out, are not its calls to make.
+    // `read_roadmap` is deliberately NOT here — the roadmap is context,
+    // and context withheld from the agent writing the code is the one
+    // place it is worth nothing.
+    "plan_roadmap",
+    "revise_roadmap",
+    "release_feature",
+    "ship_roadmap_item",
     // Names ANOTHER agent's row. A worker may register only its own,
     // through get_context; letting one point the prober at a sibling's
     // URL would let it forge a sibling's liveness.

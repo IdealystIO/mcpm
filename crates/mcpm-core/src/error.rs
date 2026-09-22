@@ -23,6 +23,12 @@ pub enum ErrorCode {
     /// record: skipping a task, declining a want.
     SkipNeedsReason,
     ModulesIncomplete,
+    /// The feature's work is done, but the roadmap item it is bound to
+    /// waits on an item that has not shipped — so this may not ship
+    /// either. Distinct from `PREREQS_OPEN`: nothing is wrong with the
+    /// work, and there is nothing for the caller to finish. It is a
+    /// hold that lifts when somebody else ships.
+    RoadmapLocked,
     PlanConflict,
     PlanInvalid,
     /// A feature already absorbed this want; it cannot be declined or

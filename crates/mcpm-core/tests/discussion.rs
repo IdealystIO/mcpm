@@ -51,6 +51,7 @@ fn plan(name: &str) -> PlanFeature {
         name: name.into(),
         description: String::new(),
         whitepaper: None,
+        roadmap_item: None,
         modules: vec![
             PlanModule {
                 name: "A".into(),

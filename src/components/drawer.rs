@@ -606,7 +606,7 @@ pub fn WantLinkRow(props: &WantLinkRowProps) -> Element {
 /// bare strip down one edge while it moves.
 // The braces are the macro's child-expression form, not Rust's.
 #[allow(unused_braces)]
-fn panel_motion(
+pub(crate) fn panel_motion(
     build: impl Fn() -> Element + 'static,
     present: impl Fn() -> bool + 'static,
 ) -> Element {

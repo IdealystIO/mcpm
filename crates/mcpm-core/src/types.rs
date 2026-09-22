@@ -33,6 +33,14 @@ pub struct PlanFeature {
     /// Stored as the feature's whitepaper document, revision 1.
     #[serde(default)]
     pub whitepaper: Option<String>,
+    /// The roadmap item this feature delivers part of, by id
+    /// (`road_…`) or by name. Omit it for a LOOSE feature — a sprint,
+    /// a bugfix, anything the roadmap does not speak to — which is
+    /// normal and carries no ceremony. Binding it is what makes the
+    /// ship door wait on the roadmap, and what puts the item's intent
+    /// (and what waits downstream of it) into every worker's briefing.
+    #[serde(default)]
+    pub roadmap_item: Option<String>,
 }
 
 /// One rung of the deprecated stage ladder.
@@ -787,6 +795,19 @@ pub struct FeatureRollup {
     /// without opening the ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_word: Option<Announcement>,
+    /// The roadmap item this feature is bound to, if any. `None` is
+    /// LOOSE, which is normal — a sprint, a bugfix, anything the
+    /// roadmap does not speak to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roadmap_item: Option<RoadmapEdge>,
+    /// When it shipped. A feature can be `done` and unreleased: the
+    /// work landed, the roadmap has not let it out yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<DateTime<Utc>>,
+    /// Unshipped roadmap items standing between this feature and its
+    /// release. Non-empty means `release_feature` would refuse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_by: Vec<RoadmapEdge>,
 }
 
 /// One thing across the project that has stopped and is waiting on a
@@ -889,6 +910,14 @@ pub struct FeatureTree {
     /// in the feature is dispatchable.
     #[serde(default)]
     pub open_questions: Vec<QuestionRef>,
+    /// The roadmap item this feature is bound to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roadmap_item: Option<RoadmapEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<DateTime<Utc>>,
+    /// Unshipped roadmap items holding this feature's release.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_by: Vec<RoadmapEdge>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -962,6 +991,12 @@ pub struct Context {
     /// Each blocks its subject until this agent (or a human) answers.
     #[serde(default)]
     pub awaiting_you: Vec<QuestionRef>,
+    /// Where the product is going, one line per unshelved item, in
+    /// topological order. Read it before choosing a shape: it is here
+    /// so a decision made today can account for work that has not
+    /// been planned yet, without the cost of reading those plans.
+    #[serde(default)]
+    pub roadmap: Vec<RoadmapLine>,
     pub suggested_next: String,
 }
 
@@ -1032,6 +1067,11 @@ pub struct Briefing {
     pub feature_name: String,
     /// The feature's plan as prose, when the planner wrote one.
     pub whitepaper: Option<DocumentView>,
+    /// Where this work sits on the roadmap, and — the half worth
+    /// reading — what waits on it downstream. Absent on a loose
+    /// feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roadmap: Option<RoadmapContext>,
     /// Files attached to the feature (and to its source wants), each
     /// with the description its author wrote for a reader like this
     /// one. `read_attachment` fetches one by id.
@@ -1316,4 +1356,220 @@ pub struct WantDraft {
     pub body: String,
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+// ---------------------------------------------------------------------
+// The roadmap
+// ---------------------------------------------------------------------
+
+/// `plan_roadmap`: the whole roadmap graph, created or extended
+/// atomically. Validated whole and refused whole, like [`PlanFeature`].
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct PlanRoadmap {
+    /// Items to create. An item whose `name` already exists is updated
+    /// in place rather than duplicated — a roadmap is re-stated more
+    /// often than it is built from nothing.
+    #[serde(default)]
+    pub items: Vec<PlanRoadmapItem>,
+}
+
+/// One item in a [`PlanRoadmap`].
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct PlanRoadmapItem {
+    pub name: String,
+    /// One paragraph, in product terms: the outcome, not the plan.
+    /// This is what every agent reads in `get_context`.
+    #[serde(default)]
+    pub intent: String,
+    /// Optional long form, Markdown. Fetched by id when an agent needs
+    /// the detail; never carried in the digest.
+    #[serde(default)]
+    pub vision: String,
+    /// Display grouping only: `now`, `next`, `later`, `H1`, … It
+    /// orders nothing. Edges do that.
+    #[serde(default)]
+    pub horizon: String,
+    /// Names of items this one waits on — in this same plan, or
+    /// already on the roadmap. Cycles are refused.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Of `depends_on`, the ones that must physically exist before
+    /// anything downstream can be WRITTEN. A hard prerequisite makes
+    /// `claim_module` refuse on features bound to this item; a soft
+    /// one (the default) holds only the ship door, which is what lets
+    /// a feature be planned and built ahead of its frontier.
+    #[serde(default)]
+    pub hard_depends_on: Vec<String>,
+}
+
+/// One surgical change to the roadmap, for `revise_roadmap`.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RoadmapOp {
+    AddItem {
+        name: String,
+        #[serde(default)]
+        intent: String,
+        #[serde(default)]
+        vision: String,
+        #[serde(default)]
+        horizon: String,
+    },
+    EditItem {
+        item_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        intent: Option<String>,
+        #[serde(default)]
+        vision: Option<String>,
+        #[serde(default)]
+        horizon: Option<String>,
+        #[serde(default)]
+        position: Option<i32>,
+    },
+    /// Take an item off the roadmap. Refused while a feature is bound
+    /// to it — unbind first, so nothing silently loosens.
+    RemoveItem {
+        item_id: String,
+    },
+    /// Hide an item without deleting it: its edges stop holding
+    /// anything and it leaves the digest.
+    ShelveItem {
+        item_id: String,
+        #[serde(default)]
+        shelved: bool,
+    },
+    AddDependency {
+        item_id: String,
+        depends_on: String,
+        #[serde(default)]
+        hard: bool,
+    },
+    RemoveDependency {
+        item_id: String,
+        depends_on: String,
+    },
+    /// Bind a feature to an item, or (with `item_id: None`) loosen it.
+    BindFeature {
+        feature_id: String,
+        #[serde(default)]
+        item_id: Option<String>,
+    },
+}
+
+/// One edge as a reader sees it: the item at the other end, named,
+/// with what the edge does and whether it is satisfied.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoadmapEdge {
+    pub item_id: String,
+    pub name: String,
+    /// `true` when this edge also holds WORK (`claim_module`), not
+    /// just the ship door.
+    pub hard: bool,
+    pub shipped: bool,
+}
+
+/// A feature seen from the roadmap: enough to say whether the item is
+/// waiting on it, without the tree.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoadmapFeatureRef {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub released: bool,
+    pub modules_done: i64,
+    pub modules_total: i64,
+}
+
+/// One roadmap item, whole. `state` is derived at read time from the
+/// edges and the bound features — only `shipped_at` is held.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoadmapItemView {
+    pub id: String,
+    pub name: String,
+    pub intent: String,
+    pub vision: String,
+    pub horizon: String,
+    pub position: i32,
+    pub shelved: bool,
+    /// `future` | `held` | `active` | `ready` | `shipped` | `shelved`.
+    /// See [`RoadmapState`] for what each means.
+    pub state: String,
+    pub shipped_at: Option<DateTime<Utc>>,
+    pub shipped_by: Option<String>,
+    /// Longest path from a root, 1-based — the column a board draws it
+    /// in, exactly as a module's depth is.
+    pub depth: i32,
+    pub depends_on: Vec<RoadmapEdge>,
+    /// The items waiting on THIS one. The half that matters to a
+    /// worker: what today's code must not make expensive.
+    pub unlocks: Vec<RoadmapEdge>,
+    pub features: Vec<RoadmapFeatureRef>,
+    pub created_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The whole roadmap, in topological order.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Roadmap {
+    pub items: Vec<RoadmapItemView>,
+    /// Features bound to no item — sprints, bugfixes, anything the
+    /// roadmap does not speak to. Loose is legal and normal; this list
+    /// exists so a planner can see what is NOT accounted for.
+    pub loose_features: Vec<RoadmapFeatureRef>,
+}
+
+/// What an item's `state` means. Derived, never stored.
+///
+/// - `shipped` — `shipped_at` is set. It is live.
+/// - `shelved` — taken out of the picture; holds nothing.
+/// - `held` — a prerequisite item has not shipped. Work on it may
+///   still be legal (only a `hard` edge stops that); shipping is not.
+/// - `ready` — nothing holds it and every bound feature is released:
+///   somebody owes it a `ship_roadmap_item`.
+/// - `active` — a bound feature is planned, running or built.
+/// - `future` — nothing holds it and nothing is being built. Vision.
+pub const ROADMAP_STATES: &[&str] = &["future", "held", "active", "ready", "shipped", "shelved"];
+
+/// One line of the roadmap as it reaches an agent's context: enough to
+/// steer a decision, cheap enough to send on every `get_context`.
+///
+/// `intent` is carried in FULL for anything unshipped, because that
+/// paragraph is the entire product of this feature — a roadmap
+/// summarized down to titles tells a model the order of things and
+/// nothing about what they are. Shipped items come as an excerpt: they
+/// are context ("this already exists"), not direction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoadmapLine {
+    pub id: String,
+    pub name: String,
+    pub horizon: String,
+    pub state: String,
+    pub intent: String,
+    /// How many features are bound to it.
+    pub features: i64,
+}
+
+/// The roadmap as it reaches a worker claiming a module.
+///
+/// The valuable half is `unlocks`, not `item`: a worker already knows
+/// what it is building from the whitepaper, and what it does NOT know
+/// is which decisions downstream will have to live with.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoadmapContext {
+    /// The item this module's feature is bound to.
+    pub item: RoadmapLine,
+    /// The item's long form, when one was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<String>,
+    /// Unshipped prerequisites. A `hard` one would have refused the
+    /// claim, so anything listed here is soft: the work is legal, the
+    /// ship is not.
+    #[serde(default)]
+    pub waiting_on: Vec<RoadmapLine>,
+    /// What this item unlocks — read it before choosing a shape.
+    #[serde(default)]
+    pub unlocks: Vec<RoadmapLine>,
+    pub guidance: String,
 }

@@ -8,6 +8,8 @@ Naming: `mcpm-*` is the project-management system (crates, the MCP
 server agents connect to, the `MCPM_*` env vars). **Control Center** is
 this console and this cargo package. They are not interchangeable.
 
+    Roadmap item ──depends_on──► Roadmap item
+          ▲
     Want ─┐
     Want ─┼─► Feature → Module ──depends_on──► Module → Task
     Want ─┘
@@ -26,6 +28,28 @@ module's own prerequisites; `topo_order` in `store.rs` gives depth and
 order at read time; nothing about readiness is stored. When you add a
 plan op, it ends in `check_ownership` and, for an edge, `reaches` — the
 cycle and overlap rules live once each and every writer calls them.
+
+**The roadmap gates SHIPPING, and nothing else.** An item is intent —
+one paragraph, product terms — and features bind to it or stay loose;
+loose is normal and carries no lock. `complete_feature` is never
+refused by the roadmap, because building ahead of the frontier is the
+entire reason to plan against one. `release_feature` is, with
+`ROADMAP_LOCKED`, while an item the feature's item waits on is
+unshipped — and `ship_roadmap_item` is refused until everything under
+it is released. The one exception that reaches back into the work is a
+`hard` edge, checked in `claim_module` beside the module gate and
+producing the same `PREREQS_OPEN`, so no worker needs a new reaction
+for it. Everything about an item's state except `shipped_at` is derived
+in `Store::roadmap`, and `shipped_at` is held for one reason: an item
+can be satisfied outside the work tree, and an item with no features
+would otherwise hold its dependents shut for good.
+
+The digest in `get_context` carries each unshipped item's intent
+WHOLE, and the claim briefing carries the items that wait on the one
+being worked. That downstream half is the product: a worker knows what
+it is building and does not know which decisions somebody later has to
+live with. If you trim either for size, trim the upstream half — and
+never the `unlocks` list.
 
 **A question is the other half of the gate.** A comment of kind
 `question` names who owes the answer (`assigned_to`, or nobody) and
@@ -150,7 +174,7 @@ anything that writes to `memories`.
 
 | Path | What it is |
 | --- | --- |
-| `crates/mcpm-core` | Domain + Postgres store. Every invariant lives here, in one place each. |
+| `crates/mcpm-core` | Domain + Postgres store. Every invariant lives here, in one place each. `roadmap.rs` is the roadmap's half, in its own module beside `store.rs`. |
 | `crates/mcpm-mcp` | The MCP server agents connect to: tools, prompts, `project://` resources. Two transports (`rpc.rs` is the shared dispatcher), plus the key CLI. |
 | `crates/api` | Wire DTOs, the capture-syntax parser, `#[server]` fns, the attachment upload/download routes (`files.rs`), and the `mcpm-web` host binary. |
 | `src/` | The Idealyst console. `components/` is one module per view. |

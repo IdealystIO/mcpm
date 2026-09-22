@@ -93,6 +93,15 @@ pub fn new_attachment_id() -> String {
     format!("att_{}", &uuid[..8])
 }
 
+/// Mint a roadmap item id. An item sits ABOVE the work tree: nothing
+/// is ever planned or claimed at roadmap scope — features are — so
+/// `road_` is not a [`Level`] prefix and `id_level` does not resolve
+/// it.
+pub fn new_roadmap_id() -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    format!("road_{}", &uuid[..8])
+}
+
 /// Mint a comment id.
 pub fn new_comment_id() -> String {
     let uuid = uuid::Uuid::new_v4().simple().to_string();

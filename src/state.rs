@@ -70,6 +70,21 @@ pub enum Edit {
     RemoveTask { feature: String, task: String },
     AddDependency { feature: String, module: String },
     RemoveDependency { feature: String, module: String, depends_on: String },
+    /// Create a roadmap item, or edit one (`item` empty = create).
+    EditRoadmapItem { item: String },
+    /// Take an item off the roadmap; refused while a feature is bound.
+    RemoveRoadmapItem { item: String },
+    ShelveRoadmapItem { item: String, shelve: bool },
+    /// Add a prerequisite to an item. `hard` is the opt-in that holds
+    /// the work as well as the ship door.
+    AddRoadmapDependency { item: String },
+    RemoveRoadmapDependency { item: String, depends_on: String },
+    /// Bind a feature to an item, or (`item` empty) loosen it.
+    BindFeature { feature: String },
+    /// The feature's second door.
+    ReleaseFeature { feature: String },
+    /// The item's door.
+    ShipRoadmapItem { item: String },
     EditWant { want: String },
     DeclineWant { want: String },
     ReopenWant { want: String },
@@ -268,9 +283,28 @@ pub struct Console {
     pub plan_name: Signal<String>,
     pub plan_description: Signal<String>,
     pub plan_whitepaper: Signal<String>,
+    /// The roadmap item the new plan is bound to, by id — empty for a
+    /// loose feature, which is the normal case and the default.
+    pub plan_item: Signal<String>,
     /// The module slots in use: the first `plan_count` of `plan_modules`.
     pub plan_count: Signal<usize>,
     pub plan_modules: [ModuleSlot; PLAN_SLOTS],
+
+    // --- The roadmap screen -----------------------------------------
+    /// The item whose detail drawer is open, by id. An id and not an
+    /// index: the roadmap re-sorts under a poll, so an index would
+    /// drift onto another item — the same reason the want drawer
+    /// addresses by id.
+    pub road_open: Signal<Option<String>>,
+    /// Last item the drawer was opened onto. Kept on close so the
+    /// panel still has something to draw through its exit animation.
+    pub last_road: Signal<Option<String>>,
+    /// Show shelved items too. Off by default: the roadmap is what is
+    /// in the picture.
+    pub road_shelved: Signal<bool>,
+    /// The "hard edge" toggle in the add-prerequisite form. A separate
+    /// buffer because `form_pick` carries the item it names.
+    pub form_hard: Signal<bool>,
 
     // --- The all-features screen's toolbar --------------------------
     /// Free-text filter over feature names.
@@ -381,6 +415,7 @@ pub fn use_console() -> Console {
         plan_name: signal(String::new()),
         plan_description: signal(String::new()),
         plan_whitepaper: signal(String::new()),
+        plan_item: signal(String::new()),
         plan_count: signal(1),
         plan_modules: std::array::from_fn(|_| ModuleSlot::new()),
         api_key: signal(String::new()),
@@ -399,6 +434,10 @@ pub fn use_console() -> Console {
         know_page: signal(0),
         know_history: signal(false),
         know_open: signal(None),
+        road_open: signal(None),
+        last_road: signal(None),
+        road_shelved: signal(false),
+        form_hard: signal(false),
         draft: signal(String::new()),
         status: signal(String::new()),
         busy: signal(false),
@@ -449,6 +488,15 @@ impl Console {
         self.close_drawer();
     }
 
+    /// Select a feature by id. The roadmap addresses features by id —
+    /// it lists them across every item, and the board's index would
+    /// mean nothing there.
+    pub fn select_feature_by_id(&self, id: &str) {
+        if let Some(at) = self.data.features.get().iter().position(|f| f.id == id) {
+            self.select_feature(at);
+        }
+    }
+
     /// Open or close the feature switcher, clearing whatever was typed
     /// into it last time — a stale query would hide the list the reader
     /// just asked to see.
@@ -490,6 +538,18 @@ impl Console {
         self.close_drawer();
     }
 
+    /// Show the roadmap.
+    pub fn show_roadmap(&self) {
+        self.pane.set("roadmap".to_string());
+        self.close_drawer();
+    }
+
+    /// Open the roadmap's detail drawer onto one item.
+    pub fn open_road(&self, item: &str) {
+        self.road_open.set(Some(item.to_string()));
+        self.last_road.set(Some(item.to_string()));
+    }
+
     /// Show the capture screen.
     pub fn show_capture(&self) {
         self.pane.set("capture".to_string());
@@ -508,6 +568,7 @@ impl Console {
         self.plan_name.set(String::new());
         self.plan_description.set(String::new());
         self.plan_whitepaper.set(String::new());
+        self.plan_item.set(String::new());
         for slot in &self.plan_modules {
             slot.clear();
         }
@@ -789,6 +850,7 @@ impl Console {
     pub fn close_drawer(&self) {
         self.selected.set(None);
         self.want.set(None);
+        self.road_open.set(None);
     }
 
     /// Narrow the pool by free text. Any filter change returns to the

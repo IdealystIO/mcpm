@@ -1,4 +1,4 @@
-//! The 41 tool definitions (architecture doc §5). Descriptions are the
+//! The 46 tool definitions (architecture doc §5). Descriptions are the
 //! agent UX: they say what the tool does, who calls it, and what the
 //! caller should do with the answer.
 
@@ -12,6 +12,7 @@ pub fn tool_defs() -> Value {
     tools.extend(attachment_tools().as_array().cloned().unwrap_or_default());
     tools.extend(discussion_tools().as_array().cloned().unwrap_or_default());
     tools.extend(want_tools().as_array().cloned().unwrap_or_default());
+    tools.extend(roadmap_tools().as_array().cloned().unwrap_or_default());
     Value::Array(tools)
 }
 
@@ -23,6 +24,7 @@ fn plan_schema() -> Value {
         "properties": {
             "name": { "type": "string" },
             "description": { "type": "string", "description": "One paragraph: what the feature is and the decisions that shape it. Put the long form in `whitepaper`." },
+            "roadmap_item": { "type": "string", "description": "The roadmap item this feature delivers part of, by id (`road_...`) or by name — read_roadmap lists them. OMIT IT for a loose feature (a sprint, a bugfix, anything the roadmap does not speak to); loose is normal and costs nothing. Binding makes the ship door wait on the roadmap (release_feature) and puts the item's intent, and what waits downstream of it, into every worker's briefing." },
             "whitepaper": { "type": "string", "description": "Markdown. The plan as prose — what you would tell a new hire: the problem, the model, the decisions and why, what is out of scope. Stored as the feature's whitepaper (revision 1) and carried into every worker's claim briefing. Revise later with write_document." },
             "modules": {
                 "type": "array",
@@ -976,6 +978,144 @@ fn want_tools() -> Value {
                     "label": { "type": "string", "description": "As you would type it; normalized to a lowercase slug (e.g. 'Field Reports' → 'field-reports')." }
                 },
                 "required": ["label"]
+            }
+        }
+    ])
+}
+/// The roadmap: long-horizon intent, and the two ship doors it gates.
+///
+/// These descriptions carry more "when NOT to" than the rest of the
+/// surface, because the failure mode here is enthusiasm — an agent that
+/// has just read a roadmap wants to build toward it. The roadmap is
+/// context for shaping today's work, not a backlog to start on.
+fn roadmap_tools() -> Value {
+    json!([
+        {
+            "name": "read_roadmap",
+            "description": "ANY AGENT. Where the product is going: every roadmap item with its \
+                intent, its state, what it waits on, what waits on IT, and the features bound \
+                to each — plus the features bound to nothing. get_context already gives you a \
+                one-line digest of this; call read_roadmap when you need an item's full text, \
+                the edges, or the feature bindings. \
+                Use it to SHAPE work, not to choose work: a roadmap item is not claimable and \
+                nothing here tells you what to build next (next_work does). The value is \
+                negative — knowing which decisions would make a later item expensive, so you \
+                do not make them today.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "plan_roadmap",
+            "description": "MANAGER ONLY. State the roadmap: items, each one paragraph of \
+                INTENT in product terms, and the edges between them. Validated whole and \
+                refused whole — an unknown prerequisite, a self-dependency or a cycle writes \
+                nothing. \
+                An item is one shippable capability, not a theme and not a feature: 'Multi-org \
+                federation', not 'Multi-tenancy' and not 'add orgId to the schema'. Write the \
+                intent for a reader who will never see the plan — it is what every agent on \
+                the project reads on every get_context, and a title with no paragraph teaches \
+                nobody anything. \
+                Re-sending an item by the same NAME updates it in place and adds to its edges \
+                rather than duplicating it, so re-stating the roadmap is cheap; dropping an \
+                edge is revise_roadmap's job, where saying so is deliberate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "The graph. Order does not matter; depends_on does.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "Unique across the roadmap; what depends_on and plan_feature's roadmap_item refer to." },
+                                "intent": { "type": "string", "description": "ONE PARAGRAPH: the outcome in product terms, and what changes for a user when it lands. No plan, no modules, no file paths — this is the text that travels into every agent's context, and it earns its place by being about the product rather than the work." },
+                                "vision": { "type": "string", "description": "Optional long form, Markdown. Read whole by an agent that needs the detail; deliberately NOT carried in the digest, so put everything expensive here and keep `intent` short." },
+                                "horizon": { "type": "string", "description": "A display label only: 'now', 'next', 'later', 'H1'. It orders NOTHING — edges do that. Two items in the same horizon with no edge between them may ship in either order, and that is what the roadmap will say." },
+                                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Names of items this one waits on, in this plan or already on the roadmap. A SOFT edge: work bound to this item may still be planned, dispatched and built — only shipping is held. That is what makes building ahead of the frontier possible." },
+                                "hard_depends_on": { "type": "array", "items": { "type": "string" }, "description": "The exception: prerequisites that must physically EXIST before anything downstream can be written. A hard edge also makes claim_module refuse (PREREQS_OPEN) on features bound to this item. Use it only when there is genuinely nothing to build against — most ordering is soft." }
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }
+        },
+        {
+            "name": "revise_roadmap",
+            "description": "MANAGER ONLY. Surgical roadmap changes, applied atomically or not \
+                at all: add, edit, remove or shelve an item, add or remove an edge, bind a \
+                feature to an item or loosen it. Use this to DROP something (plan_roadmap only \
+                ever adds) and to re-bind features. \
+                Shelve rather than remove when a direction is paused: a shelved item holds \
+                nothing and leaves the digest, but its history and its edges survive if it \
+                comes back. Removing an item with features bound to it is refused — unbind \
+                them first, so nothing silently loosens.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "description": "Applied in order. Any refusal rolls back all of them.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": { "type": "string", "enum": ["add_item", "edit_item", "remove_item", "shelve_item", "add_dependency", "remove_dependency", "bind_feature"] },
+                                "item_id": { "type": "string", "description": "`road_...`. On bind_feature, omit it to LOOSEN the feature from the roadmap." },
+                                "depends_on": { "type": "string", "description": "add_dependency / remove_dependency: the item_id waited on." },
+                                "hard": { "type": "boolean", "description": "add_dependency: true also holds the WORK (claim_module), not just the ship door. Default false." },
+                                "feature_id": { "type": "string", "description": "bind_feature: the feature to bind or loosen." },
+                                "name": { "type": "string" },
+                                "intent": { "type": "string" },
+                                "vision": { "type": "string" },
+                                "horizon": { "type": "string" },
+                                "position": { "type": "integer", "description": "edit_item: display order." },
+                                "shelved": { "type": "boolean", "description": "shelve_item: true to shelve, false to bring it back." }
+                            },
+                            "required": ["op"]
+                        }
+                    }
+                },
+                "required": ["ops"]
+            }
+        },
+        {
+            "name": "release_feature",
+            "description": "MANAGER ONLY. The second door: this feature has GONE OUT. \
+                complete_feature says the work landed; release_feature says it shipped, and it \
+                is the one the roadmap gates — refused with ROADMAP_LOCKED while any item the \
+                feature's own item waits on is unshipped. \
+                A LOOSE feature (bound to no roadmap item) releases automatically when you \
+                complete it, so this call is only ever needed for a bound one. If it refuses, \
+                nothing is wrong with your work and there is nothing for you to finish: leave \
+                the feature done-and-unreleased, tell your operator which items it waits on, \
+                and come back after they ship.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "feature_id": { "type": "string", "description": "Feature id (`feat_...`). It must already be `done`." },
+                    "note": { "type": "string", "description": "One line for the ledger: where it went and when — 'deployed to prod 2026-09-22', 'merged to main, in the 1.7 build'." }
+                },
+                "required": ["feature_id"]
+            }
+        },
+        {
+            "name": "ship_roadmap_item",
+            "description": "MANAGER ONLY. The roadmap item is LIVE — the capability exists for \
+                users. Refused until every feature bound to it has been released and every \
+                item it waits on has shipped, and it is what releases the items waiting on \
+                THIS one. \
+                It is an act rather than something derived, because an item can be satisfied \
+                by something the work tree never saw — an account migration, a contract, a \
+                vendor's release — and an item with no features would otherwise hold its \
+                dependents shut for good. Do not use it to tidy the board: shipping an item \
+                nobody delivered unlocks real work on a false premise.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "item_id": { "type": "string", "description": "Roadmap item id (`road_...`), from read_roadmap." },
+                    "note": { "type": "string", "description": "One line for the ledger: what made it true. Say so explicitly when it was satisfied outside the work tree." }
+                },
+                "required": ["item_id"]
             }
         }
     ])

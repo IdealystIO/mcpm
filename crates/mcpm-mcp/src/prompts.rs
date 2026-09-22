@@ -70,6 +70,26 @@ async fn manager_briefing(store: &Store, args: &Value) -> Result<Value, McpmErro
     if board.is_empty() {
         board.push_str("(no features planned yet)\n");
     }
+    // The roadmap goes in the briefing rather than only in get_context
+    // because a manager's first act is to PLAN, and the direction has
+    // to be in hand before the graph is, not after.
+    let mut road = String::new();
+    for i in store.roadmap_digest().await? {
+        road.push_str(&format!(
+            "- {} ({}) [{}{}]: {}\n",
+            i.name,
+            i.id,
+            i.state,
+            if i.horizon.is_empty() { String::new() } else { format!(" · {}", i.horizon) },
+            i.intent.replace('\n', " ")
+        ));
+    }
+    if road.is_empty() {
+        road.push_str(
+            "(no roadmap yet — every feature is loose, which is fine. plan_roadmap states \
+             one when there is a direction worth writing down.)\n",
+        );
+    }
     let resume = match feature_id {
         Some(id) => format!("You are resuming feature {id}.\n"),
         None => String::new(),
@@ -79,6 +99,13 @@ async fn manager_briefing(store: &Store, args: &Value) -> Result<Value, McpmErro
 feature end to end. The server is the gatekeeper — it enforces prerequisites, exclusive \
 claims, and checklist-proven completion — and you bring the loop.\n\n\
 {resume}Current board:\n{board}\n\
+The roadmap — where the product is going:\n{road}\n\
+Read it before you plan. It is not a backlog and nothing on it is claimable; it is \
+there so the graph you write accounts for what is coming. If this feature delivers \
+part of an item, pass roadmap_item to plan_feature and every worker gets the item's \
+intent and what waits downstream of it. If it does not — a sprint, a bugfix, a \
+cleanup — leave it LOOSE. Loose is normal and costs nothing; inventing a roadmap item \
+to hang a bugfix on is worse than no roadmap at all.\n\n\
 Your loop:\n\
 1. get_context(agent_name, role='manager') — register; resume any feature already in \
 flight rather than replanning it.\n\
@@ -122,7 +149,12 @@ merge, the suite, the deploy.\n\
 add_module, update_module, remove), re-dispatch, or escalate to the human. A \
 premature_claim event means YOUR dispatch was early.\n\
 5. When every module is done: complete_feature(feature_id, summary). The summary becomes \
-a feature-scope memory. Keep the whitepaper true as the plan moves: write_document \
+a feature-scope memory. A LOOSE feature is released by that same call. A feature bound \
+to the roadmap is not: it is done but not out, and release_feature(feature_id, note) is \
+the second door — refused with ROADMAP_LOCKED while anything its item waits on is \
+unshipped. That refusal is a HOLD, not a defect: nothing is wrong with the work, there \
+is nothing to finish, and the answer is to say so to your operator rather than to \
+re-open the feature. Keep the whitepaper true as the plan moves: write_document \
 (kind='whitepaper') appends a revision. Files a person attached from the console (a \
 design, a spec, a data sample) arrive in every briefing with the description they were \
 given; read them once (read_attachment) and, if the description undersells what a \
@@ -243,7 +275,12 @@ it built) — and the feature's attachments, files a person pinned with a descri
 written for you — and the discussion: what people and agents have said about this \
 module and its feature. Read the handoffs before you read the code they describe; \
 fetch an attachment (read_attachment) only when its description says your module \
-needs it. PENDING_RESOLUTION from claim_module means a question on the module or \
+needs it. If the feature is bound to the roadmap the claim also carries `roadmap`: \
+the item this work is part of and, more usefully, the items that WAIT ON IT. You are \
+not building those — do not widen scope or add abstraction for them — but do not make \
+them expensive either: a value hardcoded where they will need a column, a shape that \
+assumes one of something they need many of. Where you leave such a seam, say so in \
+your handoff. PENDING_RESOLUTION from claim_module means a question on the module or \
 its feature is unanswered: if it is owed by you, answer_question and claim again; \
 otherwise report it to your manager and end your turn.\n\
    - If claim_module returns PREREQS_OPEN: STOP. Do no work. Report the error to your \

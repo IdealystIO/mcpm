@@ -226,6 +226,88 @@ pub struct FeatureRollupDto {
     /// The newest announcement anywhere in the feature.
     #[serde(default)]
     pub last_word: Option<AnnouncementDto>,
+    /// The roadmap item it delivers part of. `None` is LOOSE, which is
+    /// normal and gets no badge — only a binding is worth showing.
+    #[serde(default)]
+    pub roadmap_item: Option<RoadmapEdgeDto>,
+    /// "MMM D HH:MM" of when it shipped, or empty. A feature can be
+    /// `done` with this empty: the work landed, the roadmap has not
+    /// let it out.
+    #[serde(default)]
+    pub released: String,
+    /// Unshipped roadmap items holding its release. Non-empty is the
+    /// HELD badge.
+    #[serde(default)]
+    pub held_by: Vec<RoadmapEdgeDto>,
+}
+
+/// The roadmap item a feature is bound to, or one end of an edge.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoadmapEdgeDto {
+    pub item_id: String,
+    pub name: String,
+    /// A hard edge holds the WORK as well as the ship door.
+    pub hard: bool,
+    pub shipped: bool,
+}
+
+/// One roadmap item as the console draws it. `state` is derived
+/// server-side — the screen never recomputes it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoadmapItemDto {
+    pub id: String,
+    pub name: String,
+    /// One paragraph, product terms. The card's body.
+    pub intent: String,
+    /// Optional long form, Markdown.
+    pub vision: String,
+    /// A display label only: 'now', 'next', 'H1'. Orders nothing.
+    pub horizon: String,
+    pub position: i32,
+    pub shelved: bool,
+    /// future | held | active | ready | shipped | shelved
+    pub state: String,
+    /// "MMM D HH:MM", or empty.
+    pub shipped_at: String,
+    pub shipped_by: String,
+    /// Longest path from a root, 1-based — the column on the board.
+    pub depth: i32,
+    pub depends_on: Vec<RoadmapEdgeDto>,
+    /// What waits on this one.
+    pub unlocks: Vec<RoadmapEdgeDto>,
+    pub features: Vec<RoadmapFeatureDto>,
+}
+
+/// A feature seen from the roadmap: enough for a row under a card.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoadmapFeatureDto {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub released: bool,
+    pub modules_done: i64,
+    pub modules_total: i64,
+}
+
+/// The whole roadmap: its own read, fetched when the screen is on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoadmapDto {
+    pub items: Vec<RoadmapItemDto>,
+    /// Features bound to no item. Loose is legal and normal; the list
+    /// is here so a planner can see what the roadmap does not account
+    /// for.
+    pub loose_features: Vec<RoadmapFeatureDto>,
+}
+
+/// What a person types to create or edit one item.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoadmapDraft {
+    /// Empty to create; an id to edit that item.
+    pub item_id: String,
+    pub name: String,
+    pub intent: String,
+    pub vision: String,
+    pub horizon: String,
 }
 
 /// A stamp as Unix seconds, for the `last_heard` fields.
@@ -296,6 +378,14 @@ pub struct FeatureDetail {
     /// in it is dispatchable.
     #[serde(default)]
     pub open_questions: Vec<QuestionDto>,
+    /// The roadmap item this feature delivers part of, if any.
+    #[serde(default)]
+    pub roadmap_item: Option<RoadmapEdgeDto>,
+    #[serde(default)]
+    pub released: String,
+    /// Unshipped roadmap items holding its release.
+    #[serde(default)]
+    pub held_by: Vec<RoadmapEdgeDto>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -383,6 +473,10 @@ pub struct PlanDraft {
     /// The plan as prose, or empty for none.
     pub whitepaper: String,
     pub modules: Vec<ModuleDraft>,
+    /// The roadmap item this feature delivers part of, by id — or
+    /// empty for a loose feature, which is the normal case.
+    #[serde(default)]
+    pub roadmap_item: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -416,6 +510,39 @@ pub enum PlanOpDto {
     UpdateFeature { description: String },
     Rename { id: String, name: String },
     Remove { id: String },
+}
+
+/// One roadmap change, mirroring `mcpm_core::RoadmapOp` on the wire so
+/// the console can send exactly what an agent's `revise_roadmap` can.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RoadmapOpDto {
+    RemoveItem { item_id: String },
+    ShelveItem { item_id: String, shelved: bool },
+    AddDependency { item_id: String, depends_on: String, hard: bool },
+    RemoveDependency { item_id: String, depends_on: String },
+    /// `item_id` empty loosens the feature from the roadmap.
+    BindFeature { feature_id: String, item_id: String },
+}
+
+#[cfg(feature = "server")]
+impl From<RoadmapOpDto> for mcpm_core::RoadmapOp {
+    fn from(op: RoadmapOpDto) -> Self {
+        match op {
+            RoadmapOpDto::RemoveItem { item_id } => Self::RemoveItem { item_id },
+            RoadmapOpDto::ShelveItem { item_id, shelved } => Self::ShelveItem { item_id, shelved },
+            RoadmapOpDto::AddDependency { item_id, depends_on, hard } => {
+                Self::AddDependency { item_id, depends_on, hard }
+            }
+            RoadmapOpDto::RemoveDependency { item_id, depends_on } => {
+                Self::RemoveDependency { item_id, depends_on }
+            }
+            RoadmapOpDto::BindFeature { feature_id, item_id } => Self::BindFeature {
+                feature_id,
+                item_id: Some(item_id).filter(|i| !i.trim().is_empty()),
+            },
+        }
+    }
 }
 
 /// What one console write did, in a line the screen can show.
@@ -920,6 +1047,9 @@ pub async fn load_board(caller: server::Extension<Caller>) -> Result<Board, Serv
             last_activity: stamp(r.last_activity),
             last_heard: epoch(r.last_heard),
             last_word: r.last_word.as_ref().map(announcement_dto),
+            roadmap_item: r.roadmap_item.as_ref().map(roadmap_edge_dto),
+            released: stamp(r.released_at),
+            held_by: r.held_by.iter().map(roadmap_edge_dto).collect(),
         })
         .collect();
     let attention = store
@@ -1108,6 +1238,12 @@ pub async fn load_feature(feature_id: String) -> Result<FeatureDetail, ServerErr
         sources,
         attachments: tree.attachments.iter().map(attachment_dto).collect(),
         open_questions: tree.open_questions.iter().map(question_dto).collect(),
+        roadmap_item: tree.roadmap_item.as_ref().map(roadmap_edge_dto),
+        released: tree
+            .released_at
+            .map(|t| t.format("%b %-d %H:%M").to_string())
+            .unwrap_or_default(),
+        held_by: tree.held_by.iter().map(roadmap_edge_dto).collect(),
     })
 }
 
@@ -1239,6 +1375,141 @@ pub(crate) fn require_planner(caller: &Caller) -> Result<(), ServerError> {
     }
 }
 
+// ---------------------------------------------------------------------
+// The roadmap
+// ---------------------------------------------------------------------
+
+/// The whole roadmap. Its own read, fetched when the screen is on and
+/// refetched on a roadmap or feature tick — it is not on the board,
+/// because the board is read on EVERY tick and must stay scalars.
+#[server]
+pub async fn load_roadmap() -> Result<RoadmapDto, ServerError> {
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let road = store.roadmap().await.map_err(fail)?;
+    Ok(RoadmapDto {
+        items: road
+            .items
+            .iter()
+            .map(|i| RoadmapItemDto {
+                id: i.id.clone(),
+                name: i.name.clone(),
+                intent: i.intent.clone(),
+                vision: i.vision.clone(),
+                horizon: i.horizon.clone(),
+                position: i.position,
+                shelved: i.shelved,
+                state: i.state.clone(),
+                shipped_at: i
+                    .shipped_at
+                    .map(|t| t.format("%b %-d %H:%M").to_string())
+                    .unwrap_or_default(),
+                shipped_by: i.shipped_by.clone().unwrap_or_default(),
+                depth: i.depth,
+                depends_on: i.depends_on.iter().map(roadmap_edge_dto).collect(),
+                unlocks: i.unlocks.iter().map(roadmap_edge_dto).collect(),
+                features: i.features.iter().map(roadmap_feature_dto).collect(),
+            })
+            .collect(),
+        loose_features: road.loose_features.iter().map(roadmap_feature_dto).collect(),
+    })
+}
+
+/// Create or edit one item from the console. Empty `item_id` creates.
+#[server]
+pub async fn save_roadmap_item(
+    draft: RoadmapDraft,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let id = draft.item_id.trim().to_string();
+    let op = if id.is_empty() {
+        mcpm_core::RoadmapOp::AddItem {
+            name: draft.name.trim().to_string(),
+            intent: draft.intent.trim().to_string(),
+            vision: draft.vision.trim().to_string(),
+            horizon: draft.horizon.trim().to_string(),
+        }
+    } else {
+        mcpm_core::RoadmapOp::EditItem {
+            item_id: id,
+            name: Some(draft.name.trim().to_string()),
+            intent: Some(draft.intent.trim().to_string()),
+            vision: Some(draft.vision.trim().to_string()),
+            horizon: Some(draft.horizon.trim().to_string()),
+            position: None,
+        }
+    };
+    let road = store
+        .revise_roadmap(&caller.name, vec![op])
+        .await
+        .map_err(fail)?;
+    let id = road
+        .items
+        .iter()
+        .find(|i| i.name == draft.name.trim())
+        .map(|i| i.id.clone())
+        .unwrap_or_default();
+    Ok(WriteResult { message: "Saved.".into(), id })
+}
+
+/// Everything else the roadmap screen edits: edges, shelving,
+/// removal, and binding a feature to an item. One door, so the
+/// console's rules are the store's — a check only the console made
+/// would be one no agent ever hits.
+#[server]
+pub async fn revise_roadmap(
+    ops: Vec<RoadmapOpDto>,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let n = ops.len();
+    let ops: Vec<mcpm_core::RoadmapOp> = ops.into_iter().map(Into::into).collect();
+    store.revise_roadmap(&caller.name, ops).await.map_err(fail)?;
+    Ok(WriteResult {
+        message: format!("{n} change(s) applied."),
+        id: String::new(),
+    })
+}
+
+/// The feature's second door, from the console.
+#[server]
+pub async fn release_feature(
+    feature_id: String,
+    note: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ack = store
+        .release_feature(&caller.name, &feature_id, note.trim())
+        .await
+        .map_err(fail)?;
+    Ok(WriteResult { message: ack.message, id: feature_id })
+}
+
+/// The item's door.
+#[server]
+pub async fn ship_roadmap_item(
+    item_id: String,
+    note: String,
+    caller: server::Extension<Caller>,
+) -> Result<WriteResult, ServerError> {
+    require_planner(&caller)?;
+    let store = server::use_state::<mcpm_core::Store>()
+        .ok_or_else(|| ServerError::failed("Store not installed"))?;
+    let ack = store
+        .ship_roadmap_item(&caller.name, &item_id, note.trim())
+        .await
+        .map_err(fail)?;
+    Ok(WriteResult { message: ack.message, id: item_id })
+}
+
 /// Plan a feature from the console's editor. Returns the new feature's
 /// id so the console can open it.
 #[server]
@@ -1253,6 +1524,7 @@ pub async fn create_plan(
         name: draft.name.trim().to_string(),
         description: draft.description.trim().to_string(),
         whitepaper: Some(draft.whitepaper.trim().to_string()).filter(|w| !w.is_empty()),
+        roadmap_item: Some(draft.roadmap_item.trim().to_string()).filter(|r| !r.is_empty()),
         modules: draft
             .modules
             .into_iter()
@@ -2016,5 +2288,27 @@ fn format_event(e: &mcpm_core::Event) -> EventDto {
         subject_id: e.subject_id.clone(),
         title,
         body,
+    }
+}
+
+#[cfg(feature = "server")]
+fn roadmap_edge_dto(e: &mcpm_core::RoadmapEdge) -> RoadmapEdgeDto {
+    RoadmapEdgeDto {
+        item_id: e.item_id.clone(),
+        name: e.name.clone(),
+        hard: e.hard,
+        shipped: e.shipped,
+    }
+}
+
+#[cfg(feature = "server")]
+fn roadmap_feature_dto(f: &mcpm_core::RoadmapFeatureRef) -> RoadmapFeatureDto {
+    RoadmapFeatureDto {
+        id: f.id.clone(),
+        name: f.name.clone(),
+        status: f.status.clone(),
+        released: f.released,
+        modules_done: f.modules_done,
+        modules_total: f.modules_total,
     }
 }

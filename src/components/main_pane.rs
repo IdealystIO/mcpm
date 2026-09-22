@@ -25,6 +25,7 @@ use crate::components::graph::GraphView;
 use crate::components::knowledge::KnowledgeView;
 use crate::components::overview::OverviewView;
 use crate::components::plan_editor::PlanEditor;
+use crate::components::roadmap::RoadmapView;
 use crate::components::wants::{CaptureView, WantsView};
 use crate::model::Status;
 use crate::state::Console;
@@ -75,6 +76,9 @@ pub fn MainPane(props: &MainPaneProps) -> Element {
             }
             if pane == "features" {
                 return ui! { FeaturesView(console = console) };
+            }
+            if pane == "roadmap" {
+                return ui! { RoadmapView(console = console) };
             }
             if pane == "knowledge" {
                 return ui! { KnowledgeView(console = console) };
@@ -320,6 +324,27 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
         .unwrap_or_default());
     let word = move || f().and_then(|f| f.last_word.as_ref().map(|w| w.line()));
 
+    // Where this feature sits on the roadmap: its item, and — while
+    // the work is done and the roadmap has not let it out — what it is
+    // waiting for.
+    let roadmap_line = move || {
+        let f = f()?;
+        let item = f.roadmap_item.as_ref()?;
+        let held: Vec<&str> = f.held_by.iter().map(|e| e.name.as_str()).collect();
+        Some(if !held.is_empty() {
+            format!(
+                "Roadmap: {} \u{2014} held until {} ship{}",
+                item.name,
+                held.join(" and "),
+                if held.len() == 1 { "s" } else { "" }
+            )
+        } else if !f.released.is_empty() {
+            format!("Roadmap: {} \u{b7} released {}", item.name, f.released)
+        } else {
+            format!("Roadmap: {}", item.name)
+        })
+    };
+
     let counts = move || {
         f()
             .map(|f| {
@@ -377,6 +402,15 @@ pub fn FeatureHead(props: &FeatureHeadProps) -> Element {
             match word() {
                 Some(word) => {
                     Typography(content = word.clone(), kind = typography_kind::Caption)
+                }
+                None => {}
+            }
+            // The hold says so where the held thing is (rule 21). It
+            // is a CURRENT condition and it clears itself the moment
+            // the items it names ship — nothing has to dismiss it.
+            match roadmap_line() {
+                Some(line) => {
+                    Typography(content = line.clone(), kind = typography_kind::Caption, muted = true)
                 }
                 None => {}
             }
