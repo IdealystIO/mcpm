@@ -297,7 +297,15 @@ impl Store {
                 description: String::new(),
             });
 
-        let features = self.feature_rollups().await?;
+        // Only live work is orientation. A finished feature is history —
+        // the console and feature_status still show it — and carrying
+        // every one of them made this call grow without bound.
+        let (finished, features): (Vec<_>, Vec<_>) = self
+            .feature_rollups()
+            .await?
+            .into_iter()
+            .partition(|f| f.status == "done");
+        let finished_features = finished.len() as i64;
         let roadmap = self.roadmap_digest().await?;
         let your_claims = self.claims_of(agent).await?;
         let awaiting_you = self.questions_awaiting(agent).await?;
@@ -325,7 +333,12 @@ impl Store {
                 c.module_name, c.module_id, c.open_tasks
             )
         } else if role == "manager" {
-            if features.is_empty() && open_wants > 0 {
+            if features.is_empty() && finished_features > 0 {
+                format!(
+                    "No feature is in flight ({finished_features} finished). Plan the next \
+                     one with plan_feature, or compose open wants into one with promote_wants."
+                )
+            } else if features.is_empty() && open_wants > 0 {
                 format!(
                     "No features yet, but {open_wants} want(s) are waiting. Read them with \
                      list_wants, find the themes, and compose a group into a feature with \
@@ -354,6 +367,7 @@ impl Store {
                 health_url,
             },
             features,
+            finished_features,
             your_claims,
             open_wants,
             awaiting_you,

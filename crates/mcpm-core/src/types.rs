@@ -982,7 +982,12 @@ pub struct TaskView {
 pub struct Context {
     pub project: ProjectInfo,
     pub you: AgentIdentity,
+    /// Features still in flight. Finished ones are left out — read
+    /// them with feature_status or on the console.
     pub features: Vec<FeatureRollup>,
+    /// How many finished features `features` leaves out.
+    #[serde(default)]
+    pub finished_features: i64,
     /// Modules this agent currently holds a claim on.
     pub your_claims: Vec<ClaimRef>,
     /// Loose ideas waiting to be composed into features.

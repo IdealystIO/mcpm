@@ -473,7 +473,8 @@ async fn the_worked_scenario() {
 
         // ---- get_context suggests resumes ---------------------------
         let ctx = store.get_context(manager, "manager").await.unwrap();
-        assert_eq!(ctx.features.len(), 1);
+        assert!(ctx.features.is_empty(), "a finished feature is not orientation");
+        assert_eq!(ctx.finished_features, 1);
         assert!(ctx.your_claims.is_empty());
     })
     .await;
